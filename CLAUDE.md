@@ -181,6 +181,8 @@ Open `9090/tcp` in your firewall for the clients' network. Never expose `9091`.
 
 ```bash
 cargo test -p openphalanx-core                                  # unit tests (no GPU or Docker needed)
+cargo test -p openbase                                          # client unit tests
+cargo run -p openbase -- servers                                # client CLI (config: OPENBASE_CONFIG or --config)
 cargo clippy --workspace --all-targets
 (cd app && npm run check)                                       # Svelte/TypeScript type check
 
@@ -216,6 +218,7 @@ crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight
   catalog.json           curated models pinned to Hugging Face commits
 docker/                  backend image: SGLang + gateway under supervisord (no agent code)
   server/gateway.py      TLS gateway: pairing, device tokens, admin API
+client/openbase/         client CLI: config.rs (paired servers, 0600 file), main.rs (clap commands)
 scripts/publish-image.sh build and push the backend image to GHCR
 milestone.md             roadmap and progress
 ```

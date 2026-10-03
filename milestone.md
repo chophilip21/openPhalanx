@@ -224,11 +224,33 @@
 
   * ✅ Verified with **real Aider 0.86** on the client side: `OPENAI_API_BASE=https://<server>:9090/v1`, the device token as API key, and `--no-verify-ssl` for this test only (Step 4.4's proxy replaces that with certificate pinning). The edit was applied to the local working tree, uncommitted. The device was credited 761 prompt and 31 completion tokens, against Aider's own estimate of 753/30.
 
-* \[ \] **Step 4.2: Scaffold `openbase` (Rust, single binary)**
+* \[x\] **Step 4.2: Scaffold `openbase` (Rust, single binary)**
 
   * Initialize `client/openbase` as a member of the Cargo workspace.
 
   * Config in `~/.config/openbase/config.json` (mode `0600`): server URL, device id, device token and the pinned certificate fingerprint. Support several named servers, with one default.
+
+  * ✅ Implemented in `client/openbase`, split into a library (`config.rs`, unit-tested) and a thin `clap` binary. It has no dependency on the server crates.
+
+    * **Location:** the OS config dir (`~/.config/openbase/` on Linux, `~/Library/Application Support/openbase/` on macOS). `--config` or `OPENBASE_CONFIG` overrides it.
+
+    * **Format:** `{"default": name, "servers": {name: {url, device_id, device_name, token, fingerprint, paired_at}}}`. The first server added becomes the default, and removing the default promotes another.
+
+    * **Protection:** written atomically as `0600` inside a `0700` directory (the directory is tightened if it already exists). Loading warns, like `ssh`, if the file is readable by others.
+
+    * **Validation:**
+
+      * URLs are normalized to `https://host:port` (port 9090 if omitted, bracketed IPv6 allowed). Plain `http://`, paths and credentials are refused.
+
+      * Fingerprints are normalized to `AB:CD:…` (64 hex digits; colons, case and a `sha256:` prefix are all accepted).
+
+      * Server names are limited to 1–32 characters from `[A-Za-z0-9_-]`.
+
+    * **Commands so far:** `openbase servers` (never prints tokens) and `openbase use <name>`.
+
+    * **Tests:** 6 unit tests cover the round trip with permissions, default handling, and URL, name and fingerprint validation. A CLI smoke test checked the warning on a `644` file, that saving tightens it to `600`/`700`, and that tokens are absent from the output.
+
+    * **Not yet:** tokens are stored in a protected file, like `gh` or `docker` do. Moving them to the OS keyring is a possible later hardening step.
 
 * \[ \] **Step 4.3: Pairing**
 
