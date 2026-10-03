@@ -12,9 +12,9 @@
 
 * \[x\] **Step 1.2: Check Client Dependencies**
 
-  * Verify runtime environments on the client node (`Go` or `Rust` for compiling the `openbase` thin client).
+  * Verify runtime environments on the client node (`Go` or `Rust` for compiling the `oppx` thin client).
 
-  * ✅ Verified: Rust 1.99.0 / Cargo 1.99.0 installed via rustup (`~/.cargo/bin`). Go is not installed, so Rust is the toolchain for `openbase`.
+  * ✅ Verified: Rust 1.99.0 / Cargo 1.99.0 installed via rustup (`~/.cargo/bin`). Go is not installed, so Rust is the toolchain for `oppx`.
 
 ## 2.3 Check Aider can edit existing code
 
@@ -98,7 +98,7 @@
 
     * `agent_server.py` is now `gateway.py`, running in a 37 MB venv (`fastapi`, `uvicorn`, `httpx`).
 
-    * `/v1/run` is replaced by `/v1/whoami`, a token-protected check that `openbase status` will use.
+    * `/v1/run` is replaced by `/v1/whoami`, a token-protected check that `oppx status` will use.
 
     * The image is 52.6 GB, down from 53.3 GB. Aider becomes a client-side dependency (Step 4.4).
 
@@ -188,13 +188,13 @@
 
 * **Device tokens:** a client trades the code for a random 256-bit **device token**. The server stores only its SHA-256 hash. Devices stay paired across restarts and can be revoked from the Devices page. A new code is needed only to add a device.
 
-* **Certificate fingerprint:** the GUI shows the TLS fingerprint. `openbase pair` shows it too, for the user to compare, and then pins it (trust on first use), so later connections can't be intercepted even though the certificate is self-signed.
+* **Certificate fingerprint:** the GUI shows the TLS fingerprint. `oppx pair` shows it too, for the user to compare, and then pins it (trust on first use), so later connections can't be intercepted even though the certificate is self-signed.
 
 * **Code handling:** prompts (which contain code) pass through the gateway to SGLang and are never written to disk on the server. The server never runs a command on a client's behalf.
 
 * **Admin API** (`:9091`): published on `127.0.0.1` only, and requires a random per-launch admin token passed through the container's environment. The GUI uses it for status, pairing and devices.
 
-## Phase 4: Client-Side Agent & `openbase` CLI
+## Phase 4: Client-Side Agent & `oppx` CLI
 
 * \[x\] **Step 4.1: Authenticated Inference Gateway (server)**
 
@@ -224,15 +224,15 @@
 
   * ✅ Verified with **real Aider 0.86** on the client side: `OPENAI_API_BASE=https://<server>:9090/v1`, the device token as API key, and `--no-verify-ssl` for this test only (Step 4.4's proxy replaces that with certificate pinning). The edit was applied to the local working tree, uncommitted. The device was credited 761 prompt and 31 completion tokens, against Aider's own estimate of 753/30.
 
-* \[x\] **Step 4.2: Scaffold `openbase` (Rust, single binary)**
+* \[x\] **Step 4.2: Scaffold `oppx` (Rust, single binary)**
 
-  * Initialize `client/openbase` as a member of the Cargo workspace.
+  * Initialize `client/oppx` as a member of the Cargo workspace.
 
-  * Config in `~/.config/openbase/config.json` (mode `0600`): server URL, device id, device token and the pinned certificate fingerprint. Support several named servers, with one default.
+  * Config in `~/.config/oppx/config.json` (mode `0600`): server URL, device id, device token and the pinned certificate fingerprint. Support several named servers, with one default.
 
-  * ✅ Implemented in `client/openbase`, split into a library (`config.rs`, unit-tested) and a thin `clap` binary. It has no dependency on the server crates.
+  * ✅ Implemented in `client/oppx`, split into a library (`config.rs`, unit-tested) and a thin `clap` binary. It has no dependency on the server crates.
 
-    * **Location:** the OS config dir (`~/.config/openbase/` on Linux, `~/Library/Application Support/openbase/` on macOS). `--config` or `OPENBASE_CONFIG` overrides it.
+    * **Location:** the OS config dir (`~/.config/oppx/` on Linux, `~/Library/Application Support/oppx/` on macOS). `--config` or `OPPX_CONFIG` overrides it.
 
     * **Format:** `{"default": name, "servers": {name: {url, device_id, device_name, token, fingerprint, paired_at}}}`. The first server added becomes the default, and removing the default promotes another.
 
@@ -246,7 +246,9 @@
 
       * Server names are limited to 1–32 characters from `[A-Za-z0-9_-]`.
 
-    * **Commands so far:** `openbase servers` (never prints tokens) and `openbase use <name>`.
+    * **Commands so far:** `oppx servers` (never prints tokens) and `oppx use <name>`.
+
+    * **Name:** the client was first called `openbase`. Its command is now `oppx` (short for OpenPhalanx), to avoid clashing with common CLIs such as 1Password's `op`/`opx`. The crate, folder (`client/oppx`), config dir (`~/.config/oppx/`) and variable (`OPPX_CONFIG`) follow the same name.
 
     * **Tests:** 6 unit tests cover the round trip with permissions, default handling, and URL, name and fingerprint validation. A CLI smoke test checked the warning on a `644` file, that saving tightens it to `600`/`700`, and that tokens are absent from the output.
 
@@ -254,21 +256,21 @@
 
 * \[ \] **Step 4.3: Pairing**
 
-  * `openbase pair https://<SERVER_IP>:9090 <CODE> [--name <device name>]`:
+  * `oppx pair https://<SERVER_IP>:9090 <CODE> [--name <device name>]`:
 
     1. Connects, reads the server certificate, and shows its SHA-256 fingerprint for comparison with the GUI.
 
     2. Calls `/v1/pair`, then stores the device token and the pinned fingerprint.
 
-  * `openbase status`: server reachability, model, and whether SGLang is ready.
+  * `oppx status`: server reachability, model, and whether SGLang is ready.
 
-  * `openbase unpair`: forgets the server locally. Revocation happens in the GUI.
+  * `oppx unpair`: forgets the server locally. Revocation happens in the GUI.
 
 * \[ \] **Step 4.4: Local proxy and agent launcher**
 
-  * `openbase proxy`: listens on `127.0.0.1:<random port>`, forwards to the server over TLS pinned to the stored fingerprint, and adds the device token. The agent talks plain HTTP to loopback, so it never needs to trust a self-signed certificate or see the token.
+  * `oppx proxy`: listens on `127.0.0.1:<random port>`, forwards to the server over TLS pinned to the stored fingerprint, and adds the device token. The agent talks plain HTTP to loopback, so it never needs to trust a self-signed certificate or see the token.
 
-  * `openbase aider [aider args…]`: starts the proxy, then runs the user's local Aider with `OPENAI_API_BASE` pointing at it, `--model openai/openphalanx-coder`, the model's context window, and `--no-auto-commits --no-dirty-commits` (agents never commit directly). It stops the proxy when Aider exits.
+  * `oppx aider [aider args…]`: starts the proxy, then runs the user's local Aider with `OPENAI_API_BASE` pointing at it, `--model openai/openphalanx-coder`, the model's context window, and `--no-auto-commits --no-dirty-commits` (agents never commit directly). It stops the proxy when Aider exits.
 
   * Check that Aider is installed and print an install hint (`pipx install aider-chat` / `uv tool install aider-chat`). A built-in Rust agent loop, which would remove the Python dependency, is a later option.
 
@@ -279,7 +281,7 @@
   * From a paired client machine, in a git repo:
 
     ```bash
-    openbase aider --message "Create a basic HTTP server in main.py using FastAPI"
+    oppx aider --message "Create a basic HTTP server in main.py using FastAPI"
     ```
 
   * Confirm that the edit lands in the local working tree, uncommitted, that local tests can be run with `/run`, and compare latency with the benchmark in "Architecture decision".
@@ -289,6 +291,12 @@
   * Execute a multi-turn modification task.
 
   * Verify high prefix-cache hit rates on later turns with the GUI's "Prefix cache hit" stat, or in `docker logs -f openphalanx-backend` (`#cached-token`).
+
+* \[ \] **Step 5.3: Distribution**
+
+We need to package this up and distribute both server and client. Refer to how others distribute packages via `curl` and etc. 
+
+
 
 ## Future Improvement
 

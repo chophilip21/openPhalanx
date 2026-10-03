@@ -315,7 +315,7 @@ async def pair(req: PairRequest) -> PairResponse:
 
 @app.get("/v1/whoami")
 async def whoami(device: dict = Depends(require_device)) -> dict:
-    """Lets a client confirm its token is still valid (e.g. `openbase status`)."""
+    """Lets a client confirm its token is still valid (e.g. `oppx status`)."""
     devices.touch(device)
     return {"device_id": device["id"], "device_name": device["name"], "model": MODEL_NAME}
 

@@ -1,12 +1,12 @@
 [package]
-name = "openbase"
+name = "oppx"
 description = "Openphalanx client: pairs a laptop with a GPU server and runs a local coding agent against it"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "openbase"
+name = "oppx"
 path = "src/main.rs"
 
 [dependencies]

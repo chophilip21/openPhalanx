@@ -1,4 +1,4 @@
-//! `openbase`: the Openphalanx client. Pairs this machine with a GPU server
+//! `oppx`: the Openphalanx client. Pairs this machine with a GPU server
 //! and (from Phase 4.4) runs a local coding agent against it.
 
 use std::path::PathBuf;
@@ -6,13 +6,13 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use openbase::config::{self, Config};
+use oppx::config::{self, Config};
 
 #[derive(Parser)]
-#[command(name = "openbase", version, about = "Use an Openphalanx GPU server from this machine")]
+#[command(name = "oppx", version, about = "Use an Openphalanx GPU server from this machine")]
 struct Cli {
-    /// Config file (defaults to the user config dir, e.g. ~/.config/openbase/config.json).
-    #[arg(long, global = true, env = "OPENBASE_CONFIG")]
+    /// Config file (defaults to the user config dir, e.g. ~/.config/oppx/config.json).
+    #[arg(long, global = true, env = "OPPX_CONFIG")]
     config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -25,7 +25,7 @@ enum Command {
     Servers,
     /// Set the default server.
     Use {
-        /// Server name, as listed by `openbase servers`.
+        /// Server name, as listed by `oppx servers`.
         name: String,
     },
 }
@@ -46,7 +46,7 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Servers => {
             if cfg.servers.is_empty() {
-                println!("No servers paired yet. Pair with: openbase pair <server> <code>");
+                println!("No servers paired yet. Pair with: oppx pair <server> <code>");
             }
             for (name, s) in &cfg.servers {
                 let mark = if cfg.default.as_deref() == Some(name) { "*" } else { " " };

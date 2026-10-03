@@ -17,7 +17,7 @@
   });
 
   const active = $derived(pairing?.active && (pairing.expires_at ?? 0) * 1000 > now);
-  const command = $derived(endpoint && pairing?.code ? `openbase pair https://${endpoint} ${pairing.code}` : "");
+  const command = $derived(endpoint && pairing?.code ? `oppx pair https://${endpoint} ${pairing.code}` : "");
 
   async function regenerate() {
     busy = true;

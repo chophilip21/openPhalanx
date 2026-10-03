@@ -8,7 +8,7 @@ Working notes for developing this repo: architecture, operations, commands and c
   * `README.md` is for end users only: what the project is, plus the minimum commands to run the server and a client. Keep it at 50–100 lines.
   * Everything operational or developer-facing goes here.
   * Roadmap status (phases, steps, checkboxes, verification notes) goes in `milestone.md`.
-* **Agents never commit directly:** any agent launcher or config (Aider, `openbase aider`, etc.) must use `--no-auto-commits --no-dirty-commits`. The user reviews with `git diff` and commits themselves.
+* **Agents never commit directly:** any agent launcher or config (Aider, `oppx aider`, etc.) must use `--no-auto-commits --no-dirty-commits`. The user reviews with `git diff` and commits themselves.
 * **Branching:** work happens on `dev`; `main` holds the initial history only.
 * **Toolchain on the server node:** `cargo` is in `~/.cargo/bin` (not on the non-interactive `PATH`), so use `export PATH=$HOME/.cargo/bin:$PATH`. `uv`/`uvx` are in `~/.local/bin`.
 * **Versioning:** the backend image tag equals the workspace version in `Cargo.toml`. Bump `Cargo.toml`, `app/package.json` and `app/src-tauri/tauri.conf.json` together when `docker/` changes.
@@ -20,7 +20,7 @@ Working notes for developing this repo: architecture, operations, commands and c
 flowchart TB
     subgraph ClientNode ["Client Node (Work Laptop)"]
         direction TB
-        CLI["openbase CLI<br/>(Rust: pairing, pinned-TLS proxy)"]
+        CLI["oppx CLI<br/>(Rust: pairing, pinned-TLS proxy)"]
         Agent["Coding agent<br/>(Aider, runs locally)"]
         FS[("Local Workspace<br/>git, tests, toolchain")]
 
@@ -53,7 +53,7 @@ flowchart TB
 
 Openphalanx splits the work along a single line: **code and execution stay on the client, GPUs stay on the server.**
 
-* **Client:** the coding agent (Aider) runs on your laptop next to your repo, so it sees the whole codebase and runs your own tests, linters and git. The `openbase` CLI pairs the laptop with a server, then launches the agent pointed at a local proxy. The proxy pins the server's TLS certificate and adds the device token, so the agent never handles either.
+* **Client:** the coding agent (Aider) runs on your laptop next to your repo, so it sees the whole codebase and runs your own tests, linters and git. The `oppx` CLI pairs the laptop with a server, then launches the agent pointed at a local proxy. The proxy pins the server's TLS certificate and adds the device token, so the agent never handles either.
 * **Server:** stores no code and executes nothing on a client's behalf. It serves SGLang behind an authenticated gateway, and the Tauri GUI manages the container, VRAM safety, models and paired devices. SGLang's RadixAttention caches repeated prompt prefixes, so multi-turn agent sessions skip most of the prompt processing.
 
 ## Status
@@ -63,7 +63,7 @@ Openphalanx splits the work along a single line: **code and execution stay on th
 | Backend image (SGLang + gateway) | Working, including the authenticated OpenAI-compatible inference API. `0.2.0` is built locally but not yet pushed to GHCR |
 | Server GUI (`app/`, Linux) | Builds and runs; first UI review pending |
 | Pairing, TLS and device tokens | Working |
-| `openbase` client CLI | Not started. Until it exists, clients can't connect for real (see `milestone.md`, Phase 4) |
+| `oppx` client CLI | Not started. Until it exists, clients can't connect for real (see `milestone.md`, Phase 4) |
 
 ## Requirements
 
@@ -143,9 +143,9 @@ curl -s -H "x-admin-token: $ADMIN_TOKEN" http://127.0.0.1:9091/admin/status | jq
 
 Optional environment variables: `MODEL_PATH`, `CONTEXT_LENGTH`, `MEM_FRACTION_STATIC` (default `0.85`; the GUI computes it from free VRAM instead), `SGLANG_EXTRA_ARGS`. The GUI shows a container started this way as "running outside the app", and can stop it.
 
-## Connecting a client before `openbase` exists
+## Connecting a client before `oppx` exists
 
-Pair with `curl`, then point the client's own Aider at the gateway. `-k` and `--no-verify-ssl` skip certificate checks, so use this only on a trusted network; `openbase` (Phase 4) replaces it with a pinned-certificate local proxy.
+Pair with `curl`, then point the client's own Aider at the gateway. `-k` and `--no-verify-ssl` skip certificate checks, so use this only on a trusted network; `oppx` (Phase 4) replaces it with a pinned-certificate local proxy.
 
 ```bash
 TOKEN=$(curl -sk https://$SERVER:9090/v1/pair -H 'content-type: application/json' \
@@ -181,8 +181,8 @@ Open `9090/tcp` in your firewall for the clients' network. Never expose `9091`.
 
 ```bash
 cargo test -p openphalanx-core                                  # unit tests (no GPU or Docker needed)
-cargo test -p openbase                                          # client unit tests
-cargo run -p openbase -- servers                                # client CLI (config: OPENBASE_CONFIG or --config)
+cargo test -p oppx                                          # client unit tests
+cargo run -p oppx -- servers                                # client CLI (config: OPPX_CONFIG or --config)
 cargo clippy --workspace --all-targets
 (cd app && npm run check)                                       # Svelte/TypeScript type check
 
@@ -218,7 +218,7 @@ crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight
   catalog.json           curated models pinned to Hugging Face commits
 docker/                  backend image: SGLang + gateway under supervisord (no agent code)
   server/gateway.py      TLS gateway: pairing, device tokens, admin API
-client/openbase/         client CLI: config.rs (paired servers, 0600 file), main.rs (clap commands)
+client/oppx/         client CLI: config.rs (paired servers, 0600 file), main.rs (clap commands)
 scripts/publish-image.sh build and push the backend image to GHCR
 milestone.md             roadmap and progress
 ```

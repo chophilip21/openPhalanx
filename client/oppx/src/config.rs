@@ -1,7 +1,7 @@
 //! Client configuration: the servers this machine is paired with.
 //!
-//! Stored as JSON at `<config dir>/openbase/config.json` (`~/.config` on
-//! Linux, `~/Library/Application Support` on macOS), or at `OPENBASE_CONFIG`.
+//! Stored as JSON at `<config dir>/oppx/config.json` (`~/.config` on
+//! Linux, `~/Library/Application Support` on macOS), or at `OPPX_CONFIG`.
 //! The file holds device tokens, so on Unix it is written `0600` inside a
 //! `0700` directory, atomically, and loading warns if it is readable by others.
 
@@ -36,11 +36,11 @@ pub struct Config {
     pub servers: BTreeMap<String, Server>,
 }
 
-/// `<config dir>/openbase/config.json`.
+/// `<config dir>/oppx/config.json`.
 pub fn default_path() -> Result<PathBuf> {
     Ok(dirs::config_dir()
         .context("cannot determine the user config directory")?
-        .join("openbase")
+        .join("oppx")
         .join("config.json"))
 }
 
@@ -53,7 +53,7 @@ impl Config {
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
         warn_if_exposed(path);
-        serde_json::from_slice(&bytes).with_context(|| format!("{} is not valid openbase config", path.display()))
+        serde_json::from_slice(&bytes).with_context(|| format!("{} is not valid oppx config", path.display()))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -68,12 +68,12 @@ impl Config {
     pub fn server(&self, name: Option<&str>) -> Result<(&str, &Server)> {
         let name = match name {
             Some(n) => n,
-            None => self.default.as_deref().context("no server paired yet; run `openbase pair` first")?,
+            None => self.default.as_deref().context("no server paired yet; run `oppx pair` first")?,
         };
         self.servers
             .get_key_value(name)
             .map(|(k, v)| (k.as_str(), v))
-            .with_context(|| format!("no server named \"{name}\"; see `openbase servers`"))
+            .with_context(|| format!("no server named \"{name}\"; see `oppx servers`"))
     }
 
     /// Adds or replaces a server. The first server becomes the default.
@@ -88,7 +88,7 @@ impl Config {
 
     pub fn set_default(&mut self, name: &str) -> Result<()> {
         if !self.servers.contains_key(name) {
-            bail!("no server named \"{name}\"; see `openbase servers`");
+            bail!("no server named \"{name}\"; see `oppx servers`");
         }
         self.default = Some(name.to_string());
         Ok(())
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn round_trips_with_private_permissions() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested/openbase/config.json");
+        let path = dir.path().join("nested/oppx/config.json");
         let mut cfg = Config::default();
         cfg.insert("home", server("https://10.0.0.2:9090")).unwrap();
         cfg.save(&path).unwrap();

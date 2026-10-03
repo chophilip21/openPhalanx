@@ -13,7 +13,7 @@ OpenPhalanx turns a Linux box with an NVIDIA GPU into a private coding-model ser
  └────────────────────────────┘   answers   └────────────────────────────────┘
 ```
 
-> **Status:** early development. The server and app work; the `openbase` client CLI, which will make pairing and certificate pinning one command, is in progress (see [`milestone.md`](milestone.md)).
+> **Status:** early development. The server and app work; the `oppx` client CLI, which will make pairing and certificate pinning one command, is in progress (see [`milestone.md`](milestone.md)).
 
 ## Run the server
 
@@ -61,7 +61,7 @@ OPENAI_API_BASE=https://$SERVER:9090/v1 OPENAI_API_KEY=$TOKEN \
 
 Keep the token: it stays valid until you revoke the device in the app (**Devices**). Pairing codes are single-use and expire after 10 minutes.
 
-> `-k` and `--no-verify-ssl` skip certificate checks, so use this only on a network you trust. `openbase` will replace these steps with `openbase pair` and `openbase aider`, which pin the server's certificate.
+> `-k` and `--no-verify-ssl` skip certificate checks, so use this only on a network you trust. `oppx` will replace these steps with `oppx pair` and `oppx aider`, which pin the server's certificate.
 
 ## Learn more
 

@@ -2533,18 +2533,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openbase"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "clap",
- "dirs 6.0.0",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "openphalanx"
 version = "0.2.0"
 dependencies = [
@@ -2574,6 +2562,18 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "oppx"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs 6.0.0",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
