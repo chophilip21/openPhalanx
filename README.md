@@ -55,6 +55,11 @@ Openphalanx operates on a decoupled client-server architecture where a lightweig
 
   * ✅ Verified: Rust 1.99.0 / Cargo 1.99.0 installed via rustup (`~/.cargo/bin`). Go is not installed, so Rust is the toolchain for `openbase`.
 
+## 2.3 Check Aider can edit existing code
+
+- [x] Edit an existing file `README.md`
+- [x] Add a new section "2.3 Check Aider can edit existing code"
+
 ## Phase 2: Unified Backend Container Setup (SGLang + Aider)
 
 * \[x\] **Step 2.1: Create Container Configurations**
