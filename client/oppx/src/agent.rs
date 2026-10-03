@@ -22,7 +22,8 @@ pub fn find_aider() -> Result<PathBuf> {
         .find(|p| is_executable(p))
         .context(
             "aider is not installed (or not on PATH). Install it with one of:\n  \
-             uv tool install aider-chat\n  pipx install aider-chat",
+             uv tool install --python 3.12 aider-chat\n  pipx install --python python3.12 aider-chat\n\
+             (Aider needs Python 3.12 or older; with 3.13 it fails on a missing `audioop` module.)",
         )
 }
 

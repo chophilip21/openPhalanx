@@ -53,7 +53,7 @@ On the laptop, install the `oppx` client (needs [Rust](https://rustup.rs)) and A
 ```bash
 git clone -b dev https://github.com/chophilip21/openPhalanx.git
 cargo install --path openPhalanx/client/oppx
-uv tool install aider-chat        # or: pipx install aider-chat
+uv tool install --python 3.12 aider-chat   # Aider needs Python ≤ 3.12
 ```
 
 Pair once, with the address and code shown in the app. `oppx` prints the server's certificate fingerprint; check that it matches the one in the app, then confirm:

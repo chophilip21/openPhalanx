@@ -412,7 +412,9 @@
 
 * \[ \] **Step 5.3: Distribution and CI/CD pipeline**
 
-We need to package this up and distribute both server and client. Refer to how others distribute packages via `curl` and etc. Build CI/CD pipeline, and bump version. We need automatic documentation generator.  
+- We need to package this up and distribute both server and client. Refer to how others distribute packages via `curl` and etc. End-user should not have to install aider-chat, and other dependencies by himself. 
+- Build CI/CD pipeline via github actions, and bump version. Versions gets determined by scale (bug, feature, major level), and by PR header (e.g "[bug]Fix ABCD" 0.0.1-> 0.0.2, or "[FEATURE]ASDFF" which would change to 0.1.2) 
+- We need automatic documentation generator upon new releases.
 
 
 ## Future Improvement

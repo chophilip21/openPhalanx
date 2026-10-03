@@ -233,6 +233,7 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
 | "Port 9090 is already in use" | Another program, or an old backend container, holds the port: `docker ps`, then `docker rm -f openphalanx-backend` |
 | Start disabled with "Needs X but only Y of VRAM is free" | Close other GPU programs (`nvidia-smi` lists them), or choose a smaller model or context |
 | Image download fails with "denied" or "unauthorized" | The GHCR package is private: make it public, or `docker login ghcr.io`. From a source checkout, the GUI builds the image locally instead |
+| `oppx aider` crashes with `No module named 'audioop'` / `'pyaudioop'` | Aider was installed with Python 3.13, which removed `audioop` (needed by Aider's `pydub` dependency). Reinstall with `uv tool install --force --python 3.12 aider-chat` |
 | Backend stops during start-up | The GUI shows the reason; the full output is on **Logs** or in `docker logs openphalanx-backend` |
 
 ## Repository layout
