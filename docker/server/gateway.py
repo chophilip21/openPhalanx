@@ -7,8 +7,9 @@ SGLang inference server, which listens on the container's loopback only.
 Two listeners share one process (and therefore pairing/metrics state):
 
 * Public API (``AGENT_PORT``, TLS): ``/health`` and ``/v1/pair`` are open;
-  everything else (``/v1/whoami`` and, from Phase 4, the inference proxy)
-  needs a device token.
+  everything else (``/v1/whoami`` and the OpenAI-compatible inference proxy,
+  ``/v1/models`` and ``/v1/chat/completions``) needs a device token. Request
+  bodies (prompts, i.e. client code) are never logged or stored.
 * Admin API (``ADMIN_PORT``, plain HTTP): used by the Openphalanx GUI only. The
   container publishes it on the host's loopback interface, and every call must
   carry the per-launch ``ADMIN_TOKEN``.
@@ -33,7 +34,8 @@ from pathlib import Path
 
 import httpx
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 SGLANG_ROOT = f"http://127.0.0.1:{os.environ.get('SGLANG_PORT', '8080')}"
@@ -43,6 +45,10 @@ AGENT_PORT = int(os.environ.get("AGENT_PORT", "9090"))
 ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "9091"))
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 STATE_DIR = Path(os.environ.get("STATE_DIR", "/state"))
+# Largest accepted request body. A 32k-token prompt is ~130 KB of text.
+MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", str(4 * 1024 * 1024)))
+# Generation can pause between tokens for a long prefill, so reads get a long timeout.
+UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=600.0, write=60.0, pool=10.0)
 
 PAIRING_TTL_S = 600
 PAIRING_MAX_ATTEMPTS = 5
@@ -94,6 +100,8 @@ class DeviceStore:
             "created_at": time.time(),
             "last_seen": None,
             "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
         }
         self.devices[device["id"]] = device
         self.save()
@@ -109,6 +117,11 @@ class DeviceStore:
     def touch(self, device: dict) -> None:
         device["last_seen"] = time.time()
         device["requests"] += 1
+        self.save()
+
+    def add_usage(self, device: dict, prompt_tokens: int, completion_tokens: int) -> None:
+        device["prompt_tokens"] = device.get("prompt_tokens", 0) + prompt_tokens
+        device["completion_tokens"] = device.get("completion_tokens", 0) + completion_tokens
         self.save()
 
     def revoke(self, device_id: str) -> bool:
@@ -305,6 +318,151 @@ async def whoami(device: dict = Depends(require_device)) -> dict:
     """Lets a client confirm its token is still valid (e.g. `openbase status`)."""
     devices.touch(device)
     return {"device_id": device["id"], "device_name": device["name"], "model": MODEL_NAME}
+
+
+# --------------------------------------------------------------------------
+# Inference proxy (OpenAI-compatible)
+# --------------------------------------------------------------------------
+
+_upstream: httpx.AsyncClient | None = None
+
+
+def upstream() -> httpx.AsyncClient:
+    global _upstream
+    if _upstream is None:
+        _upstream = httpx.AsyncClient(base_url=SGLANG_ROOT, timeout=UPSTREAM_TIMEOUT)
+    return _upstream
+
+
+def openai_error(status: int, message: str, kind: str = "invalid_request_error") -> JSONResponse:
+    return JSONResponse(status_code=status, content={"error": {"message": message, "type": kind}})
+
+
+class _TooLarge(Exception):
+    pass
+
+
+async def _read_body(request: Request) -> bytes:
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
+        raise _TooLarge
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_REQUEST_BYTES:
+            raise _TooLarge
+    return bytes(body)
+
+
+def _record_usage(device: dict, payload: bytes) -> None:
+    """Adds token counts from a response or SSE chunk that carries `usage`."""
+    try:
+        usage = json.loads(payload).get("usage")
+    except (ValueError, AttributeError):
+        return
+    if isinstance(usage, dict):
+        devices.add_usage(
+            device, int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+        )
+
+
+@app.get("/v1/models")
+async def list_models(device: dict = Depends(require_device)) -> Response:
+    try:
+        r = await upstream().get("/v1/models")
+    except httpx.HTTPError:
+        return openai_error(503, "The model is still loading; try again shortly.", "service_unavailable")
+    return Response(r.content, status_code=r.status_code, media_type="application/json")
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request, device: dict = Depends(require_device)) -> Response:
+    try:
+        raw = await _read_body(request)
+    except _TooLarge:
+        return openai_error(413, f"Request body exceeds {MAX_REQUEST_BYTES} bytes.")
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        return openai_error(400, "Request body must be a JSON object.")
+    # One served model: whatever name the client sends, it gets this one.
+    body["model"] = MODEL_NAME
+    stream = bool(body.get("stream"))
+    client_wants_usage = False
+    if stream:
+        # Always ask SGLang for the final usage chunk so tokens can be counted
+        # per device; it is stripped again below if the client didn't ask.
+        options = body.get("stream_options") if isinstance(body.get("stream_options"), dict) else {}
+        client_wants_usage = bool(options.get("include_usage"))
+        body["stream_options"] = {**options, "include_usage": True}
+
+    devices.touch(device)
+    metrics.requests_total += 1
+    metrics.requests_active += 1
+    metrics.last_request_at = time.time()
+    try:
+        resp = await upstream().send(
+            upstream().build_request("POST", "/v1/chat/completions", json=body), stream=True
+        )
+    except httpx.HTTPError:
+        metrics.requests_active -= 1
+        metrics.requests_failed += 1
+        return openai_error(503, "The model is still loading; try again shortly.", "service_unavailable")
+    if resp.status_code >= 400:
+        metrics.requests_failed += 1
+    media_type = resp.headers.get("content-type", "application/json")
+
+    if not stream:
+        try:
+            content = await resp.aread()
+        finally:
+            await resp.aclose()
+            metrics.requests_active -= 1
+        _record_usage(device, content)
+        return Response(content, status_code=resp.status_code, media_type=media_type)
+
+    async def relay():
+        # Re-frame on SSE event boundaries so the usage event can be inspected
+        # and, when the gateway injected it, removed before reaching the client.
+        buf = b""
+        try:
+            async for chunk in resp.aiter_raw():
+                buf += chunk
+                *events, buf = buf.split(b"\n\n")
+                out = []
+                for event in events:
+                    if event.startswith(b"data: {") and b'"usage"' in event:
+                        try:
+                            obj = json.loads(event[6:])
+                        except ValueError:
+                            obj = None
+                        if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
+                            usage = obj["usage"]
+                            devices.add_usage(
+                                device,
+                                int(usage.get("prompt_tokens") or 0),
+                                int(usage.get("completion_tokens") or 0),
+                            )
+                            if not client_wants_usage and obj.get("choices") == []:
+                                continue
+                    out.append(event + b"\n\n")
+                if out:
+                    yield b"".join(out)
+            if buf:
+                yield buf
+        except httpx.HTTPError:
+            metrics.requests_failed += 1
+        finally:
+            # Also runs when the client disconnects; closing the upstream
+            # stream makes SGLang abort the generation.
+            await resp.aclose()
+            metrics.requests_active -= 1
+
+    return StreamingResponse(
+        relay(), status_code=resp.status_code, media_type=media_type, headers={"cache-control": "no-cache"}
+    )
 
 
 # --------------------------------------------------------------------------

@@ -160,6 +160,8 @@ export type Device = {
   created_at: number;
   last_seen: number | null;
   requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
 };
 
 export const api = {

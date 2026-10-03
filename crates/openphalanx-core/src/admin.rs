@@ -56,6 +56,11 @@ pub struct Device {
     pub created_at: f64,
     pub last_seen: Option<f64>,
     pub requests: u64,
+    /// Counted when the backend reports usage (always for non-streaming calls).
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
 }
 
 pub struct AdminClient {

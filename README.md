@@ -48,7 +48,7 @@ Roadmap and progress are tracked in [`milestone.md`](milestone.md).
 
 | Component | State |
 |---|---|
-| Backend image (SGLang + gateway) | Working. `0.2.0` (no Aider; the agent runs on the client) is built locally but not yet pushed to GHCR |
+| Backend image (SGLang + gateway) | Working, including the authenticated OpenAI-compatible inference API. `0.2.0` is built locally but not yet pushed to GHCR |
 | Server GUI (`app/`, Linux) | Builds and runs; first UI review pending |
 | Pairing, TLS and device tokens | Working |
 | `openbase` client CLI | Not started. Until it exists, clients can't connect for real (see `milestone.md`, Phase 4) |
@@ -135,7 +135,7 @@ Optional environment variables: `MODEL_PATH`, `CONTEXT_LENGTH`, `MEM_FRACTION_ST
 
 | | |
 |---|---|
-| `9090/tcp` (all interfaces) | Public gateway API, TLS only: `/health` and `/v1/pair` are open; `/v1/whoami` (and the Phase 4 inference proxy) need a device token |
+| `9090/tcp` (all interfaces) | Public gateway API, TLS only. `/health` and `/v1/pair` are open. `/v1/whoami`, `/v1/models` and `/v1/chat/completions` (OpenAI-compatible, streaming) need a device token |
 | `9091/tcp` (`127.0.0.1` only) | Admin API for the GUI; needs the per-launch admin token |
 | `~/.config/openphalanx/settings.json` | Selected model, context length, GPU index, custom models |
 | `~/.local/share/openphalanx/models/` | Models downloaded by the GUI (verified, pinned to a commit) |
@@ -150,7 +150,7 @@ Open `9090/tcp` in your firewall for the clients' network. Never expose `9091`.
 * **Pairing codes:** 8 characters, about 39 bits. Each is single-use, valid for 10 minutes, and burned after 5 wrong attempts, with a 1 s delay after each miss.
 * **Device tokens:** each client trades a pairing code for its own random 256-bit device token. The server stores only the SHA-256 hash, and you can revoke any device from the GUI.
 * **Admin API:** the admin API is reachable from the server machine only, and requires a random token generated at each launch.
-* **No code stored or executed:** the server keeps no code and runs no commands for clients. Model weights are mounted read-only, and the backend never downloads weights on its own.
+* **No code stored or executed:** the server keeps no code and runs no commands for clients. Request bodies (prompts) are never logged; only per-device request and token counts are kept. Model weights are mounted read-only, and the backend never downloads weights on its own.
 
 ## Development
 

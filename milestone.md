@@ -196,13 +196,33 @@
 
 ## Phase 4: Client-Side Agent & `openbase` CLI
 
-* \[ \] **Step 4.1: Authenticated Inference Gateway (server)**
+* \[x\] **Step 4.1: Authenticated Inference Gateway (server)**
 
   * In `docker/server/gateway.py`, add OpenAI-compatible `POST /v1/chat/completions` and `GET /v1/models` on the public TLS port. They proxy to SGLang on `127.0.0.1:8080`, streaming included, and require a device token.
 
   * Pin `model` to the served model so clients can't address anything else. Enforce a request-size limit, and count requests and tokens per device for the Devices page.
 
   * Keep prompts out of logs. Only metadata is recorded (device, token counts, latency).
+
+  * ✅ Implemented in `docker/server/gateway.py`:
+
+    * `GET /v1/models` and `POST /v1/chat/completions` require a device token and proxy to SGLang. Streaming is relayed event by event, and a client disconnect closes the upstream stream, which makes SGLang abort the generation.
+
+    * `model` is overwritten with the served model; SGLang alone would accept any name.
+
+    * Bodies over 4 MiB (`MAX_REQUEST_BYTES`) get `413`. Errors use OpenAI's `{"error": {...}}` shape, and the API answers `503` while the model is still loading.
+
+    * **Per-device token counts:** streaming clients such as Aider don't ask for usage, so the gateway asks SGLang for it (`stream_options.include_usage`). It records the final usage event, and strips that event when the client didn't ask for it. The Devices page shows requests and tokens in and out.
+
+  * ✅ Verified with the lifecycle example (`cargo run -p openphalanx-core --example lifecycle`):
+
+    * 401 without a token or with a bad one, model pinned (a request for "gpt-4" is served by `openphalanx-coder`), streaming ends with `[DONE]`, and a 5 MiB body gets 413.
+
+    * Usage is counted for both streaming and non-streaming calls, and a client that didn't ask for usage receives no usage events.
+
+    * A marker string in a prompt appears 0 times in the container log.
+
+  * ✅ Verified with **real Aider 0.86** on the client side: `OPENAI_API_BASE=https://<server>:9090/v1`, the device token as API key, and `--no-verify-ssl` for this test only (Step 4.4's proxy replaces that with certificate pinning). The edit was applied to the local working tree, uncommitted. The device was credited 761 prompt and 31 completion tokens, against Aider's own estimate of 753/30.
 
 * \[ \] **Step 4.2: Scaffold `openbase` (Rust, single binary)**
 

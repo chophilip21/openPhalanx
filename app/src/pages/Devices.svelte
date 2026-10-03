@@ -2,7 +2,7 @@
   import { ask } from "@tauri-apps/plugin-dialog";
   import Icon from "../components/Icon.svelte";
   import { api, errorText, type Device } from "../lib/api";
-  import { ago } from "../lib/format";
+  import { ago, tokens } from "../lib/format";
   import { app } from "../lib/store.svelte";
 
   let devices = $state<Device[]>([]);
@@ -71,7 +71,9 @@
             </span>
             <span class="muted small">Paired {ago(d.created_at)}</span>
             <span class="muted small">Last seen {ago(d.last_seen)}</span>
-            <span class="muted small">{d.requests} task{d.requests === 1 ? "" : "s"}</span>
+            <span class="muted small" title="Prompt / generated tokens (counted when the client reports usage)">
+              {d.requests} request{d.requests === 1 ? "" : "s"} · {tokens(d.prompt_tokens)} in / {tokens(d.completion_tokens)} out
+            </span>
             <button class="danger" onclick={() => revoke(d)}>Revoke</button>
           </div>
         {/each}
@@ -83,7 +85,7 @@
 <style>
   .empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 48px; text-align: center; }
   .list { padding: 4px 0; }
-  .dev { display: grid; grid-template-columns: 36px 1.6fr 1fr 1fr 0.7fr auto; gap: 12px; align-items: center; padding: 12px 18px; border-top: 1px solid var(--border); }
+  .dev { display: grid; grid-template-columns: 36px 1.5fr 0.9fr 0.9fr 1.3fr auto; gap: 12px; align-items: center; padding: 12px 18px; border-top: 1px solid var(--border); }
   .dev:first-child { border-top: none; }
   .ic { width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center; background: var(--surface-2); color: var(--on); }
   .name { display: flex; flex-direction: column; }
