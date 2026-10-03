@@ -1,15 +1,17 @@
 //! `oppx`: the OpenPhalanx client. Pairs this machine with a GPU server
-//! and (from Phase 4.4) runs a local coding agent against it.
+//! and runs a local coding agent (Aider) against it through a pinned proxy.
 
+use std::ffi::OsString;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use oppx::config::{self, Config, Server};
-use oppx::{api, tls};
+use oppx::proxy::Proxy;
+use oppx::{agent, api, tls};
 
 #[derive(Parser)]
 #[command(name = "oppx", version, about = "Use an OpenPhalanx GPU server from this machine")]
@@ -59,6 +61,26 @@ enum Command {
         #[arg(long)]
         local_only: bool,
     },
+    /// Run Aider in the current directory, using the server's model.
+    ///
+    /// Everything after `--` (or any unrecognized argument) goes to Aider,
+    /// e.g. `oppx aider -- --message "add tests" src/lib.rs`.
+    Aider {
+        /// Server name (defaults to the default server).
+        #[arg(long)]
+        server: Option<String>,
+        /// Arguments passed through to Aider.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "AIDER_ARGS")]
+        args: Vec<OsString>,
+    },
+    /// Run only the local proxy, for other OpenAI-compatible tools.
+    Proxy {
+        /// Server name (defaults to the default server).
+        name: Option<String>,
+        /// Local port (default: a free one).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
     /// List paired servers (tokens are never shown).
     Servers,
     /// Set the default server.
@@ -92,6 +114,11 @@ async fn run(cli: Cli) -> Result<()> {
             unpair(&mut cfg, name.as_deref(), local_only).await?;
             cfg.save(&path)?;
         }
+        Command::Aider { server, args } => {
+            let code = run_aider(&cfg, server.as_deref(), &args).await?;
+            std::process::exit(code);
+        }
+        Command::Proxy { name, port } => run_proxy(&cfg, name.as_deref(), port).await?,
         Command::Servers => {
             if cfg.servers.is_empty() {
                 println!("No servers paired yet. Pair with: oppx pair <server> <code>");
@@ -260,6 +287,77 @@ async fn unpair(cfg: &mut Config, name: Option<&str>, local_only: bool) -> Resul
         None => println!("No servers left."),
     }
     Ok(())
+}
+
+/// Confirms the server is usable before starting anything, and returns its
+/// model's context window.
+async fn preflight(name: &str, s: &Server) -> Result<u64> {
+    let client = tls::pinned_client(&s.fingerprint)?;
+    let health = match api::health(&client, &s.url).await {
+        Ok(h) => h,
+        Err(e) if tls::is_pin_mismatch(e.as_ref()) => bail!(
+            "the server's TLS certificate has changed; nothing was sent. Run `oppx status {name}` for details."
+        ),
+        Err(e) => return Err(e.context(format!("cannot reach {} (\"{name}\")", s.url))),
+    };
+    if api::whoami(&client, &s.url, &s.token).await?.is_none() {
+        bail!("this device was revoked on \"{name}\". Pair again: oppx pair {} <code> --as {name} --force", s.url);
+    }
+    if health.sglang != "ready" {
+        bail!("the model on \"{name}\" is still loading; try again in a minute (`oppx status` shows progress)");
+    }
+    Ok(api::context_len(&client, &s.url, &s.token).await?.unwrap_or(32_768))
+}
+
+async fn run_proxy(cfg: &Config, name: Option<&str>, port: u16) -> Result<()> {
+    let (name, s) = cfg.server(name)?;
+    let ctx = preflight(name, s).await?;
+    let proxy = Proxy::bind(s, port).await?;
+    println!("Proxy for \"{name}\" ({}) is running.", s.url);
+    println!("  OPENAI_API_BASE={}", proxy.base_url());
+    println!("  OPENAI_API_KEY={}", proxy.local_key);
+    println!("  model: {} ({}k context)", agent::AIDER_MODEL.trim_start_matches("openai/"), ctx / 1024);
+    println!("The key is valid only while this proxy runs. Press Ctrl-C to stop.");
+    tokio::select! {
+        r = proxy.serve() => r,
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    }
+}
+
+async fn run_aider(cfg: &Config, name: Option<&str>, user_args: &[OsString]) -> Result<i32> {
+    agent::reject_commit_flags(user_args)?;
+    let aider = agent::find_aider()?;
+    let (name, s) = cfg.server(name)?;
+    let ctx = preflight(name, s).await?;
+    let metadata = agent::model_metadata(ctx)?;
+    let proxy = Proxy::bind(s, 0).await?;
+    let (base, key) = (proxy.base_url(), proxy.local_key.clone());
+    let serving = tokio::spawn(proxy.serve());
+    eprintln!("oppx: using \"{name}\" ({}), {}k context. Edits stay uncommitted.", s.url, ctx / 1024);
+
+    let mut child = tokio::process::Command::new(&aider)
+        .args(agent::aider_args(metadata.path(), user_args))
+        .env("OPENAI_API_BASE", &base)
+        .env("OPENAI_API_KEY", &key)
+        // Don't let an unrelated OpenAI/LiteLLM setup in the user's env redirect requests.
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("OPENAI_API_TYPE")
+        .spawn()
+        .with_context(|| format!("cannot start {}", aider.display()))?;
+
+    // Ctrl-C belongs to Aider (it shares the terminal); keep oppx and its
+    // proxy alive until Aider itself exits.
+    let swallow = tokio::spawn(async {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+        }
+    });
+    let status = child.wait().await?;
+    swallow.abort();
+    serving.abort();
+    Ok(status.code().unwrap_or(1))
 }
 
 #[cfg(test)]

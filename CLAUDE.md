@@ -63,7 +63,7 @@ Openphalanx splits the work along a single line: **code and execution stay on th
 | Backend image (SGLang + gateway) | Working, including the authenticated OpenAI-compatible inference API. `0.2.0` is built locally but not yet pushed to GHCR |
 | Server GUI (`app/`, Linux) | Builds and runs; first UI review pending |
 | Pairing, TLS and device tokens | Working |
-| `oppx` client CLI | Pairing with certificate pinning, `status`, `unpair`, `servers` and `use` work. The local proxy and `oppx aider` (Step 4.4) are next |
+| `oppx` client CLI | Working: `pair` (certificate pinning), `status`, `unpair`, `aider` (local Aider through a pinned loopback proxy), `proxy`, `servers`, `use` |
 
 ## Requirements
 
@@ -143,18 +143,22 @@ curl -s -H "x-admin-token: $ADMIN_TOKEN" http://127.0.0.1:9091/admin/status | jq
 
 Optional environment variables: `MODEL_PATH`, `CONTEXT_LENGTH`, `MEM_FRACTION_STATIC` (default `0.85`; the GUI computes it from free VRAM instead), `SGLANG_EXTRA_ARGS`. The GUI shows a container started this way as "running outside the app", and can stop it.
 
-## Connecting a client before `oppx aider` exists
-
-`oppx pair <server> <code>` now pairs with certificate pinning, and `oppx status` checks the connection. Until Step 4.4's local proxy exists, Aider itself still has to reach the gateway directly, with certificate checks off. The `curl` route below does that; use it only on a trusted network.
+## Client (`oppx`)
 
 ```bash
-TOKEN=$(curl -sk https://$SERVER:9090/v1/pair -H 'content-type: application/json' \
-  -d '{"code":"ABCD-EFGH","device_name":"my-laptop"}' | jq -r .token)
-OPENAI_API_BASE=https://$SERVER:9090/v1 OPENAI_API_KEY=$TOKEN \
-  aider --model openai/openphalanx-coder --no-verify-ssl --no-auto-commits --no-dirty-commits
+cargo install --path client/oppx              # or: cargo build -p oppx (binary in target/debug/oppx)
+oppx pair <server> <code> [--fingerprint FP | --yes] [--as NAME] [--device-name NAME] [--force]
+oppx status [NAME]                            # certificate pinned ✓, token valid ✓, model ready + context
+oppx aider [--server NAME] [-- aider args]    # local Aider via pinned loopback proxy; never commits
+oppx proxy [NAME] [--port N]                  # proxy only; prints OPENAI_API_BASE and a per-run local key
+oppx unpair [NAME] [--local-only]             # self-revoke on the server, then forget locally
+oppx servers | oppx use NAME
 ```
 
-The admin API can issue a code without the GUI: `curl -X POST -H "x-admin-token: $ADMIN_TOKEN" http://127.0.0.1:9091/admin/pairing`. The token is in the container env: `docker inspect openphalanx-backend --format '{{json .Config.Env}}'`.
+* **Config:** `~/.config/oppx/config.json` (`0600`), or `OPPX_CONFIG` / `--config`.
+* **Agent isolation:** the agent sees only the per-run local key; the device token stays in `oppx`.
+* **Testing without a GUI:** pairing codes can be issued through the admin API: `curl -X POST -H "x-admin-token: $ADMIN_TOKEN" http://127.0.0.1:9091/admin/pairing`. The token is in the container env: `docker inspect openphalanx-backend --format '{{json .Config.Env}}'`.
+* **Stand-in agents:** a fake `aider` script on `PATH` (printing its args and env) is a quick way to test `oppx aider` without the real agent.
 
 ## Ports and files
 

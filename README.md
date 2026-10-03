@@ -13,7 +13,7 @@ OpenPhalanx turns a Linux box with an NVIDIA GPU into a private coding-model ser
  └────────────────────────────┘   answers   └────────────────────────────────┘
 ```
 
-> **Status:** early development. The server and app work; the `oppx` client CLI, which will make pairing and certificate pinning one command, is in progress (see [`milestone.md`](milestone.md)).
+> **Status:** early development, Linux server only. The server app and the `oppx` client work end to end; see [`milestone.md`](milestone.md) for what's next.
 
 ## Run the server
 
@@ -48,20 +48,28 @@ Open port `9090/tcp` to your laptops' network.
 
 ## Connect a laptop
 
-On the laptop, install Aider (`uv tool install aider-chat` or `pipx install aider-chat`), pair once, then work in any git repo:
+On the laptop, install the `oppx` client (needs [Rust](https://rustup.rs)) and Aider:
 
 ```bash
-SERVER=192.168.1.77            # the address shown in the app
-TOKEN=$(curl -sk https://$SERVER:9090/v1/pair -H 'content-type: application/json' \
-  -d '{"code":"ABCD-EFGH","device_name":"my-laptop"}' | jq -r .token)
-
-OPENAI_API_BASE=https://$SERVER:9090/v1 OPENAI_API_KEY=$TOKEN \
-  aider --model openai/openphalanx-coder --no-verify-ssl --no-auto-commits --no-dirty-commits
+git clone -b dev https://github.com/chophilip21/openPhalanx.git
+cargo install --path openPhalanx/client/oppx
+uv tool install aider-chat        # or: pipx install aider-chat
 ```
 
-Keep the token: it stays valid until you revoke the device in the app (**Devices**). Pairing codes are single-use and expire after 10 minutes.
+Pair once, with the address and code shown in the app. `oppx` prints the server's certificate fingerprint; check that it matches the one in the app, then confirm:
 
-> `-k` and `--no-verify-ssl` skip certificate checks, so use this only on a network you trust. `oppx` will replace these steps with `oppx pair` and `oppx aider`, which pin the server's certificate.
+```bash
+oppx pair 192.168.1.77 ABCD-EFGH
+oppx status                       # certificate, device and model all ✓
+```
+
+Then, in any git repo:
+
+```bash
+oppx aider                        # extra Aider options go after --, e.g. oppx aider -- src/main.rs
+```
+
+Aider edits your files locally and never commits; review with `git diff` and commit yourself. Remove a laptop with `oppx unpair` (or revoke it in the app's **Devices** page). Other OpenAI-compatible tools can use the server through `oppx proxy`.
 
 ## Learn more
 

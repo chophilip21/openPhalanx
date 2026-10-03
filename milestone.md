@@ -298,13 +298,41 @@
 
     * **`pair --force`** re-pairs, and **`unpair`** removes the device on the server, confirmed through the admin API.
 
-* \[ \] **Step 4.4: Local proxy and agent launcher**
+* \[x\] **Step 4.4: Local proxy and agent launcher**
 
   * `oppx proxy`: listens on `127.0.0.1:<random port>`, forwards to the server over TLS pinned to the stored fingerprint, and adds the device token. The agent talks plain HTTP to loopback, so it never needs to trust a self-signed certificate or see the token.
 
   * `oppx aider [aider args…]`: starts the proxy, then runs the user's local Aider with `OPENAI_API_BASE` pointing at it, `--model openai/openphalanx-coder`, the model's context window, and `--no-auto-commits --no-dirty-commits` (agents never commit directly). It stops the proxy when Aider exits.
 
   * Check that Aider is installed and print an install hint (`pipx install aider-chat` / `uv tool install aider-chat`). A built-in Rust agent loop, which would remove the Python dependency, is a later option.
+
+  * ✅ Implemented (`client/oppx/src/{proxy,agent,main}.rs`):
+
+    * **`oppx proxy [name] [--port N]`:** an `axum` server on `127.0.0.1` that forwards only `GET /v1/models` and `POST /v1/chat/completions` through the pinned `reqwest` client, adding the device token. Responses stream through as they arrive, and dropping the client closes the upstream request. Local clients must send a **random per-run key** (`oppx-local-…`), so other processes and users on the laptop can't use the device's identity, and the real token never leaves `oppx`. On a certificate change it refuses and returns 502. Useful on its own for other OpenAI-compatible tools.
+
+    * **`oppx aider [--server name] [-- aider args]`:**
+
+      1. Checks the certificate, token and model readiness first, failing with clear messages.
+
+      2. Writes a private model-metadata file with the real context length, so Aider doesn't warn about an unknown model.
+
+      3. Starts the proxy on a free port and runs the user's `aider` with only the local key and base URL. `OPENAI_BASE_URL` and `OPENAI_API_TYPE` are removed from Aider's environment.
+
+      4. Arguments are ordered as defaults (`--edit-format diff`, etc.), then the user's (which override them), then `--no-auto-commits --no-dirty-commits` (which nothing overrides). `--auto-commits` and `--dirty-commits` are rejected outright.
+
+      5. Ctrl-C goes to Aider while `oppx` keeps the proxy alive, and Aider's exit code is passed through. A missing `aider` gets install hints.
+
+  * ✅ Verified against the live backend (13 client unit tests plus end-to-end runs):
+
+    * **With a stand-in `aider`:** the exact argument order and the user's override were confirmed. The device token appears 0 times in the agent's environment, and the exit code (7) passed through.
+
+    * **The proxy on its own:** a missing or wrong key gets 401, other paths 404, and it listens on loopback only. Non-streaming works, and streaming arrives incrementally. **Disconnecting mid-generation leaves 0 running requests on SGLang.**
+
+    * **Real Aider 0.86.2 via `oppx aider`,** with no certificate flags: the edit was applied to a repo that had an uncommitted change, nothing was committed, and the device was credited 2,610/203 tokens.
+
+    * **Ctrl-C:** the agent received the interrupt, kept running, and its next request through the proxy returned 200.
+
+    * **Install:** `cargo install --path client/oppx` works. The repo is private, so `cargo install --git` would need credentials.
 
 ## Phase 5: End-to-End Validation & Caching Benchmark
 
@@ -331,7 +359,7 @@ We need to package this up and distribute both server and client. Refer to how o
 
 ## Future Improvement
 
-1. Important feature, and this deserves its own section. If you combine SearXNG and /web (aider), we can make something awesome.There are MCP servers, like mcp-searxng that we can leverage to fill up the gab of missing feature of automatic web search. SearXNG should reside on the server side. 
+1. Important feature, and this deserves its own section. If you combine SearXNG and /web (aider), we can make something awesome.There are MCP servers, like mcp-searxng that we can leverage to fill up the gab of missing feature of automatic web search. SearXNG should reside on the server side. Right now web search cannot be done unless you provide "/web" as the keyword. 
 2. Another important feature that deserves its own section. right now, our codebase assumes there is one server, and N possible clients. But this is not only the case. There can be N servers that can distribute the workload, and load one large model in a distributed way. And we can also imagine multiple clients, that points at cluster of nodes. 
 
 Scaling from a single GPU workstation to a cluster of nodes handling multiple concurrent clients is the exact use case that frameworks like SGLang and vLLM were built to solve for enterprise deployments.To achieve this, the architecture splits into two distinct problems: distributing the model (across N servers) and distributing the traffic (routing N clients).Here is exactly how this is handled in modern LLM infrastructure.Part 1: Distributing One Large Model Across N ServersIf a model is too large to fit on a single machine (e.g., a 70B parameter model or massive Mixture-of-Experts like DeepSeek), you cluster multiple physical servers together. SGLang supports this natively using Ray and NCCL (NVIDIA Collective Communications Library).Tensor Parallelism (TP) & Pipeline Parallelism (PP):TP slices individual matrix math operations across multiple GPUs. If those GPUs are on different servers, SGLang uses Ray to coordinate them over the network.PP slices the model vertically. Server A handles layers 1–20, and Server B handles layers 21–40. Server A computes the first half and passes the intermediate tensors over the network to Server B to finish.   Prefill/Decode (PD) Disaggregation:This is a highly advanced SGLang feature for clusters. You designate some servers strictly as "Prefill nodes" (their only job is reading massive codebases/prompts) and other servers as "Decode nodes" (their only job is generating the output tokens). Once a Prefill node processes an Aider Repo Map, it transfers the KV cache over the network to the Decode node to stream the answer.   Note: Splitting a single model across multiple physical machines requires extremely fast networking (e.g., InfiniBand or 400GbE RoCE). Standard Gigabit Ethernet is too slow for Tensor Parallelism between physical servers.Part 2: Routing N Clients to N Servers (Load Balancing)If you simply want to increase your capacity to handle many developers (N clients) at once, you run identical copies of your model across multiple independent servers (Data Parallelism).To the clients, there should only ever be one API endpoint. You accomplish this using a router.The SGLang Model Gateway (Router):SGLang has a built-in router (sglang-router) that sits in front of all your GPU servers. You launch your GPU workers, and then launch the router on a head node.   Bashpython -m sglang_router.launch_server --host 0.0.0.0 --port 30000 --dp-size 4
