@@ -32,8 +32,15 @@ impl ResolvedModel {
         wanted.min(self.max_context)
     }
 
-    pub fn requirement(&self, wanted_context: u32) -> Requirement {
-        vram::requirement(self.weight_bytes, &self.arch, self.context_len(wanted_context))
+    /// Conservative VRAM need on a GPU with the given compute capability.
+    pub fn requirement(&self, wanted_context: u32, compute_capability: Option<f32>) -> Requirement {
+        vram::requirement(
+            self.weight_bytes,
+            self.quant.as_deref(),
+            &self.arch,
+            self.context_len(wanted_context),
+            compute_capability,
+        )
     }
 }
 
@@ -179,7 +186,8 @@ pub async fn preflight(settings: &Settings) -> Preflight {
         }
     }
 
-    let requirement = model.as_ref().map(|m| m.requirement(settings.context_len));
+    let cc = gpu.as_ref().and_then(|g| g.compute_capability);
+    let requirement = model.as_ref().map(|m| m.requirement(settings.context_len, cc));
     let fit = match (&requirement, &gpu) {
         (Some(req), Some(g)) if !running => Some(vram::check(req, g.free_bytes)),
         _ => None,
@@ -255,7 +263,7 @@ pub async fn start(settings: &Settings, mut on_progress: impl FnMut(StartProgres
         .into_iter()
         .find(|g| g.index == settings.gpu_index)
         .ok_or_else(|| anyhow::anyhow!("GPU {} disappeared", settings.gpu_index))?;
-    let req = model.requirement(settings.context_len);
+    let req = model.requirement(settings.context_len, gpu.compute_capability);
     let fit = vram::check(&req, gpu.free_bytes);
     if fit.fit == Fit::Insufficient {
         bail!(fit.message);

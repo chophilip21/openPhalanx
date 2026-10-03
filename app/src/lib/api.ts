@@ -23,13 +23,12 @@ export type Pairing = {
 export type AdminStatus = {
   sglang: string;
   model: string;
-  agent: {
+  gateway: {
     started_at: number;
-    tasks_total: number;
-    tasks_failed: number;
-    tasks_active: number;
-    tasks_queued: number;
-    last_task_at: number | null;
+    requests_total: number;
+    requests_failed: number;
+    requests_active: number;
+    last_request_at: number | null;
   };
   inference: {
     prompt_tokens_total?: number | null;
@@ -78,10 +77,13 @@ export type Snapshot = {
 
 export type Requirement = {
   context_len: number;
+  download_bytes: number;
+  /** Estimated weights once loaded (download + repacking; 2x for FP8 without native support). */
   weight_bytes: number;
   kv_bytes: number;
   overhead_bytes: number;
   total_bytes: number;
+  fp8_upcast: boolean;
 };
 
 export type Fit = "ok" | "tight" | "insufficient";
@@ -120,7 +122,8 @@ export type ModelRow = {
   quant: string | null;
   license: string | null;
   notes: string | null;
-  recommended: boolean;
+  tested: boolean;
+  best_fit: boolean;
   custom: boolean;
   weight_bytes: number;
   max_context: number;

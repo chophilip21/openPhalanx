@@ -405,7 +405,10 @@ struct ModelRow {
     quant: Option<String>,
     license: Option<String>,
     notes: Option<String>,
-    recommended: bool,
+    /// Verified end to end on real hardware (catalog flag).
+    tested: bool,
+    /// Largest installed-or-downloadable model that fits comfortably right now.
+    best_fit: bool,
     custom: bool,
     weight_bytes: u64,
     max_context: u32,
@@ -448,12 +451,12 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
 
     let mut keys: Vec<String> = catalog::catalog().iter().map(|e| server::catalog_key(&e.id)).collect();
     keys.extend(settings.custom_models.iter().map(|c| c.key.clone()));
-    let rows = keys
+    let mut rows: Vec<ModelRow> = keys
         .iter()
         .filter_map(|key| {
             let m = server::resolve(&settings, key)?;
             let entry = key.strip_prefix("catalog:").and_then(catalog::find);
-            let requirement = m.requirement(settings.context_len);
+            let requirement = m.requirement(settings.context_len, gpu.as_ref().and_then(|g| g.compute_capability));
             Some(ModelRow {
                 key: key.clone(),
                 name: m.label.clone(),
@@ -466,7 +469,8 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
                 quant: m.quant.clone(),
                 license: entry.as_ref().map(|e| e.license.clone()),
                 notes: entry.as_ref().and_then(|e| e.notes.clone()),
-                recommended: entry.as_ref().is_some_and(|e| e.recommended),
+                tested: entry.as_ref().is_some_and(|e| e.tested),
+                best_fit: false,
                 custom: entry.is_none(),
                 weight_bytes: m.weight_bytes,
                 max_context: m.max_context,
@@ -477,6 +481,20 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
             })
         })
         .collect();
+    // Recommend the catalog model with the most parameters that fits with
+    // headroom ("Ok", not "Tight"); among equal sizes, prefer higher precision.
+    let params = |r: &ModelRow| {
+        r.key.strip_prefix("catalog:").and_then(catalog::find).and_then(|e| e.params_billions())
+    };
+    if let Some(best) = rows
+        .iter_mut()
+        .filter(|r| r.fit.as_ref().is_some_and(|f| f.fit == vram::Fit::Ok))
+        .filter_map(|r| params(r).map(|p| ((p * 10.0) as u64, r.requirement.weight_bytes, r)))
+        .max_by_key(|(p, w, _)| (*p, *w))
+        .map(|(_, _, r)| r)
+    {
+        best.best_fit = true;
+    }
     Ok(ModelsView {
         rows,
         selected: settings.selected_model,
@@ -654,12 +672,15 @@ async fn inspect_source(state: &AppState, input: &str) -> CmdResult<CustomInspec
         }
     };
     let ctx = settings.context_len.min(info.max_context);
-    let requirement = vram::requirement(info.weight_bytes, &info.arch, ctx);
-    let free = gpu::query()
-        .await
-        .ok()
-        .and_then(|g| g.into_iter().find(|g| g.index == settings.gpu_index))
-        .map(|g| g.free_bytes);
+    let gpu = gpu::query().await.ok().and_then(|g| g.into_iter().find(|g| g.index == settings.gpu_index));
+    let requirement = vram::requirement(
+        info.weight_bytes,
+        info.quant.as_deref(),
+        &info.arch,
+        ctx,
+        gpu.as_ref().and_then(|g| g.compute_capability),
+    );
+    let free = gpu.map(|g| g.free_bytes);
     Ok(CustomInspect {
         key: source.key(),
         label,

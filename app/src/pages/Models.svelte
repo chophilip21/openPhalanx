@@ -118,6 +118,11 @@
     Openphalanx never redistributes weights. Downloads come straight from the publisher's Hugging Face repo, pinned to
     a commit and checked against its SHA-256 hashes.
   </p>
+  <p class="sub estimate">
+    <strong>VRAM needed</strong> is a deliberately conservative estimate, much larger than the download:
+    weights as loaded, KV cache for the full context window plus 25%, and runtime memory (CUDA graphs and
+    activations). Models marked <em>Won't fit</em> are blocked from starting.
+  </p>
 
   <div class="toolbar">
     <div class="ctx">
@@ -141,7 +146,7 @@
 
   <div class="table card">
     <div class="tr th">
-      <span>Model</span><span>Quantization</span><span>Weights</span><span>VRAM needed</span><span>License</span><span></span>
+      <span>Model</span><span>Quantization</span><span>Download</span><span>VRAM needed</span><span>License</span><span></span>
     </div>
     {#each view?.rows ?? [] as row (row.key)}
       {@const dl = app.downloads[row.key]}
@@ -151,7 +156,8 @@
         <span class="name">
           <span class="title">
             {row.name}
-            {#if row.recommended}<span class="badge ok">Recommended</span>{/if}
+            {#if row.best_fit}<span class="badge ok" title="Largest model that fits this GPU with headroom at the selected context">Best fit for this GPU</span>{/if}
+            {#if row.tested}<span class="badge neutral" title="Verified end to end on real hardware">Tested</span>{/if}
             {#if row.custom}<span class="badge neutral">Custom</span>{/if}
           </span>
           {#if row.source_url}
@@ -164,12 +170,20 @@
           {#if row.notes}<span class="note">{row.notes}</span>{/if}
         </span>
         <span>{row.params ? `${row.params} · ` : ""}{row.quant ?? "–"}</span>
-        <span class="num">{gb(row.weight_bytes)}</span>
+        <span class="num muted">{gb(row.requirement.download_bytes)}</span>
         <span class="need">
-          <span class="num">{gib(row.requirement.total_bytes)}</span>
-          {#if row.fit}<span class="badge {row.fit.fit}" title={row.fit.message}>{FIT_LABEL[row.fit.fit]}</span>{/if}
+          <span class="need-top">
+            <span class="num total">{gib(row.requirement.total_bytes)}</span>
+            {#if row.fit}<span class="badge {row.fit.fit}" title={row.fit.message}>{FIT_LABEL[row.fit.fit]}</span>{/if}
+          </span>
+          <span class="note num" title="Weights as loaded + KV cache ({tokens(row.requirement.context_len)} context + 25%) + runtime">
+            {gib(row.requirement.weight_bytes)} + {gib(row.requirement.kv_bytes)} KV + {gib(row.requirement.overhead_bytes)} runtime
+          </span>
+          {#if row.requirement.fp8_upcast}
+            <span class="note warn-note">FP8 counted at 16-bit size: this GPU has no native FP8</span>
+          {/if}
           {#if row.requirement.context_len < (view?.context_len ?? 0)}
-            <span class="note">capped at {tokens(row.requirement.context_len)}</span>
+            <span class="note">context capped at {tokens(row.requirement.context_len)}</span>
           {/if}
         </span>
         <span class="muted">{row.license ?? "–"}</span>
@@ -236,6 +250,7 @@
           overhead={inspected.requirement.overhead_bytes} available={inspected.fit?.free_bytes ?? null}
           total={view?.gpu?.total_bytes ?? inspected.requirement.total_bytes} fit={inspected.fit?.fit ?? null} />
         {#if inspected.fit}<p class="muted small">{inspected.fit.message}</p>{/if}
+        {#if inspected.requirement.fp8_upcast}<p class="small warn-note">FP8 weights are counted at 16-bit size because this GPU has no native FP8.</p>{/if}
         <div>
           <button class="primary" onclick={addCustom}>
             {inspected.local ? "Add model" : `Add and download (${gb(inspected.info.weight_bytes)})`}
@@ -270,7 +285,11 @@
   .link.plain { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .note { font-size: 11.5px; color: var(--faint); }
   .num { font-variant-numeric: tabular-nums; }
-  .need { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .need { display: flex; flex-direction: column; gap: 2px; }
+  .need-top { display: flex; gap: 6px; align-items: center; }
+  .need .total { font-weight: 600; }
+  .warn-note { color: var(--busy); }
+  .estimate { margin-top: -14px; font-size: 12.5px; }
   .actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
   .actions button { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; }
   .icon { padding: 6px !important; }

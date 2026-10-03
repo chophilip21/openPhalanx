@@ -14,6 +14,8 @@ args=(
   --port "${SGLANG_PORT}"
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --enable-metrics
+  # The GUI polls these every 2 s; keep them out of the log it displays.
+  --uvicorn-access-log-exclude-prefixes /metrics /v1/models /health
 )
 if [[ -n "${CONTEXT_LENGTH:-}" ]]; then
   args+=(--context-length "${CONTEXT_LENGTH}")

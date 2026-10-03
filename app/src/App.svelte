@@ -39,7 +39,7 @@
       </button>
     {/each}
     <div class="spacer"></div>
-    <div class="version muted">v0.1.0 · Linux</div>
+    <div class="version muted">v{__APP_VERSION__} · Linux</div>
   </nav>
 
   <main>

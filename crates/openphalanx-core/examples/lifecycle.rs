@@ -1,5 +1,5 @@
 //! End-to-end check without the GUI: start the backend exactly as the app
-//! does, wait for SGLang, pair a fake client over TLS, and run one task.
+//! does, wait for SGLang, pair a fake client over TLS, and check its token.
 //! `cargo run -p openphalanx-core --example lifecycle`
 
 use std::time::Duration;
@@ -44,22 +44,17 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .await?;
     let device_token = paired["token"].as_str().unwrap();
-    let run: serde_json::Value = http
-        .post(format!("{base}/v1/run"))
-        .bearer_auth(device_token)
-        .json(&serde_json::json!({
-            "prompt": "Add a function is_even(n) to util.py.",
-            "files": {"util.py": "def add(a, b):\n    return a + b\n"}
-        }))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    println!("exit_code {} diff:\n{}", run["exit_code"], run["diff"].as_str().unwrap_or(""));
-    let status = admin.status().await?;
-    println!("tasks_total={} devices={} cache_hit={:?}", status.agent.tasks_total, status.devices, status.inference.cache_hit_ratio);
+    let whoami = |token: String| {
+        let (http, base) = (http.clone(), base.clone());
+        async move { http.get(format!("{base}/v1/whoami")).bearer_auth(token).send().await }
+    };
+    let me: serde_json::Value = whoami(device_token.into()).await?.error_for_status()?.json().await?;
+    println!("whoami with device token: {me}");
+    println!("whoami with bad token: HTTP {}", whoami("bogus".into()).await?.status());
     // Leave the test device out of the real device list.
     admin.revoke(paired["device_id"].as_str().unwrap()).await?;
+    println!("whoami after revoke: HTTP {}", whoami(device_token.into()).await?.status());
+    let status = admin.status().await?;
+    println!("devices={} cache_hit={:?}", status.devices, status.inference.cache_hit_ratio);
     Ok(())
 }

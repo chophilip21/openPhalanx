@@ -30,7 +30,7 @@
     "weight_bytes": 9980170584,
     "max_context": 32768,
     "license": "apache-2.0",
-    "recommended": true,
+    "tested": true,
     "notes": "Tested end to end on an RTX 3090 (24 GB).",
     "arch": { "kv_layers": 48, "kv_heads": 8, "head_dim": 128 }
   },

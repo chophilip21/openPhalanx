@@ -16,13 +16,13 @@ pub struct Pairing {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AgentMetrics {
+pub struct GatewayMetrics {
     pub started_at: f64,
-    pub tasks_total: u64,
-    pub tasks_failed: u64,
-    pub tasks_active: u64,
-    pub tasks_queued: u64,
-    pub last_task_at: Option<f64>,
+    /// Authenticated client requests through the gateway.
+    pub requests_total: u64,
+    pub requests_failed: u64,
+    pub requests_active: u64,
+    pub last_request_at: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -41,7 +41,7 @@ pub struct InferenceMetrics {
 pub struct Status {
     pub sglang: String,
     pub model: String,
-    pub agent: AgentMetrics,
+    pub gateway: GatewayMetrics,
     #[serde(default)]
     pub inference: InferenceMetrics,
     pub pairing: Pairing,

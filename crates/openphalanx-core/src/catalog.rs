@@ -21,8 +21,9 @@ pub struct CatalogEntry {
     pub max_context: u32,
     pub license: String,
     pub arch: ArchSpec,
+    /// Verified end to end on real hardware.
     #[serde(default)]
-    pub recommended: bool,
+    pub tested: bool,
     #[serde(default)]
     pub min_compute_capability: Option<f32>,
     #[serde(default)]
@@ -30,6 +31,11 @@ pub struct CatalogEntry {
 }
 
 impl CatalogEntry {
+    /// Total parameters in billions, parsed from e.g. "30.5B (3.3B active)".
+    pub fn params_billions(&self) -> Option<f32> {
+        self.params.split('B').next()?.trim().parse().ok()
+    }
+
     pub fn source_url(&self) -> String {
         format!("https://huggingface.co/{}/tree/{}", self.id, self.revision)
     }
@@ -51,12 +57,13 @@ mod tests {
     fn catalog_is_well_formed() {
         let entries = catalog();
         assert!(!entries.is_empty());
-        assert_eq!(entries.iter().filter(|e| e.recommended).count(), 1);
+        assert!(entries.iter().any(|e| e.tested));
         for e in &entries {
             assert_eq!(e.revision.len(), 40, "{} revision must be a full commit sha", e.id);
             assert!(e.id.contains('/'), "{}", e.id);
             assert!(e.weight_bytes > 1_000_000_000, "{}", e.id);
             assert!(e.arch.kv_layers > 0 && e.arch.kv_heads > 0 && e.arch.head_dim > 0);
+            assert!(e.params_billions().is_some_and(|p| p > 0.0), "{} params", e.id);
         }
     }
 }

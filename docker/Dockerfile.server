@@ -2,31 +2,23 @@
 FROM lmsysorg/sglang@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469
 
 LABEL org.opencontainers.image.source=https://github.com/chophilip21/openPhalanx \
-      org.opencontainers.image.description="OpenPhalanx backend: SGLang inference + headless Aider agent"
+      org.opencontainers.image.description="OpenPhalanx backend: SGLang inference behind an authenticated gateway"
 
 # supervisor comes from apt so it stays independent of both Python environments.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends supervisor \
     && rm -rf /var/lib/apt/lists/*
 
-# Aider pins many deps (openai, numpy, ...) that would clash with SGLang's
-# environment in /opt/sglang, so it gets its own venv.
-RUN uv venv /opt/aider --python 3.12 \
-    && uv pip install --python /opt/aider/bin/python --no-cache \
-        aider-chat fastapi "uvicorn[standard]"
-
-# System-level so it applies to any uid (e.g. `docker exec -u $(id -u)`):
-# Aider needs a git identity, and bind-mounted repos are owned by host users.
-RUN git config --system user.name "openphalanx" \
-    && git config --system user.email "openphalanx@localhost" \
-    && git config --system --add safe.directory '*'
+# The gateway gets a small venv of its own so SGLang upgrades can't break it.
+# (The coding agent runs on the client; nothing agent-related lives here.)
+RUN uv venv /opt/gateway --python 3.12 \
+    && uv pip install --python /opt/gateway/bin/python --no-cache \
+        fastapi "uvicorn[standard]" httpx
 
 COPY server/supervisord.conf /etc/supervisor/conf.d/openphalanx.conf
 COPY server/start-sglang.sh /opt/openphalanx/start-sglang.sh
-COPY server/agent_server.py /opt/openphalanx/agent_server.py
-COPY server/aider-local.sh /usr/local/bin/aider-local
-RUN chmod +x /opt/openphalanx/start-sglang.sh /usr/local/bin/aider-local \
-    && mkdir -p /workspace /state
+COPY server/gateway.py /opt/openphalanx/gateway.py
+RUN chmod +x /opt/openphalanx/start-sglang.sh && mkdir -p /state
 
 ENV MODEL_PATH=Qwen/Qwen2.5-Coder-14B-Instruct-AWQ \
     SERVED_MODEL_NAME=openphalanx-coder \
@@ -34,10 +26,9 @@ ENV MODEL_PATH=Qwen/Qwen2.5-Coder-14B-Instruct-AWQ \
     MEM_FRACTION_STATIC=0.85 \
     AGENT_PORT=9090 \
     ADMIN_PORT=9091 \
-    STATE_DIR=/state \
-    AIDER_EDIT_FORMAT=diff
+    STATE_DIR=/state
 
-# 9090: public agent API (TLS). 9091: admin API; publish on loopback only.
+# 9090: public gateway API (TLS). 9091: admin API; publish on loopback only.
 EXPOSE 9090 9091
 
 CMD ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/supervisord.conf"]

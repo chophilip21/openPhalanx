@@ -103,7 +103,7 @@
       <div class="stats">
         <div class="stat"><span class="v">{pct(admin.inference.cache_hit_ratio)}</span><span class="k">Prefix cache hit</span></div>
         <div class="stat"><span class="v">{admin.inference.gen_throughput != null ? Math.round(admin.inference.gen_throughput) : "–"}</span><span class="k">Tokens / s</span></div>
-        <div class="stat"><span class="v">{admin.agent.tasks_total}</span><span class="k">Tasks run</span></div>
+        <div class="stat"><span class="v">{admin.gateway.requests_total}</span><span class="k">Client requests</span></div>
         <div class="stat"><span class="v">{admin.devices}</span><span class="k">Paired devices</span></div>
       </div>
     {/if}
