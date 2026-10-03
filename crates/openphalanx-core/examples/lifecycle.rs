@@ -23,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(s) if s.sglang == "ready" => break,
             Ok(_) | Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
         }
+        anyhow::ensure!(t0.elapsed() < Duration::from_secs(900), "SGLang not ready after 15 minutes");
         if let Some(c) = docker::inspect().await? {
             anyhow::ensure!(c.state.running, "container exited: {:?}", c.state);
         }

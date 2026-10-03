@@ -275,7 +275,7 @@ pub async fn start(settings: &Settings, mut on_progress: impl FnMut(StartProgres
         image: settings.image(),
         gpu_index: settings.gpu_index,
         agent_port: settings.agent_port,
-        model: model::mount_for(&dir),
+        model: model::mount_for(&dir)?,
         model_key: model.key.clone(),
         mem_fraction_static: fraction,
         context_len: req.context_len,

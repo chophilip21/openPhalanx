@@ -207,38 +207,50 @@ fn hf_snapshot_complete(dir: &Path) -> bool {
     dir.join("model.safetensors").is_file()
 }
 
-/// A bind mount that makes a model folder visible inside the container.
+/// Read-only bind mounts that make a model folder usable inside the container.
+///
+/// Model folders are often symlink farms (the Hugging Face cache links
+/// `snapshots/<rev>/*` into per-repo and hub-wide blob stores). Every
+/// directory along each link chain is mounted at the *same* absolute path, so
+/// links resolve inside the container exactly as on the host, while nothing
+/// beyond those directories is exposed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelMount {
-    pub host_dir: PathBuf,
-    pub container_dir: String,
+    pub dirs: Vec<PathBuf>,
     /// Value for `MODEL_PATH` inside the container.
     pub model_path: String,
 }
 
-pub fn mount_for(model_dir: &Path) -> ModelMount {
-    // HF cache snapshots are symlinks into ../../blobs, so mount the whole repo
-    // folder or the links dangle inside the container.
-    let parent = model_dir.parent();
-    let repo_dir = parent.and_then(Path::parent);
-    if let (Some(parent), Some(repo_dir), Some(rev)) = (parent, repo_dir, model_dir.file_name()) {
-        let is_snapshot = parent.file_name().is_some_and(|n| n == "snapshots")
-            && repo_dir
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("models--"));
-        if is_snapshot {
-            return ModelMount {
-                host_dir: repo_dir.to_path_buf(),
-                container_dir: "/model-repo".into(),
-                model_path: format!("/model-repo/snapshots/{}", rev.to_string_lossy()),
-            };
+pub fn mount_for(model_dir: &Path) -> Result<ModelMount> {
+    let root = model_dir
+        .canonicalize()
+        .with_context(|| format!("cannot open {}", model_dir.display()))?;
+    let mut dirs = vec![root.clone()];
+    for entry in std::fs::read_dir(&root)? {
+        let mut hop = entry?.path();
+        // Follow the chain one link at a time, recording each hop's directory.
+        for _ in 0..16 {
+            let Ok(target) = std::fs::read_link(&hop) else { break };
+            let parent = hop.parent().unwrap_or(Path::new("/")).to_path_buf();
+            hop = if target.is_absolute() { target } else { parent.join(target) };
+            if let Some(dir) = hop.parent().and_then(|d| d.canonicalize().ok()) {
+                dirs.push(dir);
+            }
         }
     }
-    ModelMount {
-        host_dir: model_dir.to_path_buf(),
-        container_dir: "/model".into(),
-        model_path: "/model".into(),
+    dirs.sort();
+    dirs.dedup();
+    // Drop directories already covered by a mounted ancestor.
+    let mut minimal: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if !minimal.iter().any(|m| d.starts_with(m)) {
+            minimal.push(d);
+        }
     }
+    if minimal.iter().any(|d| d == Path::new("/")) {
+        bail!("{} links into the filesystem root; copy the model into a plain folder.", model_dir.display());
+    }
+    Ok(ModelMount { dirs: minimal, model_path: root.display().to_string() })
 }
 
 #[cfg(test)]
@@ -306,9 +318,17 @@ mod tests {
         assert_eq!(find_in_hf_cache(tmp.path(), "Org/M", None), Some(snap.clone()));
         assert_eq!(find_in_hf_cache(tmp.path(), "Org/M", Some("other")), None);
 
-        let m = mount_for(&snap);
-        assert_eq!(m.host_dir, repo);
-        assert_eq!(m.model_path, "/model-repo/snapshots/rev1");
-        assert_eq!(mount_for(Path::new("/data/plain")).model_path, "/model");
+        // Second hop into a hub-wide store outside the repo folder, as in
+        // newer Hugging Face caches.
+        let shared = tmp.path().join("blobs/38");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("real"), vec![1u8; 10]).unwrap();
+        std::os::unix::fs::symlink("../../blobs/38/real", repo.join("blobs/w2")).unwrap();
+        std::os::unix::fs::symlink("../../blobs/w2", snap.join("tokenizer.json")).unwrap();
+
+        let m = mount_for(&snap).unwrap();
+        let canon = |p: &Path| p.canonicalize().unwrap();
+        assert_eq!(m.model_path, canon(&snap).display().to_string());
+        assert_eq!(m.dirs, vec![canon(&shared), canon(&repo.join("blobs")), canon(&snap)]);
     }
 }

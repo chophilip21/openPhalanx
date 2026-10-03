@@ -185,14 +185,16 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
         "-p".into(),
         format!("127.0.0.1:{ADMIN_PORT}:{ADMIN_PORT}"),
         "-v".into(),
-        format!("{}:{}:ro", spec.model.host_dir.display(), spec.model.container_dir),
-        "-v".into(),
         format!("{}:/state", spec.state_dir.display()),
         "--label".into(),
         format!("{MANAGED_LABEL}=true"),
         "--label".into(),
         format!("{MODEL_LABEL}={}", spec.model_key),
     ];
+    for dir in &spec.model.dirs {
+        a.push("-v".into());
+        a.push(format!("{0}:{0}:ro", dir.display()));
+    }
     for (k, v) in [
         ("MODEL_PATH", spec.model.model_path.clone()),
         ("MEM_FRACTION_STATIC", format!("{}", spec.mem_fraction_static)),
@@ -261,11 +263,17 @@ pub fn diagnose_crash(logs: &str) -> Option<String> {
     if l.contains("not enough memory") {
         return Some("SGLang could not fit the model in the memory it was given. Pick a smaller model or context.".into());
     }
+    if l.contains("incomplete download") || l.contains("missing from") {
+        return Some("Some model files are missing or unreadable inside the backend. Re-download the model.".into());
+    }
     if l.contains("no such file or directory") && l.contains("config.json") {
         return Some("The model folder is missing config.json or is not readable.".into());
     }
     if l.contains("address already in use") {
         return Some("A port the backend needs is already in use.".into());
+    }
+    if l.contains("sglang exited with code") {
+        return Some("The inference engine (SGLang) failed. See Logs for the error.".into());
     }
     None
 }
@@ -280,11 +288,7 @@ mod tests {
             image: DEFAULT_IMAGE.into(),
             gpu_index: 0,
             agent_port: 9090,
-            model: ModelMount {
-                host_dir: "/m".into(),
-                container_dir: "/model".into(),
-                model_path: "/model".into(),
-            },
+            model: ModelMount { dirs: vec!["/m".into(), "/blobs".into()], model_path: "/m".into() },
             model_key: "catalog:Qwen/X".into(),
             mem_fraction_static: 0.812,
             context_len: 32768,
@@ -294,7 +298,7 @@ mod tests {
         let a = run_args(&spec).join(" ");
         assert!(a.contains("-p 9090:9090"));
         assert!(a.contains("-p 127.0.0.1:9091:9091"));
-        assert!(a.contains("-v /m:/model:ro"));
+        assert!(a.contains("-v /m:/m:ro") && a.contains("-v /blobs:/blobs:ro"));
         assert!(a.contains("-e MEM_FRACTION_STATIC=0.812"));
         assert!(a.contains("-e HF_HUB_OFFLINE=1"));
         assert!(a.ends_with(DEFAULT_IMAGE));

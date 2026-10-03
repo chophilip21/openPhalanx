@@ -109,6 +109,7 @@ Openphalanx operates on a decoupled client-server architecture where a lightweig
   * Launch the unified backend container using NVIDIA runtime pass-through:
 
     ```bash
+    # Manual/dev run. The Phase 3 GUI normally launches the container (see below).
     docker run -d --name openphalanx-backend --gpus all \
       --shm-size 32g \
       -p 9090:9090 \
@@ -141,15 +142,72 @@ Openphalanx operates on a decoupled client-server architecture where a lightweig
 - Use github container registry as you have suggested. 
 - Upon clicking start, it should display some kind of pairing code for client to connect to. This could be random everytime, or the same. But think about security and the best practice. 
 
-* \[ \] **Step 3.1: Implement Docker Engine Manager in Tauri**
+* \[x\] **Step 3.1: Implement Docker Engine Manager in Tauri**
 
   * Add container lifecycle controls to the Tauri app's Rust backend using the Docker API or `std::process::Command`.
 
   * Implement pre-flight checks: verify Docker daemon availability, pull/build image if missing, and monitor container runtime health.
 
+  * ✅ Implemented in `crates/openphalanx-core` (plain Rust, no Tauri, so it is unit-tested with `cargo test -p openphalanx-core`). The checks run on this machine with `cargo run -p openphalanx-core --example preflight`.
+
+    * **Docker** (`docker.rs`): drives the `docker` CLI to check the daemon (with fix-it hints for permission and not-running errors), check for the nvidia runtime, and handle pull, build fallback, run, stop, inspect and logs. Containers are labelled `io.openphalanx.managed`, so the GUI reattaches to a running backend after it restarts.
+
+    * **Crash handling:** if SGLang dies, `start-sglang.sh` stops the whole container instead of letting supervisord restart it in a loop. The GUI then sees the exit and diagnoses it from the logs (CUDA OOM, missing files, port in use).
+
+    * **Model mounts:** the folder is mounted read-only, together with every directory its symlinks pass through, at identical paths. This is needed because the Hugging Face cache links snapshots into per-repo and hub-wide blob stores. `HF_HUB_OFFLINE=1` stops SGLang from ever downloading on its own.
+
+  * **OOM protection** (`vram.rs`):
+
+    * The requirement is weights + KV cache for one full context window + 3 GiB runtime overhead. The KV formula matches SGLang's own allocation for Qwen2.5-14B within 1%.
+
+    * Starting is **refused** when free VRAM is below the requirement, and flagged as **tight** with less than 1.5 GiB spare. Both are checked before the image pull and again right before launch.
+
+    * `--mem-fraction-static` is computed from the VRAM actually free at launch, not a fixed 0.85, so SGLang never claims memory another process holds.
+
+  * **Model catalog** (`catalog.json`):
+
+    * Official Qwen coder repos only, each pinned to a commit. Weight sizes and attention shapes come from the repo's file listing and `config.json`.
+
+    * Downloads go to `~/.local/share/openphalanx/models`, resume after interruption, and verify every weight file against Hugging Face's published SHA-256.
+
+    * Copies already in `~/.cache/huggingface` are reused.
+
+    * Custom models can be a local folder, or a Hugging Face URL or repo id. Those are resolved to a commit, and the VRAM need is shown before anything downloads.
+
+  * **Registry:** the image is `ghcr.io/chophilip21/openphalanx-backend:<app version>`, and its base image is pinned by digest. Publish with `scripts/publish-image.sh`. Until it's published, the GUI falls back to building from `docker/` in a source checkout.
+
 * \[ \] **Step 3.2: Configure GUI Controls & Status Dashboard**
 
   * Expose container logs, GPU VRAM status, and agent connection metrics in the Tauri frontend UI.
+
+  * 🚧 Written, not yet run: `app/` (Tauri 2 + Svelte 5 + Vite, Linux `.deb`/AppImage).
+
+    * **Server:** a VPN-style power button, the pairing code with its countdown, the selected model with a VRAM bar, and the pre-flight checklist. While running it also shows prefix-cache hit rate, tokens/s, tasks and paired devices.
+
+    * **Models:** the catalog table with a "Fits / Tight / Won't fit" badge per context length, plus download, use and delete actions and custom models.
+
+    * **Devices:** paired devices, with revoke.
+
+    * **Logs:** live container output.
+
+  * The frontend type-checks and builds. The native app needs the WebKitGTK system libraries before it can compile:
+
+    ```bash
+    sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+    cd app && npm install && npx tauri dev     # or: npx tauri build
+    ```
+
+### Pairing & security model
+
+* **Public API** (`:9090`): TLS only, using a self-signed certificate generated on first start and kept in `~/.local/share/openphalanx/backend-state`. It accepts only `/health`, `/v1/pair`, and `/v1/run` with a device token.
+
+* **Pairing codes:** pressing Start shows an 8-character code from a 30-letter alphabet with no lookalike characters (about 39 bits). Each code is single-use, expires after 10 minutes, and is burned after 5 wrong attempts. Every failed attempt also waits 1 s.
+
+* **Device tokens:** a client trades the code for a random 256-bit **device token**. The server stores only its SHA-256 hash. Devices stay paired across restarts and can be revoked from the Devices page. A new code is needed only to add a device.
+
+* **Certificate fingerprint:** the GUI shows the TLS fingerprint. The client should show it at pairing time and pin it (trust on first use), so later connections can't be intercepted.
+
+* **Admin API** (`:9091`): published on `127.0.0.1` only, and requires a random per-launch admin token passed through the container's environment. The GUI uses it for status, pairing and devices.
 
 ## Phase 4: Thin Client CLI (`openbase`) Implementation
 
