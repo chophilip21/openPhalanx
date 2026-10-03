@@ -94,6 +94,8 @@ Openphalanx operates on a decoupled client-server architecture where a lightweig
       docker exec -it -u $(id -u):$(id -g) -e HOME=/tmp -w /workspace openphalanx-backend aider-local
       ```
 
+      `aider-local` runs with `--yes-always`, so it doesn't ask for confirmation, and with `--no-auto-commits --no-dirty-commits`, so it never commits. Review its changes with `git diff` and commit them yourself. Any extra arguments are files to put in the chat at startup. For example, append `$(git ls-files)` to load every tracked file (about 7.5k of the 32k-token context for this repo).
+
       Aider only sees *committed* files in its repo map. Use `/add <file>` to give the model a file's contents, `/ask` for questions, and `/run <cmd>` for shell commands. Plain chat text goes only to the LLM.
 
 * \[x\] **Step 2.2: Build and Test Unified Image**

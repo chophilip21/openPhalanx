@@ -7,6 +7,9 @@ exec env \
   /opt/aider/bin/aider \
   --model "openai/${SERVED_MODEL_NAME}" \
   --edit-format "${AIDER_EDIT_FORMAT}" \
+  --yes-always \
+  --no-auto-commits \
+  --no-dirty-commits \
   --no-check-update \
   --no-show-release-notes \
   --no-show-model-warnings \
