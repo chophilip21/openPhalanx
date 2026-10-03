@@ -9,6 +9,7 @@ Working notes for developing this repo: architecture, operations, commands and c
   * Everything operational or developer-facing goes here.
   * Roadmap status (phases, steps, checkboxes, verification notes) goes in `milestone.md`.
 * **Agents never commit directly:** any agent launcher or config (Aider, `oppx aider`, etc.) must use `--no-auto-commits --no-dirty-commits`. The user reviews with `git diff` and commits themselves.
+* **Commits:** never commit or push unless the user explicitly asks for that commit. Finish with an uncommitted diff and a summary.
 * **Branching:** work happens on `dev`; `main` holds the initial history only.
 * **Toolchain on the server node:** `cargo` is in `~/.cargo/bin` (not on the non-interactive `PATH`), so use `export PATH=$HOME/.cargo/bin:$PATH`. `uv`/`uvx` are in `~/.local/bin`.
 * **Versioning:** the backend image tag equals the workspace version in `Cargo.toml`. Bump `Cargo.toml`, `app/package.json` and `app/src-tauri/tauri.conf.json` together when `docker/` changes.
@@ -149,8 +150,9 @@ Optional environment variables: `MODEL_PATH`, `CONTEXT_LENGTH`, `MEM_FRACTION_ST
 cargo install --path client/oppx              # or: cargo build -p oppx (binary in target/debug/oppx)
 oppx pair <server> <code> [--fingerprint FP | --yes] [--as NAME] [--device-name NAME] [--force]
 oppx status [NAME]                            # certificate pinned ✓, token valid ✓, model ready + context
-oppx aider [--server NAME] [--web] [-- aider args]   # local Aider via pinned loopback proxy; never commits
-oppx proxy [NAME] [--port N] [--web]          # proxy only; prints OPENAI_API_BASE and a per-run local key
+oppx [--no-web] [--classic]                   # OpenPhalanx chat frontend (--classic: Aider's own UI); unpaired: banner + how to pair
+oppx aider [--server NAME] [--no-web] [-- aider args]   # local Aider via pinned loopback proxy; never commits
+oppx proxy [NAME] [--port N] [--no-web]       # proxy only; prints OPENAI_API_BASE and a per-run local key
 oppx search "query" [-n N]                    # web search via the server's SearXNG (Markdown; use /run in Aider)
 oppx unpair [NAME] [--local-only]             # self-revoke on the server, then forget locally
 oppx servers | oppx use NAME
@@ -159,6 +161,20 @@ oppx servers | oppx use NAME
 * **Config:** `~/.config/oppx/config.json` (`0600`), or `OPPX_CONFIG` / `--config`.
 * **Agent isolation:** the agent sees only the per-run local key; the device token stays in `oppx`.
 * **Testing without a GUI:** pairing codes can be issued through the admin API: `curl -X POST -H "x-admin-token: $ADMIN_TOKEN" http://127.0.0.1:9091/admin/pairing`. The token is in the container env: `docker inspect openphalanx-backend --format '{{json .Config.Env}}'`.
+* **Terminal UI** (`client/oppx/src/ui.rs`, `console` + `indicatif`):
+  * There's an OPENPHALANX banner: large 5-row block letters at 95 columns or more, a compact 2-row version below that, with a green-to-blue gradient. It also has spinners on stderr, rounded panels, and ✓ / ! / ✗ rows.
+  * Output is plain when stdout or stderr isn't a terminal, or when `NO_COLOR` is set. This matters because `/run oppx search` output goes into Aider's chat. Keep it that way.
+  * To preview in a pty, use `script -qec "stty rows 40 cols 120; oppx status" /dev/null`. The rows matter: a pty with 0 rows reports no size, so the compact banner is used.
+* **Chat frontend** (`client/oppx/frontend/oppx_chat.py`, embedded with `include_str!`):
+  * **How it runs:** `oppx` writes the file to `~/.cache/oppx/oppx_chat-<version>.py` and runs it with the Python from the `aider` launcher's shebang, so `aider`, `prompt_toolkit` and `rich` are importable.
+  * **How it hooks into Aider:** it sets `aider.main.InputOutput` to its own `OppxIO`, and `base_coder.WaitingSpinner` to its `Thinking` spinner. It calls `aider.main.main(argv, return_coder=True)`, then loops over `coder.run_one()` itself, handling `SwitchCoder` the way Aider's main loop does.
+  * **What it changes on screen:**
+    * It hides Aider's announcements, URLs and `Tokens:` lines.
+    * Edit blocks are hidden while they stream, and each turn ends with a Claude-style diff (`⏺ Update(file)` plus colored lines).
+    * Edit-retry noise collapses to one line.
+    * Routine confirmations are auto-accepted. Commands the model proposes, and going over the context window, are asked.
+  * **Aider version:** it relies on Aider internals, so it's tested with **aider-chat 0.86.2** and warns on other versions; installs are pinned to that version. Crashes go to `~/.local/state/oppx/last-crash.txt` with a hint to use `--classic`.
+  * **Testing:** drive it in a pty (Python `pty.fork`, 120×40 via `TIOCSWINSZ`), and render the raw bytes with `pyte` to see the real screen.
 * **Stand-in agents:** a fake `aider` script on `PATH` (printing its args and env) is a quick way to test `oppx aider` without the real agent.
 
 ## Web search
@@ -166,9 +182,12 @@ oppx servers | oppx use NAME
 * **SearXNG:** the `openphalanx-searxng` container is pinned by digest and runs on the private `openphalanx` Docker network with **no published ports**. Its settings live in `crates/openphalanx-core/searxng/settings.yml` and are written to `~/.local/share/openphalanx/searxng/settings.yml` (0644, read-only mount, `FORCE_OWNERSHIP=false`). The secret is passed as `SEARXNG_SECRET`, and `--log-driver none` keeps queries out of logs. The GUI starts it before the backend when `settings.web_search` is on (the default; toggle on the Server page). The backend gets `SEARXNG_URL=http://openphalanx-searxng:8080`.
 * **Gateway:**
   * `POST /v1/search {query, max_results}` returns `{results: [{title, url, snippet}]}`.
-  * A chat request with `X-Oppx-Web-Search: auto` goes through the **router**: a constrained-JSON call to the same model (`{"search": bool, "query": str}`) on the last ~4,000 characters of the latest user message. Results are appended to the end of that message as `<web_search_results>`, with an "untrusted" note.
+  * A chat request with `X-Oppx-Web-Search: auto` (sent by `oppx` unless `--no-web`) goes through the **router**, in two steps:
+    1. **Decide:** a one-token, regex-constrained `yes`/`no` call to the same model, on the last ~4,000 characters of the user's **whole latest turn**. That's every user message since the last assistant message, because Aider follows the question with reminders such as "Reply in English.". The few-shot examples sit in a fixed system prompt, so they're cached. Median about 50 ms; 16/16 correct on mixed phrasings.
+    2. **Query:** only on `yes`, a constrained-JSON call writes the search query.
+  * **Speculative routing:** the answer starts at the same time as the router, and its response is held unread until the router decides. With no search, the router costs **about 27 ms** of time-to-first-token (68 ms against 39 ms measured). With a search, the speculative answer is closed (SGLang aborts it) and the request is resent with `<web_search_results>` appended to the end of the latest message, with an "untrusted" note.
   * Native tool calling was tried and doesn't work with Qwen2.5-Coder-14B (see `milestone.md`, Step 4.5).
-* **Client:** `oppx aider --web` and `oppx proxy --web` add the header, and `oppx search` calls `/v1/search`.
+* **Client:** `oppx`, `oppx aider` and `oppx proxy` send the header by default; `--no-web` opts out (`--web` is accepted as a hidden no-op). `oppx search` calls `/v1/search`.
 * **Manual run (without the GUI):**
 
   ```bash
@@ -200,7 +219,7 @@ Open `9090/tcp` in your firewall for the clients' network. Never expose `9091`.
 * **Pairing codes:** 8 characters, about 39 bits. Each is single-use, valid for 10 minutes, and burned after 5 wrong attempts, with a 1 s delay after each miss.
 * **Device tokens:** each client trades a pairing code for its own random 256-bit device token. The server stores only the SHA-256 hash, and you can revoke any device from the GUI.
 * **Admin API:** the admin API is reachable from the server machine only, and requires a random token generated at each launch.
-* **Web search:** SearXNG is reachable only from the gateway (private network, no ports) and keeps no logs. Automatic search is opt-in per session (`--web`) because router-written queries leave the server for public search engines. Results are injected as untrusted reference text.
+* **Web search:** SearXNG is reachable only from the gateway (private network, no ports) and keeps no logs. Automatic search is on by default (the user's choice; `--no-web` opts out). Router-written queries leave the server for public search engines, so they can carry fragments of a request. Results are injected as untrusted reference text.
 * **No code stored or executed:** the server keeps no code and runs no commands for clients. Request bodies (prompts) are never logged; only per-device request and token counts are kept. Model weights are mounted read-only, and the backend never downloads weights on its own.
 
 ## Development

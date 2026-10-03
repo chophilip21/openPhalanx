@@ -11,17 +11,35 @@ use clap::{Parser, Subcommand};
 
 use oppx::config::{self, Config, Server};
 use oppx::proxy::Proxy;
-use oppx::{agent, api, tls};
+use oppx::{agent, api, tls, ui};
 
 #[derive(Parser)]
-#[command(name = "oppx", version, about = "Use an OpenPhalanx GPU server from this machine")]
+#[command(
+    name = "oppx",
+    version,
+    about = "Use an OpenPhalanx GPU server from this machine",
+    long_about = "Use an OpenPhalanx GPU server from this machine.\n\n\
+                  Run `oppx` on its own to start coding with Aider in the current directory \
+                  (same as `oppx aider`), or pair first with `oppx pair <server> <code>`. \
+                  Automatic web search is on by default; `--no-web` turns it off."
+)]
 struct Cli {
     /// Config file (defaults to the user config dir, e.g. ~/.config/oppx/config.json).
     #[arg(long, global = true, env = "OPPX_CONFIG")]
     config: Option<PathBuf>,
 
+    /// With no command: start without automatic web search.
+    #[arg(long)]
+    no_web: bool,
+    /// With no command: use Aider's own terminal interface instead of OpenPhalanx's.
+    #[arg(long)]
+    classic: bool,
+    /// Automatic web search is the default; kept so old habits don't break.
+    #[arg(long, hide = true)]
+    web: bool,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -61,7 +79,7 @@ enum Command {
         #[arg(long)]
         local_only: bool,
     },
-    /// Run Aider in the current directory, using the server's model.
+    /// Run Aider with its own terminal interface (plain `oppx` uses OpenPhalanx's).
     ///
     /// Everything after `--` (or any unrecognized argument) goes to Aider,
     /// e.g. `oppx aider -- --message "add tests" src/lib.rs`.
@@ -69,8 +87,11 @@ enum Command {
         /// Server name (defaults to the default server).
         #[arg(long)]
         server: Option<String>,
-        /// Let the server search the web automatically when a request needs it.
+        /// Don't let the server search the web automatically.
         #[arg(long)]
+        no_web: bool,
+        /// Automatic web search is the default; kept so old habits don't break.
+        #[arg(long, hide = true)]
         web: bool,
         /// Arguments passed through to Aider.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "AIDER_ARGS")]
@@ -83,8 +104,11 @@ enum Command {
         /// Local port (default: a free one).
         #[arg(long, default_value_t = 0)]
         port: u16,
-        /// Let the server search the web automatically when a request needs it.
+        /// Don't let the server search the web automatically.
         #[arg(long)]
+        no_web: bool,
+        /// Automatic web search is the default; kept so old habits don't break.
+        #[arg(long, hide = true)]
         web: bool,
     },
     /// Search the web through the server's private SearXNG.
@@ -112,10 +136,34 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    ui::init();
     if let Err(e) = run(Cli::parse()).await {
-        eprintln!("error: {e:#}");
+        ui::error(format!("{e:#}"));
         std::process::exit(1);
     }
+}
+
+/// `oppx` with no command and no paired server: the banner and how to start.
+fn welcome(cfg: &Config) {
+    ui::banner();
+    let steps: &[(&str, &str)] = if cfg.servers.is_empty() {
+        &[
+            ("oppx pair <server> <code>", "pair with the code shown in the OpenPhalanx app"),
+            ("oppx status", "check the connection and the model"),
+            ("oppx", "start coding in the current repo"),
+        ]
+    } else {
+        &[
+            ("oppx", "start coding in the current repo (--no-web: no web search)"),
+            ("oppx search \"query\"", "search the web through the server"),
+            ("oppx status", "check the connection and the model"),
+            ("oppx servers", "list paired servers"),
+        ]
+    };
+    for (cmd, what) in steps {
+        println!("  {}  {}", ui::accent(format!("{cmd:<26}")), ui::dim(what));
+    }
+    println!("\n  {}", ui::dim("oppx --help for all commands"));
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -124,7 +172,19 @@ async fn run(cli: Cli) -> Result<()> {
         None => config::default_path()?,
     };
     let mut cfg = Config::load(&path)?;
-    match cli.command {
+    // Plain `oppx` starts coding right away once a server is paired.
+    let command = match cli.command {
+        Some(c) => c,
+        None if cfg.servers.is_empty() => {
+            welcome(&cfg);
+            return Ok(());
+        }
+        None => {
+            let code = run_aider(&cfg, None, !cli.no_web, cli.classic, &[]).await?;
+            std::process::exit(code);
+        }
+    };
+    match command {
         Command::Pair { server, code, fingerprint, yes, device_name, alias, force } => {
             pair(&mut cfg, &server, &code, fingerprint, yes, device_name, alias, force).await?;
             cfg.save(&path)?;
@@ -134,26 +194,39 @@ async fn run(cli: Cli) -> Result<()> {
             unpair(&mut cfg, name.as_deref(), local_only).await?;
             cfg.save(&path)?;
         }
-        Command::Aider { server, web, args } => {
-            let code = run_aider(&cfg, server.as_deref(), web, &args).await?;
+        Command::Aider { server, no_web, web: _, args } => {
+            let code = run_aider(&cfg, server.as_deref(), !no_web, true, &args).await?;
             std::process::exit(code);
         }
-        Command::Proxy { name, port, web } => run_proxy(&cfg, name.as_deref(), port, web).await?,
+        Command::Proxy { name, port, no_web, web: _ } => run_proxy(&cfg, name.as_deref(), port, !no_web).await?,
         Command::Search { query, max, server } => run_search(&cfg, server.as_deref(), &query.join(" "), max).await?,
         Command::Servers => {
             if cfg.servers.is_empty() {
-                println!("No servers paired yet. Pair with: oppx pair <server> <code>");
+                println!("No servers paired yet. Pair with: {}", ui::accent("oppx pair <server> <code>"));
             }
-            for (name, s) in &cfg.servers {
-                let mark = if cfg.default.as_deref() == Some(name) { "*" } else { " " };
-                println!("{mark} {name:<16} {:<28} device {:<16} cert {}", s.url, s.device_name, tls::short(&s.fingerprint));
+            let rows: Vec<String> = cfg
+                .servers
+                .iter()
+                .map(|(name, s)| {
+                    let mark = if cfg.default.as_deref() == Some(name) { ui::accent("★") } else { " ".into() };
+                    format!(
+                        "{mark} {:<16} {:<28} {} {}",
+                        name,
+                        s.url,
+                        ui::dim(format!("device {:<14}", s.device_name)),
+                        ui::dim(format!("cert {}", tls::short(&s.fingerprint)))
+                    )
+                })
+                .collect();
+            if !rows.is_empty() {
+                ui::panel("Paired servers", &rows);
             }
-            println!("config: {}", path.display());
+            println!("  {}", ui::dim(format!("config: {}", path.display())));
         }
         Command::Use { name } => {
             cfg.set_default(&name)?;
             cfg.save(&path)?;
-            println!("Default server: {name}");
+            ui::line(ui::ok("default", &name));
         }
     }
     Ok(())
@@ -196,23 +269,35 @@ async fn pair(
         bail!("already paired as \"{alias}\"; use --force to replace it, or --as <name> to keep both");
     }
 
-    println!("Connecting to {url} …");
-    let fp = tls::probe_fingerprint(&url).await?;
-    println!("Server certificate fingerprint: {}", tls::short(&fp));
-    println!("  (full SHA-256: {fp})");
+    let sp = ui::spinner(format!("Connecting to {url}"));
+    let fp = match tls::probe_fingerprint(&url).await {
+        Ok(fp) => fp,
+        Err(e) => {
+            sp.clear();
+            return Err(e);
+        }
+    };
+    sp.done(format!("Connected to {url}"));
+    ui::panel(
+        "Server certificate",
+        &[
+            format!("{}  {}", ui::dim("as shown in the app"), ui::accent(tls::short(&fp))),
+            format!("{}  {}", ui::dim("full SHA-256       "), ui::dim(&fp)),
+        ],
+    );
 
     match expected {
-        Some(e) if tls::matches(&e, &fp)? => println!("Fingerprint matches --fingerprint."),
+        Some(e) if tls::matches(&e, &fp)? => ui::line(ui::ok("fingerprint", "matches --fingerprint")),
         Some(_) => bail!(
             "the server's certificate does not match --fingerprint. Do not pair: you may be talking to a \
              different machine than the one running OpenPhalanx."
         ),
-        None if yes => println!("Skipping the fingerprint comparison (--yes)."),
+        None if yes => ui::line(ui::warn("fingerprint", "not compared (--yes)")),
         None => {
             if !std::io::stdin().is_terminal() {
                 bail!("can't ask for confirmation without a terminal; pass --fingerprint <FP> (or --yes)");
             }
-            print!("Does it match the fingerprint on the app's Server page? [y/N] ");
+            print!("  Does it match the fingerprint on the app's Server page? {} ", ui::dim("[y/N]"));
             std::io::stdout().flush()?;
             let mut answer = String::new();
             std::io::stdin().lock().read_line(&mut answer)?;
@@ -226,7 +311,15 @@ async fn pair(
     // pairing code and the returned token can't go anywhere else.
     let client = tls::pinned_client(&fp)?;
     let device_name = device_name.unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
-    let paired = api::pair(&client, &url, code, &device_name).await?;
+    let sp = ui::spinner("Pairing");
+    let paired = match api::pair(&client, &url, code, &device_name).await {
+        Ok(p) => p,
+        Err(e) => {
+            sp.clear();
+            return Err(e);
+        }
+    };
+    sp.done("Paired");
 
     let replaced = cfg.servers.contains_key(&alias);
     cfg.insert(
@@ -240,20 +333,38 @@ async fn pair(
             paired_at: now(),
         },
     )?;
-    let default = if cfg.default.as_deref() == Some(alias.as_str()) { ", default" } else { "" };
-    println!("Paired \"{device_name}\" with {url}. Saved as \"{alias}\"{default}.");
+    let default = if cfg.default.as_deref() == Some(alias.as_str()) { " (default)" } else { "" };
+    ui::banner();
+    ui::panel(
+        "Paired",
+        &[
+            ui::ok("server", format!("{alias}{default}  {}", ui::dim(&url))),
+            ui::ok("device", &device_name),
+            ui::ok("certificate", format!("pinned {}", tls::short(&cfg.servers[&alias].fingerprint))),
+        ],
+    );
     if replaced {
-        println!("The previous pairing was replaced; revoke the old device in the app's Devices page.");
+        ui::warning("the previous pairing was replaced; revoke the old device in the app's Devices page.");
     }
-    println!("Next: oppx status");
+    println!("  Next: {}  then  {}", ui::accent("oppx status"), ui::accent("oppx aider"));
     Ok(())
 }
 
 async fn status(cfg: &Config, name: Option<&str>) -> Result<()> {
     let (name, s) = cfg.server(name)?;
-    println!("{name}: {}", s.url);
     let client = tls::pinned_client(&s.fingerprint)?;
-    let health = match api::health(&client, &s.url).await {
+    let sp = ui::spinner(format!("Checking {name}"));
+    let health = api::health(&client, &s.url).await;
+    let me = match &health {
+        Ok(_) => api::whoami(&client, &s.url, &s.token).await,
+        Err(_) => Ok(None),
+    };
+    let ctx = match (&health, &me) {
+        (Ok(h), Ok(Some(_))) if h.sglang == "ready" => api::context_len(&client, &s.url, &s.token).await.ok().flatten(),
+        _ => None,
+    };
+    sp.clear();
+    let health = match health {
         Ok(h) => h,
         Err(e) if tls::is_pin_mismatch(e.as_ref()) => bail!(
             "WARNING: the server's TLS certificate has changed (pinned {}).\n\
@@ -264,22 +375,26 @@ async fn status(cfg: &Config, name: Option<&str>) -> Result<()> {
         ),
         Err(e) => return Err(e.context(format!("cannot reach {}", s.url))),
     };
-    println!("  certificate  pinned {} ✓", tls::short(&s.fingerprint));
-    match api::whoami(&client, &s.url, &s.token).await? {
-        Some(me) => println!("  device       {} ({}) ✓", me.device_name, me.device_id),
-        None => bail!(
-            "this device's token was rejected: it was revoked in the app. Pair again with \
-             `oppx pair {} <code> --as {name} --force`",
-            s.url
-        ),
-    }
-    if health.sglang == "ready" {
-        let ctx = api::context_len(&client, &s.url, &s.token).await?;
-        let ctx = ctx.map(|c| format!(", {}k context", c / 1024)).unwrap_or_default();
-        println!("  model        ready{ctx}");
+    let mut rows = vec![
+        ui::ok("server", format!("{name}  {}", ui::dim(&s.url))),
+        ui::ok("certificate", format!("pinned {}", tls::short(&s.fingerprint))),
+    ];
+    let me = match me? {
+        Some(me) => me,
+        None => {
+            rows.push(ui::bad("device", "token rejected (revoked in the app)"));
+            ui::panel("OpenPhalanx", &rows);
+            bail!("pair again with `oppx pair {} <code> --as {name} --force`", s.url);
+        }
+    };
+    rows.push(ui::ok("device", format!("{} {}", me.device_name, ui::dim(format!("({})", me.device_id)))));
+    rows.push(if health.sglang == "ready" {
+        let ctx = ctx.map(|c| format!(" · {}k context", c / 1024)).unwrap_or_default();
+        ui::ok("model", format!("{} ready{ctx}", me.model))
     } else {
-        println!("  model        loading (the server is starting; try again in a minute)");
-    }
+        ui::warn("model", "loading; try again in a minute")
+    });
+    ui::panel("OpenPhalanx", &rows);
     Ok(())
 }
 
@@ -291,21 +406,20 @@ async fn unpair(cfg: &mut Config, name: Option<&str>, local_only: bool) -> Resul
             Err(e) => Err(e),
         };
         match result {
-            Ok(true) => println!("The server revoked this device's token."),
-            Ok(false) => println!("The server had already revoked this device."),
-            Err(e) => eprintln!(
-                "warning: could not reach the server to revoke this device ({e:#}).\n\
-                 Revoke \"{}\" in the app's Devices page.",
+            Ok(true) => ui::line(ui::ok("revoked", "the server revoked this device's token")),
+            Ok(false) => ui::line(ui::ok("revoked", "already revoked on the server")),
+            Err(e) => ui::warning(format!(
+                "could not reach the server to revoke this device ({e:#}). Revoke \"{}\" in the app's Devices page.",
                 s.device_name
-            ),
+            )),
         }
     }
     cfg.remove(&name)?;
-    println!("Forgot \"{name}\".");
+    ui::line(ui::ok("forgotten", &name));
     match &cfg.default {
-        Some(d) => println!("Default server is now \"{d}\"."),
+        Some(d) => ui::line(ui::ok("default", d)),
         None if !cfg.servers.is_empty() => {}
-        None => println!("No servers left."),
+        None => println!("  {}", ui::dim("No servers left.")),
     }
     Ok(())
 }
@@ -313,6 +427,16 @@ async fn unpair(cfg: &mut Config, name: Option<&str>, local_only: bool) -> Resul
 /// Confirms the server is usable before starting anything, and returns its
 /// model's context window.
 async fn preflight(name: &str, s: &Server) -> Result<u64> {
+    let sp = ui::spinner(format!("Checking {name}"));
+    let result = preflight_inner(name, s).await;
+    match &result {
+        Ok(ctx) => sp.done(format!("{name} ready · {}k context", ctx / 1024)),
+        Err(_) => sp.clear(),
+    }
+    result
+}
+
+async fn preflight_inner(name: &str, s: &Server) -> Result<u64> {
     let client = tls::pinned_client(&s.fingerprint)?;
     let health = match api::health(&client, &s.url).await {
         Ok(h) => h,
@@ -333,7 +457,10 @@ async fn preflight(name: &str, s: &Server) -> Result<u64> {
 async fn run_search(cfg: &Config, name: Option<&str>, query: &str, max: u8) -> Result<()> {
     let (name, s) = cfg.server(name)?;
     let client = tls::pinned_client(&s.fingerprint)?;
-    let results = match api::search(&client, &s.url, &s.token, query, max).await {
+    let sp = ui::spinner(format!("Searching for \"{query}\""));
+    let found = api::search(&client, &s.url, &s.token, query, max).await;
+    sp.clear();
+    let results = match found {
         Ok(r) => r,
         Err(e) if tls::is_pin_mismatch(e.as_ref()) => bail!(
             "the server's TLS certificate has changed; nothing was sent. Run `oppx status {name}` for details."
@@ -358,34 +485,75 @@ async fn run_proxy(cfg: &Config, name: Option<&str>, port: u16, web: bool) -> Re
     let (name, s) = cfg.server(name)?;
     let ctx = preflight(name, s).await?;
     let proxy = Proxy::bind(s, port, web).await?;
-    println!("Proxy for \"{name}\" ({}) is running.", s.url);
-    println!("  OPENAI_API_BASE={}", proxy.base_url());
-    println!("  OPENAI_API_KEY={}", proxy.local_key);
-    println!("  model: {} ({}k context)", agent::AIDER_MODEL.trim_start_matches("openai/"), ctx / 1024);
-    if web {
-        println!("  automatic web search: on");
-    }
-    println!("The key is valid only while this proxy runs. Press Ctrl-C to stop.");
+    ui::panel(
+        &format!("Proxy for {name}"),
+        &[
+            format!("OPENAI_API_BASE={}", ui::accent(proxy.base_url())),
+            format!("OPENAI_API_KEY={}", ui::accent(&proxy.local_key)),
+            ui::dim(format!(
+                "model {} · {}k context · web search {}",
+                agent::AIDER_MODEL.trim_start_matches("openai/"),
+                ctx / 1024,
+                if web { "automatic" } else { "off" }
+            )),
+        ],
+    );
+    println!("  {}", ui::dim("The key is valid only while this proxy runs. Press Ctrl-C to stop."));
     tokio::select! {
         r = proxy.serve() => r,
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }
 
-async fn run_aider(cfg: &Config, name: Option<&str>, web: bool, user_args: &[OsString]) -> Result<i32> {
+/// Runs the coding agent against the server through the loopback proxy:
+/// OpenPhalanx's own chat frontend by default, or Aider's UI when `classic`.
+async fn run_aider(cfg: &Config, name: Option<&str>, web: bool, classic: bool, user_args: &[OsString]) -> Result<i32> {
     agent::reject_commit_flags(user_args)?;
     let aider = agent::find_aider()?;
     let (name, s) = cfg.server(name)?;
+    ui::banner();
     let ctx = preflight(name, s).await?;
     let metadata = agent::model_metadata(ctx)?;
+    let cwd = std::env::current_dir()?;
+    let repo = agent::repo_root(&cwd);
+    let history = agent::history_for(repo.as_deref().unwrap_or(&cwd))?;
+    let identity = match &repo {
+        Some(r) => {
+            agent::exclude_agent_files(r)?;
+            agent::placeholder_git_identity(r)
+        }
+        None => Vec::new(),
+    };
     let proxy = Proxy::bind(s, 0, web).await?;
     let (base, key) = (proxy.base_url(), proxy.local_key.clone());
     let serving = tokio::spawn(proxy.serve());
-    let search = if web { "automatic web search on" } else { "web search via /run oppx search \"…\"" };
-    eprintln!("oppx: using \"{name}\" ({}), {}k context, {search}. Edits stay uncommitted.", s.url, ctx / 1024);
-
-    let mut child = tokio::process::Command::new(&aider)
-        .args(agent::aider_args(metadata.path(), user_args))
+    let args = agent::aider_args(metadata.path(), &history, user_args);
+    let mut command = if classic {
+        let search = if web { "web search on (--no-web to disable)" } else { "web search off: /run oppx search \"…\"" };
+        eprintln!(
+            "  {} {} {}",
+            ui::accent("OpenPhalanx"),
+            name,
+            ui::dim(format!("· {}k context · {search} · edits stay uncommitted", ctx / 1024))
+        );
+        let mut c = tokio::process::Command::new(&aider);
+        c.args(&args);
+        c
+    } else {
+        let python = agent::aider_python(&aider)?;
+        let frontend = agent::write_frontend()?;
+        let mut c = tokio::process::Command::new(python);
+        c.arg(frontend)
+            .args(&args)
+            .env("OPPX_SERVER", name)
+            .env("OPPX_CONTEXT", ctx.to_string())
+            .env("OPPX_WEB", if web { "1" } else { "0" })
+            .env("OPPX_VERSION", env!("CARGO_PKG_VERSION"))
+            .env("OPPX_BIN", std::env::current_exe().unwrap_or_else(|_| "oppx".into()));
+        c
+    };
+    let mut child = command
+        .envs(identity)
         .env("OPENAI_API_BASE", &base)
         .env("OPENAI_API_KEY", &key)
         // Don't let an unrelated OpenAI/LiteLLM setup in the user's env redirect requests.

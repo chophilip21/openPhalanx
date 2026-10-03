@@ -53,7 +53,7 @@ On the laptop, install the `oppx` client (needs [Rust](https://rustup.rs)) and A
 ```bash
 git clone -b dev https://github.com/chophilip21/openPhalanx.git
 cargo install --path openPhalanx/client/oppx
-uv tool install --python 3.12 aider-chat   # Aider needs Python ≤ 3.12
+uv tool install --python 3.12 aider-chat==0.86.2   # the coding engine (needs Python ≤ 3.12)
 ```
 
 Pair once, with the address and code shown in the app. `oppx` prints the server's certificate fingerprint; check that it matches the one in the app, then confirm:
@@ -63,13 +63,16 @@ oppx pair 192.168.1.77 ABCD-EFGH
 oppx status                       # certificate, device and model all ✓
 ```
 
-Then, in any git repo:
+Then, in any git repo, just run:
 
 ```bash
-oppx aider                        # extra Aider options go after --, e.g. oppx aider -- src/main.rs
+oppx                              # the OpenPhalanx chat, in the current repo
+oppx --no-web                     # ...without automatic web search
 ```
 
-Need current information (new library versions, recent APIs, error messages)? `oppx aider --web` lets the server search the web automatically when a request needs it, through a private [SearXNG](https://docs.searxng.org) instance on the server. Without `--web`, ask for a search inside Aider with `/run oppx search "your query"`.
+Type a request or a question; `/help` lists commands such as `/add <file>`, `/ask`, `/search` and `/run`. `oppx --classic` (or `oppx aider -- <options>`) uses the engine's own interface instead.
+
+When a request needs current information (new library versions, recent APIs, error messages), the server searches the web automatically through a private [SearXNG](https://docs.searxng.org) instance on the server. Edits and general questions skip the search, and the check adds about 30 ms. Use `oppx --no-web` to turn it off; you can still search on demand inside Aider with `/run oppx search "your query"`.
 
 Aider edits your files locally and never commits; review with `git diff` and commit yourself. Remove a laptop with `oppx unpair` (or revoke it in the app's **Devices** page). Other OpenAI-compatible tools can use the server through `oppx proxy`.
 

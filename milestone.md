@@ -392,6 +392,74 @@
 
     * Web results are untrusted input. Since the agent never commits, any edit influenced by a malicious page still has to pass the user's `git diff`.
 
+* **Step 4.5 follow-up: web search on by default, with near-zero latency.**
+
+  * **Change:** at the user's request, automatic search is now **on by default** in `oppx`, `oppx aider` and `oppx proxy`; `--no-web` opts out. The user's requirement was "no noticeable drop of performance".
+
+  * **The cost of default-on:** the JSON router added **202 ms** to time-to-first-token on every turn (a cached Aider-sized edit: 34 ms without, 236 ms with). It's decode-bound, at about 12 JSON tokens.
+
+  * **Fixes:**
+
+    1. **Speculative routing:** the answer starts alongside the router, held unread until the router decides, and is aborted and resent if a search is needed. On its own this didn't help, because the router (200 ms) was slower than the cached first token (34 ms).
+
+    2. **A two-step router:** first a one-token, regex-constrained `yes`/`no` decision (about 40–50 ms), then a query call only on `yes`.
+
+    3. **Routing on the whole user turn:** real Aider follows the question with an empty message and "Reply in English.", and the router had been judging only that last line. Found by logging Aider's request with `--llm-history-file`.
+
+    4. **Few-shot examples** in the cached decide prompt: the bare yes/no prompt said "no" to "newest released version… reply with just the number". With the examples it scores 16/16 on mixed phrasings, including Aider's reminder (48 ms median).
+
+  * ✅ **Result:**
+
+    * Time-to-first-token goes from **39 ms** with `--no-web` to **66 ms** with the default: **+27 ms**.
+
+    * Searching requests take 1.7–2.3 s end to end, down from 2.4 s.
+
+    * Real Aider with defaults answers "newest tokio" as **1.53.1 (July 20, 2026)**, and with `--no-web` says it can't know.
+
+    * A real edit made 0 searches. The lifecycle routing checks still pass.
+
+* \[ \] **Step 4.6: CLI experience**
+
+  * Requested by the user after the first second-machine test.
+
+  * **Plain `oppx` starts Aider** in the current directory (same as `oppx aider`; `oppx --web` adds automatic search). With no server paired, it shows the banner and the three commands needed to get started.
+
+  * **Terminal graphics** (`client/oppx/src/ui.rs`, using `console` and `indicatif`):
+
+    * An **OPENPHALANX** banner in large block letters with a green-to-blue gradient, switching to a compact 2-row version on terminals narrower than 95 columns. It shows on `oppx`, before Aider starts, and after pairing.
+
+    * Spinners while connecting, checking, pairing and searching. Rounded panels for the certificate, pairing result, `status`, `servers` and `proxy`. Colored ✓ / ! / ✗ marks, and red `error:` and yellow `warning:` prefixes.
+
+    * Output is plain when not a terminal or when `NO_COLOR` is set. Piped `oppx search` output, as used by Aider's `/run`, has 0 escape codes.
+
+  * Also in this round: Aider must be installed with Python 3.12 or older. With 3.13 it crashes on a missing `audioop` module; this was found on the second desktop. The README, the `oppx` install hint and the troubleshooting table now say so.
+
+  * Previewed in a pty at 120 and 80 columns: the large and compact banners, the welcome screen, launching via plain `oppx`, and every panel line the same width. Still to do: the user's look on a real terminal before checking this off.
+
+* \[ \] **Step 4.7: OpenPhalanx chat frontend (Claude-style, Aider hidden)**
+
+  * Requested by the user, with a performance requirement of no noticeable slowdown. A Python frontend on Aider's engine was chosen over a Rust agent (which would mean rebuilding the editing engine and risking edit quality) and over rewriting Aider's output in a pty (fragile).
+
+  * `oppx` now opens the OpenPhalanx chat by default, and `--classic` (or `oppx aider`) runs Aider's own UI. It's implemented as `client/oppx/frontend/oppx_chat.py`, embedded in `oppx` and run with Aider's interpreter, so there's no extra install. See `CLAUDE.md` for how it hooks into Aider.
+
+  * **Looks:** an OPENPHALANX banner, a "✻ Welcome to OpenPhalanx" box, separators around the input, a bottom status bar (server, model, context, web search, files in chat), a `✻ Thinking… (Ns · ctrl-c to interrupt)` spinner, `⏺` answers, and `⏺ Update(file)` diffs. It has its own `/help` and `/search`, and no Aider branding (none was found in the captured sessions).
+
+  * ✅ **Verified** in a pty session rendered with a terminal emulator:
+
+    * The welcome screen, `/help` and a question answered.
+
+    * An edit (including a model retry, collapsed to one line) shown as a diff, with the file modified and no commit.
+
+    * Web search on by default: "newest tokio" answered 1.53.1.
+
+    * Ctrl-C during a long answer returns to the prompt, and SGLang shows 0 running requests afterwards.
+
+    * `--classic` still launches Aider's UI. The repo's git config was untouched and there were no repo traces.
+
+  * **Aider pinned:** installs use `aider-chat==0.86.2` (Python 3.12), because the frontend relies on Aider internals.
+
+  * Remaining: the user's own look on a real terminal.
+
 ## Phase 5: End-to-End Validation & Caching Benchmark
 
 * \[ \] **Step 5.1: Test Simple File Edit**
@@ -419,8 +487,9 @@
 
 ## Future Improvement
 
-1. Important feature, and this deserves its own section. If you combine SearXNG and /web (aider), we can make something awesome.There are MCP servers, like mcp-searxng that we can leverage to fill up the gab of missing feature of automatic web search. SearXNG should reside on the server side. Right now web search cannot be done unless you provide "/web" as the keyword. 
-2. Another important feature that deserves its own section. right now, our codebase assumes there is one server, and N possible clients. But this is not only the case. There can be N servers that can distribute the workload, and load one large model in a distributed way. And we can also imagine multiple clients, that points at cluster of nodes. 
+1. Optimization work for speed and security. 
+2. Implement sessions that can be resumed, and make sure we are doing context summarization, etc. 
+3. Another important feature that deserves its own section. right now, our codebase assumes there is one server, and N possible clients. But this is not only the case. There can be N servers that can distribute the workload, and load one large model in a distributed way. And we can also imagine multiple clients, that points at cluster of nodes. 
 
 Scaling from a single GPU workstation to a cluster of nodes handling multiple concurrent clients is the exact use case that frameworks like SGLang and vLLM were built to solve for enterprise deployments.To achieve this, the architecture splits into two distinct problems: distributing the model (across N servers) and distributing the traffic (routing N clients).Here is exactly how this is handled in modern LLM infrastructure.Part 1: Distributing One Large Model Across N ServersIf a model is too large to fit on a single machine (e.g., a 70B parameter model or massive Mixture-of-Experts like DeepSeek), you cluster multiple physical servers together. SGLang supports this natively using Ray and NCCL (NVIDIA Collective Communications Library).Tensor Parallelism (TP) & Pipeline Parallelism (PP):TP slices individual matrix math operations across multiple GPUs. If those GPUs are on different servers, SGLang uses Ray to coordinate them over the network.PP slices the model vertically. Server A handles layers 1–20, and Server B handles layers 21–40. Server A computes the first half and passes the intermediate tensors over the network to Server B to finish.   Prefill/Decode (PD) Disaggregation:This is a highly advanced SGLang feature for clusters. You designate some servers strictly as "Prefill nodes" (their only job is reading massive codebases/prompts) and other servers as "Decode nodes" (their only job is generating the output tokens). Once a Prefill node processes an Aider Repo Map, it transfers the KV cache over the network to the Decode node to stream the answer.   Note: Splitting a single model across multiple physical machines requires extremely fast networking (e.g., InfiniBand or 400GbE RoCE). Standard Gigabit Ethernet is too slow for Tensor Parallelism between physical servers.Part 2: Routing N Clients to N Servers (Load Balancing)If you simply want to increase your capacity to handle many developers (N clients) at once, you run identical copies of your model across multiple independent servers (Data Parallelism).To the clients, there should only ever be one API endpoint. You accomplish this using a router.The SGLang Model Gateway (Router):SGLang has a built-in router (sglang-router) that sits in front of all your GPU servers. You launch your GPU workers, and then launch the router on a head node.   Bashpython -m sglang_router.launch_server --host 0.0.0.0 --port 30000 --dp-size 4
 All of your Tauri/Aider clients simply point their OPENAI_API_BASE to this single router IP.Cache-Aware Routing (The Secret Weapon):If 10 developers are working simultaneously, their prompts are huge. SGLang's router uses RadixAttention cache-aware load balancing.When Developer A sends their codebase map, the router sends it to Server 1. When Developer A asks a follow-up question, the router remembers that Server 1 already has Developer A's codebase in its KV cache, and routes the request back to Server 1. If Developer B logs in, the router sends them to an idle node, like Server 2.   External API Gateways (LiteLLM):If you don't use the built-in SGLang router, the industry standard for this is LiteLLM. You run an NGINX-like container called LiteLLM Gateway that receives all API calls and load-balances them across your cluster of SGLang servers using round-robin or lowest-latency routing.
