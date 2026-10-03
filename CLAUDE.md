@@ -63,7 +63,7 @@ Openphalanx splits the work along a single line: **code and execution stay on th
 | Backend image (SGLang + gateway) | Working, including the authenticated OpenAI-compatible inference API. `0.2.0` is built locally but not yet pushed to GHCR |
 | Server GUI (`app/`, Linux) | Builds and runs; first UI review pending |
 | Pairing, TLS and device tokens | Working |
-| `oppx` client CLI | Not started. Until it exists, clients can't connect for real (see `milestone.md`, Phase 4) |
+| `oppx` client CLI | Pairing with certificate pinning, `status`, `unpair`, `servers` and `use` work. The local proxy and `oppx aider` (Step 4.4) are next |
 
 ## Requirements
 
@@ -143,9 +143,9 @@ curl -s -H "x-admin-token: $ADMIN_TOKEN" http://127.0.0.1:9091/admin/status | jq
 
 Optional environment variables: `MODEL_PATH`, `CONTEXT_LENGTH`, `MEM_FRACTION_STATIC` (default `0.85`; the GUI computes it from free VRAM instead), `SGLANG_EXTRA_ARGS`. The GUI shows a container started this way as "running outside the app", and can stop it.
 
-## Connecting a client before `oppx` exists
+## Connecting a client before `oppx aider` exists
 
-Pair with `curl`, then point the client's own Aider at the gateway. `-k` and `--no-verify-ssl` skip certificate checks, so use this only on a trusted network; `oppx` (Phase 4) replaces it with a pinned-certificate local proxy.
+`oppx pair <server> <code>` now pairs with certificate pinning, and `oppx status` checks the connection. Until Step 4.4's local proxy exists, Aider itself still has to reach the gateway directly, with certificate checks off. The `curl` route below does that; use it only on a trusted network.
 
 ```bash
 TOKEN=$(curl -sk https://$SERVER:9090/v1/pair -H 'content-type: application/json' \
@@ -160,7 +160,7 @@ The admin API can issue a code without the GUI: `curl -X POST -H "x-admin-token:
 
 | | |
 |---|---|
-| `9090/tcp` (all interfaces) | Public gateway API, TLS only. `/health` and `/v1/pair` are open. `/v1/whoami`, `/v1/models` and `/v1/chat/completions` (OpenAI-compatible, streaming) need a device token |
+| `9090/tcp` (all interfaces) | Public gateway API, TLS only. `/health` and `/v1/pair` are open. `/v1/whoami`, `/v1/unpair` (self-revoke), `/v1/models` and `/v1/chat/completions` (OpenAI-compatible, streaming) need a device token |
 | `9091/tcp` (`127.0.0.1` only) | Admin API for the GUI; needs the per-launch admin token |
 | `~/.config/openphalanx/settings.json` | Selected model, context length, GPU index, custom models |
 | `~/.local/share/openphalanx/models/` | Models downloaded by the GUI (verified, pinned to a commit) |
@@ -182,7 +182,8 @@ Open `9090/tcp` in your firewall for the clients' network. Never expose `9091`.
 ```bash
 cargo test -p openphalanx-core                                  # unit tests (no GPU or Docker needed)
 cargo test -p oppx                                          # client unit tests
-cargo run -p oppx -- servers                                # client CLI (config: OPPX_CONFIG or --config)
+cargo run -p oppx -- pair <server> <code>                   # pair (also: status, unpair, servers, use; config via OPPX_CONFIG or --config)
+# note: `cargo test`/`clippy` don't rebuild target/debug/oppx; run `cargo build -p oppx` before testing the binary
 cargo clippy --workspace --all-targets
 (cd app && npm run check)                                       # Svelte/TypeScript type check
 
@@ -218,7 +219,8 @@ crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight
   catalog.json           curated models pinned to Hugging Face commits
 docker/                  backend image: SGLang + gateway under supervisord (no agent code)
   server/gateway.py      TLS gateway: pairing, device tokens, admin API
-client/oppx/         client CLI: config.rs (paired servers, 0600 file), main.rs (clap commands)
+client/oppx/             client CLI: config.rs (paired servers, 0600 file), tls.rs (fingerprint pinning),
+                         api.rs (gateway calls), main.rs (clap commands)
 scripts/publish-image.sh build and push the backend image to GHCR
 milestone.md             roadmap and progress
 ```

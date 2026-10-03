@@ -7,7 +7,7 @@ SGLang inference server, which listens on the container's loopback only.
 Two listeners share one process (and therefore pairing/metrics state):
 
 * Public API (``AGENT_PORT``, TLS): ``/health`` and ``/v1/pair`` are open;
-  everything else (``/v1/whoami`` and the OpenAI-compatible inference proxy,
+  everything else (``/v1/whoami``, ``/v1/unpair`` and the OpenAI-compatible inference proxy,
   ``/v1/models`` and ``/v1/chat/completions``) needs a device token. Request
   bodies (prompts, i.e. client code) are never logged or stored.
 * Admin API (``ADMIN_PORT``, plain HTTP): used by the Openphalanx GUI only. The
@@ -318,6 +318,13 @@ async def whoami(device: dict = Depends(require_device)) -> dict:
     """Lets a client confirm its token is still valid (e.g. `oppx status`)."""
     devices.touch(device)
     return {"device_id": device["id"], "device_name": device["name"], "model": MODEL_NAME}
+
+
+@app.post("/v1/unpair")
+async def unpair(device: dict = Depends(require_device)) -> dict:
+    """Lets a client revoke its own token when it forgets this server."""
+    devices.revoke(device["id"])
+    return {"revoked": device["id"]}
 
 
 # --------------------------------------------------------------------------

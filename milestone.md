@@ -254,7 +254,7 @@
 
     * **Not yet:** tokens are stored in a protected file, like `gh` or `docker` do. Moving them to the OS keyring is a possible later hardening step.
 
-* \[ \] **Step 4.3: Pairing**
+* \[x\] **Step 4.3: Pairing**
 
   * `oppx pair https://<SERVER_IP>:9090 <CODE> [--name <device name>]`:
 
@@ -265,6 +265,38 @@
   * `oppx status`: server reachability, model, and whether SGLang is ready.
 
   * `oppx unpair`: forgets the server locally. Revocation happens in the GUI.
+
+  * ✅ Implemented (`client/oppx/src/{tls,api,main}.rs`, plus `POST /v1/unpair` in the gateway):
+
+    * **Certificate pinning** (`tls.rs`): a custom `rustls` verifier in front of `reqwest`. Trust is the SHA-256 of the server's self-signed certificate; hostnames and issuers are ignored, but TLS 1.2/1.3 handshake signatures are still verified against the certificate's key.
+
+    * **`oppx pair <server> <code>`:**
+
+      1. Probes the server and prints the certificate fingerprint, both as the app shows it (first 8 bytes) and in full.
+
+      2. Requires confirmation: an interactive `[y/N]`, or `--fingerprint <FP>` (full, or the app's 8-byte prefix), or an explicit `--yes`. With no terminal and neither flag, it refuses.
+
+      3. Redeems the code over a client already pinned to the approved certificate, so neither the code nor the returned token can reach another server.
+
+      Options: `--device-name` (default: hostname), `--as <name>` (default: derived from the address, e.g. `192-168-1-77`), and `--force` to replace an existing pairing.
+
+    * **`oppx status [name]`:** checks over the pinned connection that the certificate matches, the token is accepted (via `/v1/whoami`), and the model is ready, with its context length from `/v1/models`. Exits non-zero on a certificate change, which is reported as a warning naming both possible causes, or on a revoked token, with the exact re-pair command.
+
+    * **`oppx unpair [name]`:** goes further than planned. The device revokes its own token on the server (new `POST /v1/unpair`), then forgets it locally. `--local-only` skips the server, and if the server is unreachable it warns you to revoke the device in the app.
+
+  * ✅ Verified against the live backend: 10 unit tests plus end-to-end scenarios.
+
+    * **A wrong `--fingerprint`** aborts before the code is sent; the code stays valid.
+
+    * **The refusal paths** work: no terminal without a flag is refused, answering "n" cancels, and a wrong code gets a clear message.
+
+    * **Pairing with the app's 8-byte prefix** succeeds, and `status` shows all three checks. The config is `600`, and the token never appears in output.
+
+    * **An impostor TLS server** (a different certificate on another port) triggers the certificate-changed warning, and the impostor receives **no HTTP request**: the handshake is aborted, so the token is never sent.
+
+    * **After revoking in the app,** `status` reports the rejected token.
+
+    * **`pair --force`** re-pairs, and **`unpair`** removes the device on the server, confirmed through the admin API.
 
 * \[ \] **Step 4.4: Local proxy and agent launcher**
 
@@ -292,14 +324,15 @@
 
   * Verify high prefix-cache hit rates on later turns with the GUI's "Prefix cache hit" stat, or in `docker logs -f openphalanx-backend` (`#cached-token`).
 
-* \[ \] **Step 5.3: Distribution**
+* \[ \] **Step 5.3: Distribution and CI/CD pipeline**
 
-We need to package this up and distribute both server and client. Refer to how others distribute packages via `curl` and etc. 
-
+We need to package this up and distribute both server and client. Refer to how others distribute packages via `curl` and etc. Build CI/CD pipeline, and bump version. We need automatic documentation generator.  
 
 
 ## Future Improvement
 
-* If you combine SearXNG and /web (aider), we can make something awesome.There are MCP servers, like mcp-searxng that we can leverage to fill up the gab of missing feature of automatic web search. SearXNG should reside on the server side. 
-- dependabot, automatic building based on updates on aider and srglang. 
-- Celery? is there anyway to utilize celery here for async work. 
+1. Important feature, and this deserves its own section. If you combine SearXNG and /web (aider), we can make something awesome.There are MCP servers, like mcp-searxng that we can leverage to fill up the gab of missing feature of automatic web search. SearXNG should reside on the server side. 
+2. Another important feature that deserves its own section. right now, our codebase assumes there is one server, and N possible clients. But this is not only the case. There can be N servers that can distribute the workload, and load one large model in a distributed way. And we can also imagine multiple clients, that points at cluster of nodes. 
+
+Scaling from a single GPU workstation to a cluster of nodes handling multiple concurrent clients is the exact use case that frameworks like SGLang and vLLM were built to solve for enterprise deployments.To achieve this, the architecture splits into two distinct problems: distributing the model (across N servers) and distributing the traffic (routing N clients).Here is exactly how this is handled in modern LLM infrastructure.Part 1: Distributing One Large Model Across N ServersIf a model is too large to fit on a single machine (e.g., a 70B parameter model or massive Mixture-of-Experts like DeepSeek), you cluster multiple physical servers together. SGLang supports this natively using Ray and NCCL (NVIDIA Collective Communications Library).Tensor Parallelism (TP) & Pipeline Parallelism (PP):TP slices individual matrix math operations across multiple GPUs. If those GPUs are on different servers, SGLang uses Ray to coordinate them over the network.PP slices the model vertically. Server A handles layers 1–20, and Server B handles layers 21–40. Server A computes the first half and passes the intermediate tensors over the network to Server B to finish.   Prefill/Decode (PD) Disaggregation:This is a highly advanced SGLang feature for clusters. You designate some servers strictly as "Prefill nodes" (their only job is reading massive codebases/prompts) and other servers as "Decode nodes" (their only job is generating the output tokens). Once a Prefill node processes an Aider Repo Map, it transfers the KV cache over the network to the Decode node to stream the answer.   Note: Splitting a single model across multiple physical machines requires extremely fast networking (e.g., InfiniBand or 400GbE RoCE). Standard Gigabit Ethernet is too slow for Tensor Parallelism between physical servers.Part 2: Routing N Clients to N Servers (Load Balancing)If you simply want to increase your capacity to handle many developers (N clients) at once, you run identical copies of your model across multiple independent servers (Data Parallelism).To the clients, there should only ever be one API endpoint. You accomplish this using a router.The SGLang Model Gateway (Router):SGLang has a built-in router (sglang-router) that sits in front of all your GPU servers. You launch your GPU workers, and then launch the router on a head node.   Bashpython -m sglang_router.launch_server --host 0.0.0.0 --port 30000 --dp-size 4
+All of your Tauri/Aider clients simply point their OPENAI_API_BASE to this single router IP.Cache-Aware Routing (The Secret Weapon):If 10 developers are working simultaneously, their prompts are huge. SGLang's router uses RadixAttention cache-aware load balancing.When Developer A sends their codebase map, the router sends it to Server 1. When Developer A asks a follow-up question, the router remembers that Server 1 already has Developer A's codebase in its KV cache, and routes the request back to Server 1. If Developer B logs in, the router sends them to an idle node, like Server 2.   External API Gateways (LiteLLM):If you don't use the built-in SGLang router, the industry standard for this is LiteLLM. You run an NGINX-like container called LiteLLM Gateway that receives all API calls and load-balances them across your cluster of SGLang servers using round-robin or lowest-latency routing.
