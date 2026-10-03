@@ -16,12 +16,15 @@ use oppx::{agent, api, tls, ui};
 #[derive(Parser)]
 #[command(
     name = "oppx",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("OPPX_GIT_COMMIT"), ")"),
     about = "Use an OpenPhalanx GPU server from this machine",
     long_about = "Use an OpenPhalanx GPU server from this machine.\n\n\
-                  Run `oppx` on its own to start coding with Aider in the current directory \
-                  (same as `oppx aider`), or pair first with `oppx pair <server> <code>`. \
-                  Automatic web search is on by default; `--no-web` turns it off."
+                  Run `oppx` in a git repo to start the OpenPhalanx chat (keys and commands follow \
+                  Claude Code), or pair first with `oppx pair <server> <code>`.\n\n\
+                  Examples:\n  oppx\n  oppx \"fix the failing test\"\n  oppx -p \"explain src/main.rs\"\n  \
+                  oppx -c   (continue the last conversation)\n  oppx -r   (pick a past conversation)\n  \
+                  oppx --update",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
     /// Config file (defaults to the user config dir, e.g. ~/.config/oppx/config.json).
@@ -38,8 +41,39 @@ struct Cli {
     #[arg(long, hide = true)]
     web: bool,
 
+    /// Start the chat with this request.
+    #[arg(value_name = "PROMPT")]
+    prompt: Option<String>,
+    /// Print mode: answer PROMPT once and exit (for scripts and quick questions).
+    #[arg(short = 'p', long = "print")]
+    print: bool,
+    /// Continue the most recent conversation in this repo.
+    #[arg(short = 'c', long = "continue")]
+    continue_last: bool,
+    /// Resume a past conversation in this repo (pick from a list, or give its id).
+    #[arg(short = 'r', long, value_name = "ID", num_args = 0..=1, default_missing_value = "")]
+    resume: Option<String>,
+    /// Update oppx and its coding engine to the latest version.
+    #[arg(long)]
+    update: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// How to start the coding session.
+struct Launch {
+    web: bool,
+    classic: bool,
+    initial: Option<String>,
+    print: bool,
+    session: SessionChoice,
+}
+
+enum SessionChoice {
+    New,
+    Latest,
+    Pick(String), // "" = ask
 }
 
 #[derive(Subcommand)]
@@ -171,6 +205,10 @@ async fn run(cli: Cli) -> Result<()> {
         Some(p) => p,
         None => config::default_path()?,
     };
+    if cli.update {
+        ui::banner();
+        return oppx::update::run();
+    }
     let mut cfg = Config::load(&path)?;
     // Plain `oppx` starts coding right away once a server is paired.
     let command = match cli.command {
@@ -180,7 +218,21 @@ async fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
         None => {
-            let code = run_aider(&cfg, None, !cli.no_web, cli.classic, &[]).await?;
+            if cli.print && cli.prompt.is_none() {
+                bail!("-p needs a prompt, e.g. oppx -p \"explain src/main.rs\"");
+            }
+            let launch = Launch {
+                web: !cli.no_web,
+                classic: cli.classic,
+                initial: cli.prompt,
+                print: cli.print,
+                session: match (cli.continue_last, cli.resume) {
+                    (_, Some(id)) => SessionChoice::Pick(id),
+                    (true, None) => SessionChoice::Latest,
+                    (false, None) => SessionChoice::New,
+                },
+            };
+            let code = run_aider(&cfg, None, &launch, &[]).await?;
             std::process::exit(code);
         }
     };
@@ -195,7 +247,8 @@ async fn run(cli: Cli) -> Result<()> {
             cfg.save(&path)?;
         }
         Command::Aider { server, no_web, web: _, args } => {
-            let code = run_aider(&cfg, server.as_deref(), !no_web, true, &args).await?;
+            let launch = Launch { web: !no_web, classic: true, initial: None, print: false, session: SessionChoice::New };
+            let code = run_aider(&cfg, server.as_deref(), &launch, &args).await?;
             std::process::exit(code);
         }
         Command::Proxy { name, port, no_web, web: _ } => run_proxy(&cfg, name.as_deref(), port, !no_web).await?,
@@ -507,16 +560,83 @@ async fn run_proxy(cfg: &Config, name: Option<&str>, port: u16, web: bool) -> Re
 
 /// Runs the coding agent against the server through the loopback proxy:
 /// OpenPhalanx's own chat frontend by default, or Aider's UI when `classic`.
-async fn run_aider(cfg: &Config, name: Option<&str>, web: bool, classic: bool, user_args: &[OsString]) -> Result<i32> {
+/// Picks the conversation to start or restore. Returns the history files and
+/// whether Aider should restore them.
+fn choose_session(root: &std::path::Path, choice: &SessionChoice) -> Result<(agent::History, bool)> {
+    let pick = match choice {
+        SessionChoice::New => return Ok((agent::new_session(root)?, false)),
+        SessionChoice::Latest => match agent::list_sessions(root)?.into_iter().next() {
+            Some(s) => s,
+            None => {
+                ui::warning("no earlier conversation in this repo; starting a new one");
+                return Ok((agent::new_session(root)?, false));
+            }
+        },
+        SessionChoice::Pick(id) if !id.is_empty() => agent::list_sessions(root)?
+            .into_iter()
+            .find(|s| s.id == *id)
+            .with_context(|| format!("no conversation \"{id}\" in this repo; `oppx -r` lists them"))?,
+        SessionChoice::Pick(_) => {
+            let sessions = agent::list_sessions(root)?;
+            if sessions.is_empty() {
+                ui::warning("no earlier conversation in this repo; starting a new one");
+                return Ok((agent::new_session(root)?, false));
+            }
+            let shown: Vec<_> = sessions.iter().take(20).collect();
+            let rows: Vec<String> = shown
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    format!(
+                        "{} {}  {}  {}",
+                        ui::accent(format!("{:>2}.", i + 1)),
+                        ui::dim(ago(s.modified)),
+                        s.first_message,
+                        ui::dim(format!("({} message{})", s.messages, if s.messages == 1 { "" } else { "s" }))
+                    )
+                })
+                .collect();
+            ui::panel("Resume a conversation", &rows);
+            if !std::io::stdin().is_terminal() {
+                bail!("pick a conversation with `oppx --resume <id>`; ids: {}", shown.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", "));
+            }
+            print!("  Number (Enter for 1): ");
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().lock().read_line(&mut answer)?;
+            let n: usize = match answer.trim() {
+                "" => 1,
+                a => a.parse().ok().filter(|n| (1..=shown.len()).contains(n)).context("not a number from the list")?,
+            };
+            shown[n - 1].clone()
+        }
+    };
+    Ok((agent::open_session(root, &pick)?, true))
+}
+
+fn ago(t: std::time::SystemTime) -> String {
+    let secs = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    match secs {
+        0..=59 => "  just now".into(),
+        60..=3599 => format!("{:>2} min ago", secs / 60),
+        3600..=86_399 => format!("{:>2} h ago", secs / 3600),
+        _ => format!("{:>2} d ago", secs / 86_400),
+    }
+}
+
+async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args: &[OsString]) -> Result<i32> {
+    let (web, classic) = (launch.web, launch.classic);
     agent::reject_commit_flags(user_args)?;
     let aider = agent::find_aider()?;
     let (name, s) = cfg.server(name)?;
-    ui::banner();
+    if !launch.print {
+        ui::banner();
+    }
     let ctx = preflight(name, s).await?;
     let metadata = agent::model_metadata(ctx)?;
     let cwd = std::env::current_dir()?;
     let repo = agent::repo_root(&cwd);
-    let history = agent::history_for(repo.as_deref().unwrap_or(&cwd))?;
+    let (history, restore) = choose_session(repo.as_deref().unwrap_or(&cwd), &launch.session)?;
     let identity = match &repo {
         Some(r) => {
             agent::exclude_agent_files(r)?;
@@ -527,7 +647,7 @@ async fn run_aider(cfg: &Config, name: Option<&str>, web: bool, classic: bool, u
     let proxy = Proxy::bind(s, 0, web).await?;
     let (base, key) = (proxy.base_url(), proxy.local_key.clone());
     let serving = tokio::spawn(proxy.serve());
-    let args = agent::aider_args(metadata.path(), &history, user_args);
+    let args = agent::aider_args(metadata.path(), &history, restore, user_args);
     let mut command = if classic {
         let search = if web { "web search on (--no-web to disable)" } else { "web search off: /run oppx search \"…\"" };
         eprintln!(
@@ -549,7 +669,9 @@ async fn run_aider(cfg: &Config, name: Option<&str>, web: bool, classic: bool, u
             .env("OPPX_CONTEXT", ctx.to_string())
             .env("OPPX_WEB", if web { "1" } else { "0" })
             .env("OPPX_VERSION", env!("CARGO_PKG_VERSION"))
-            .env("OPPX_BIN", std::env::current_exe().unwrap_or_else(|_| "oppx".into()));
+            .env("OPPX_BIN", std::env::current_exe().unwrap_or_else(|_| "oppx".into()))
+            .env("OPPX_PRINT", if launch.print { "1" } else { "0" })
+            .env("OPPX_INITIAL", launch.initial.clone().unwrap_or_default());
         c
     };
     let mut child = command

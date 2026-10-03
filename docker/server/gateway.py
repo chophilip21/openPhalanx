@@ -633,6 +633,9 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
         request.headers.get("x-oppx-web-search", "").lower() == "auto"
         and bool(SEARXNG_URL)
         and isinstance(body.get("messages"), list)
+        # Structured utility calls (e.g. the client's ask/edit classifier) never search.
+        and not body.get("regex")
+        and not body.get("response_format")
     )
     stream = bool(body.get("stream"))
     client_wants_usage = False

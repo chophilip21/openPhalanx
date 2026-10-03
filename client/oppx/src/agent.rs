@@ -14,6 +14,9 @@ pub const AIDER_MODEL: &str = "openai/openphalanx-coder";
 /// the agent edits the working tree, and the user commits.
 pub const NO_COMMIT_FLAGS: [&str; 2] = ["--no-auto-commits", "--no-dirty-commits"];
 
+/// The Aider release the chat frontend is built and tested against.
+pub const AIDER_VERSION: &str = "0.86.2";
+
 /// The OpenPhalanx chat frontend (Python), run with Aider's own interpreter.
 pub const FRONTEND: &str = include_str!("../frontend/oppx_chat.py");
 
@@ -68,7 +71,7 @@ pub fn find_aider() -> Result<PathBuf> {
         .context(
             "aider is not installed (or not on PATH). Install it with one of:\n  \
              uv tool install --python 3.12 aider-chat==0.86.2\n  pipx install --python python3.12 aider-chat==0.86.2\n\
-             (Aider needs Python 3.12 or older; with 3.13 it fails on a missing `audioop` module.)",
+             (or simply: oppx --update)",
         )
 }
 
@@ -115,21 +118,33 @@ const THEME: [&str; 16] = [
     "--completion-menu-current-bg-color", "#1E2840",
 ];
 
-/// Where one repo's chat and input history live: outside the repo, so the
-/// agent leaves no files behind (`<state dir>/oppx/history/<repo id>.*`).
+/// One conversation's history files, kept outside the repo so the agent
+/// leaves no files behind: `<state dir>/oppx/history/<repo>-<id>/<session>.md`,
+/// plus one input history (up-arrow) shared by the repo's sessions.
 pub struct History {
     pub chat: PathBuf,
     pub input: PathBuf,
 }
 
-pub fn history_for(repo_root: &Path) -> Result<History> {
+/// A past conversation in this repo.
+#[derive(Debug, Clone)]
+pub struct Session {
+    /// File stem, e.g. `20261003-154210`; what `oppx --resume <id>` takes.
+    pub id: String,
+    pub path: PathBuf,
+    pub modified: std::time::SystemTime,
+    pub first_message: String,
+    pub messages: usize,
+}
+
+/// The per-repo folder holding its sessions.
+pub fn sessions_dir(repo_root: &Path) -> Result<PathBuf> {
     use sha2::{Digest, Sha256};
     let base = dirs::state_dir()
         .or_else(dirs::data_local_dir)
         .context("cannot determine a state directory")?
         .join("oppx")
         .join("history");
-    std::fs::create_dir_all(&base)?;
     let canonical = repo_root.canonicalize().unwrap_or_else(|_| repo_root.to_path_buf());
     let id: String = Sha256::digest(canonical.as_os_str().as_encoded_bytes())
         .iter()
@@ -140,12 +155,84 @@ pub fn history_for(repo_root: &Path) -> Result<History> {
         "{}-{id}",
         canonical.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "repo".into())
     );
-    Ok(History { chat: base.join(format!("{stem}.chat.md")), input: base.join(format!("{stem}.input")) })
+    let dir = base.join(&stem);
+    std::fs::create_dir_all(&dir)?;
+    // Earlier versions kept one ever-growing file per repo; keep it as a session.
+    let legacy = base.join(format!("{stem}.chat.md"));
+    if legacy.is_file() {
+        let _ = std::fs::rename(&legacy, dir.join("00000000-000000.md"));
+    }
+    let legacy_input = base.join(format!("{stem}.input"));
+    if legacy_input.is_file() {
+        let _ = std::fs::rename(&legacy_input, dir.join("input.history"));
+    }
+    Ok(dir)
+}
+
+/// A fresh conversation.
+pub fn new_session(repo_root: &Path) -> Result<History> {
+    let dir = sessions_dir(repo_root)?;
+    let stamp = chrono_stamp();
+    Ok(History { chat: dir.join(format!("{stamp}.md")), input: dir.join("input.history") })
+}
+
+/// An existing conversation, to be restored.
+pub fn open_session(repo_root: &Path, session: &Session) -> Result<History> {
+    Ok(History { chat: session.path.clone(), input: sessions_dir(repo_root)?.join("input.history") })
+}
+
+/// `YYYYmmdd-HHMMSS` in local time, without a date crate.
+fn chrono_stamp() -> String {
+    let out = std::process::Command::new("date").arg("+%Y%m%d-%H%M%S").output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => format!(
+            "{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+        ),
+    }
+}
+
+/// Past conversations in this repo, newest first (empty files skipped).
+pub fn list_sessions(repo_root: &Path) -> Result<Vec<Session>> {
+    let dir = sessions_dir(repo_root)?;
+    let mut sessions = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|e| e != "md") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        // Aider writes each user message as a "#### " line.
+        let user: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("#### "))
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if user.is_empty() {
+            continue;
+        }
+        let first = user.iter().find(|l| !l.starts_with('/')).unwrap_or(&user[0]);
+        sessions.push(Session {
+            id: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            modified: entry_modified(&path),
+            first_message: first.chars().take(80).collect(),
+            messages: user.len(),
+            path,
+        });
+    }
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
+    Ok(sessions)
+}
+
+fn entry_modified(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH)
 }
 
 /// Aider's arguments: our defaults, then the user's (which may override the
 /// defaults), then the no-commit flags (which nothing may override).
-pub fn aider_args(metadata: &Path, history: &History, user_args: &[OsString]) -> Vec<OsString> {
+pub fn aider_args(metadata: &Path, history: &History, restore: bool, user_args: &[OsString]) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "--model",
         AIDER_MODEL,
@@ -169,6 +256,9 @@ pub fn aider_args(metadata: &Path, history: &History, user_args: &[OsString]) ->
     args.push(history.chat.clone().into_os_string());
     args.push("--input-history-file".into());
     args.push(history.input.clone().into_os_string());
+    if restore {
+        args.push("--restore-chat-history".into());
+    }
     args.push("--model-metadata-file".into());
     args.push(metadata.as_os_str().to_owned());
     args.extend(user_args.iter().cloned());
@@ -259,7 +349,7 @@ mod tests {
     fn no_commit_flags_come_last() {
         let user = vec![OsString::from("--edit-format"), OsString::from("whole"), OsString::from("src/main.rs")];
         let history = History { chat: "/h/c.md".into(), input: "/h/i".into() };
-        let args = aider_args(Path::new("/tmp/m.json"), &history, &user);
+        let args = aider_args(Path::new("/tmp/m.json"), &history, false, &user);
         for flag in ["--no-show-release-notes", "--yes-always", "--no-gitignore"] {
             assert!(args.iter().any(|a| a == flag), "{flag}");
         }
@@ -283,11 +373,22 @@ mod tests {
     }
 
     #[test]
-    fn history_lives_outside_the_repo() {
-        let dir = tempfile::tempdir().unwrap();
-        let h = history_for(dir.path()).unwrap();
-        assert!(!h.chat.starts_with(dir.path()) && !h.input.starts_with(dir.path()));
-        assert_eq!(history_for(dir.path()).unwrap().chat, h.chat, "stable per repo");
+    fn sessions_live_outside_the_repo_and_list_newest_first() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        // SAFETY: tests in this module don't read XDG_STATE_HOME concurrently.
+        unsafe { std::env::set_var("XDG_STATE_HOME", state.path()) };
+        let h = new_session(repo.path()).unwrap();
+        assert!(!h.chat.starts_with(repo.path()) && !h.input.starts_with(repo.path()));
+        let dir = sessions_dir(repo.path()).unwrap();
+        std::fs::write(dir.join("20260101-090000.md"), "# aider chat\n#### /add x.rs\n#### fix the parser bug\nok\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.join("20260102-090000.md"), "#### add tests\n").unwrap();
+        std::fs::write(dir.join("20260103-090000.md"), "no user messages\n").unwrap();
+        let s = list_sessions(repo.path()).unwrap();
+        assert_eq!(s.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["20260102-090000", "20260101-090000"]);
+        assert_eq!(s[1].first_message, "fix the parser bug");
+        assert_eq!(s[1].messages, 2);
     }
 
     #[test]

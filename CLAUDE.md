@@ -150,7 +150,9 @@ Optional environment variables: `MODEL_PATH`, `CONTEXT_LENGTH`, `MEM_FRACTION_ST
 cargo install --path client/oppx              # or: cargo build -p oppx (binary in target/debug/oppx)
 oppx pair <server> <code> [--fingerprint FP | --yes] [--as NAME] [--device-name NAME] [--force]
 oppx status [NAME]                            # certificate pinned ✓, token valid ✓, model ready + context
-oppx [--no-web] [--classic]                   # OpenPhalanx chat frontend (--classic: Aider's own UI); unpaired: banner + how to pair
+oppx [PROMPT] [--no-web] [--classic]          # chat frontend (--classic: Aider's UI); unpaired: banner + how to pair
+oppx -c | -r [ID] | -p PROMPT                 # continue latest session · resume (picker or id) · print mode (one answer)
+oppx --update                                 # pull the source checkout, rebuild if changed, install pinned engine
 oppx aider [--server NAME] [--no-web] [-- aider args]   # local Aider via pinned loopback proxy; never commits
 oppx proxy [NAME] [--port N] [--no-web]       # proxy only; prints OPENAI_API_BASE and a per-run local key
 oppx search "query" [-n N]                    # web search via the server's SearXNG (Markdown; use /run in Aider)
@@ -174,7 +176,21 @@ oppx servers | oppx use NAME
     * Edit-retry noise collapses to one line.
     * Routine confirmations are auto-accepted. Commands the model proposes, and going over the context window, are asked.
   * **Aider version:** it relies on Aider internals, so it's tested with **aider-chat 0.86.2** and warns on other versions; installs are pinned to that version. Crashes go to `~/.local/state/oppx/last-crash.txt` with a hint to use `--classic`.
-  * **Testing:** drive it in a pty (Python `pty.fork`, 120×40 via `TIOCSWINSZ`), and render the raw bytes with `pyte` to see the real screen.
+  * **Claude Code parity:**
+    * Keys: Ctrl-C clears the line, twice on an empty line exits; Ctrl-D exits; Esc (or Ctrl-C) interrupts the model; Shift+Tab toggles plan mode (`/ask`, no edits); `\`+Enter or Esc-Enter adds a new line; `?` shows shortcuts.
+    * Input prefixes: `!cmd` becomes `/run`, `@file` adds the file, `# note` appends to `OPENPHALANX.md`.
+    * Commands: `/clear /compact /cost /context /status /model /init /memory /review /export /doctor /vim /resume /exit`, plus Aider's `/add /drop /run /test /lint /web` and our `/search`. Other Claude-only commands report "not available".
+  * **Esc interrupt:** `EscWatcher` holds the terminal in cbreak mode during a turn and turns a lone Esc into SIGINT. It pauses whenever a question needs an answer. Keystrokes typed during a turn are kept: finished lines are queued as the next messages, and a partial line is pre-filled.
+  * **Interrupts:** Aider's `keyboard_interrupt` (which exits on a double press) is replaced. A mid-stream interrupt is detected from the "I see that you interrupted…" note Aider records; check the coder returned after `SwitchCoder` too.
+  * **Ask/edit routing:** each normal message goes through a one-token `ask`/`edit` classification by the server's model through the proxy (about 40 ms, 14/14 on probes). Questions run as `/ask`, so they can't edit. Without it, Qwen-14B in diff mode deleted `mul` when asked "what does mul return?". The gateway skips the web-search router for requests that carry `regex` or `response_format`.
+  * **Memory:** `OPENPHALANX.md` (and `AGENTS.md` if present) in the repo root is loaded read-only every turn. `/init` asks the model to write it.
+  * **Sessions:** one file per conversation in `~/.local/state/oppx/history/<repo>-<id>/<YYYYmmdd-HHMMSS>.md`, with a shared `input.history`. The old single per-repo file is migrated as session `00000000-000000`. `-c` and `-r` pass `--restore-chat-history`.
+  * **Testing:** drive it in a pty (Python `pty.fork`, 120×40 via `TIOCSWINSZ`). The driver must **answer cursor-position requests** (`ESC[6n` → `ESC[30;1R`), or prompt_toolkit never draws the status bar. Render the raw bytes with `pyte` to see the real screen.
+* **`--update`** (`client/oppx/src/update.rs`):
+  * It works on the checkout `oppx` was built from (`CARGO_MANIFEST_DIR/../..`), and refuses if that checkout has local changes.
+  * It fetches and fast-forwards. It rebuilds with `cargo install --locked --path client/oppx` when it pulled anything, or when the commit embedded at build time (`build.rs`, shown in `oppx --version`) differs from the checkout's HEAD.
+  * It makes sure `aider-chat==agent::AIDER_VERSION` is installed, preferring `uv tool install --python 3.12`, then `pipx`.
+  * To test it in isolation, use a scratch clone with a local bare remote, plus `CARGO_INSTALL_ROOT`, `UV_TOOL_DIR` and `UV_TOOL_BIN_DIR` set to scratch directories.
 * **Stand-in agents:** a fake `aider` script on `PATH` (printing its args and env) is a quick way to test `oppx aider` without the real agent.
 
 ## Web search

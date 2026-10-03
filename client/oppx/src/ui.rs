@@ -124,6 +124,8 @@ impl Spinner {
     /// Replaces the spinner with a green check line.
     pub fn done(self, message: impl AsRef<str>) {
         if self.0.is_hidden() {
+            // Not a terminal: still report the step, as plain text.
+            eprintln!("  ✓ {}", message.as_ref());
             return;
         }
         self.0.finish_and_clear();

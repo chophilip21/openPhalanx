@@ -48,12 +48,12 @@ Open port `9090/tcp` to your laptops' network.
 
 ## Connect a laptop
 
-On the laptop, install the `oppx` client (needs [Rust](https://rustup.rs)) and Aider:
+On the laptop (needs [Rust](https://rustup.rs) and [uv](https://docs.astral.sh/uv/)):
 
 ```bash
 git clone -b dev https://github.com/chophilip21/openPhalanx.git
 cargo install --path openPhalanx/client/oppx
-uv tool install --python 3.12 aider-chat==0.86.2   # the coding engine (needs Python ≤ 3.12)
+oppx --update                     # installs the coding engine; run it any time to update everything
 ```
 
 Pair once, with the address and code shown in the app. `oppx` prints the server's certificate fingerprint; check that it matches the one in the app, then confirm:
@@ -63,18 +63,20 @@ oppx pair 192.168.1.77 ABCD-EFGH
 oppx status                       # certificate, device and model all ✓
 ```
 
-Then, in any git repo, just run:
+Then, in any git repo:
 
 ```bash
-oppx                              # the OpenPhalanx chat, in the current repo
-oppx --no-web                     # ...without automatic web search
+oppx                              # start a conversation
+oppx "fix the failing test"       # start with a request
+oppx -c                           # continue the last conversation (oppx -r to pick an older one)
+oppx -p "explain src/main.rs"     # answer once and exit
 ```
 
-Type a request or a question; `/help` lists commands such as `/add <file>`, `/ask`, `/search` and `/run`. `oppx --classic` (or `oppx aider -- <options>`) uses the engine's own interface instead.
+Keys and commands work like Claude Code: `/help`, `@file` to mention a file, `!cmd` to run a shell command, `# note` to save to project memory, `/init` to write a project summary, Shift+Tab for plan mode (no edits), Esc to interrupt, Ctrl-C twice to exit. Questions are answered without touching your files; requests are applied as edits.
 
-When a request needs current information (new library versions, recent APIs, error messages), the server searches the web automatically through a private [SearXNG](https://docs.searxng.org) instance on the server. Edits and general questions skip the search, and the check adds about 30 ms. Use `oppx --no-web` to turn it off; you can still search on demand inside Aider with `/run oppx search "your query"`.
+When a request needs current information (new library versions, recent APIs, error messages), the server searches the web automatically through a private [SearXNG](https://docs.searxng.org) instance; `oppx --no-web` turns that off.
 
-Aider edits your files locally and never commits; review with `git diff` and commit yourself. Remove a laptop with `oppx unpair` (or revoke it in the app's **Devices** page). Other OpenAI-compatible tools can use the server through `oppx proxy`.
+Edits are never committed: review with `git diff` and commit yourself. Remove a laptop with `oppx unpair` (or revoke it in the app's **Devices** page).
 
 ## Learn more
 

@@ -7,14 +7,21 @@ settings) from the arguments oppx passes, but swaps in our InputOutput class
 first, then drives `coder.run_one()` from our own prompt. Every line on screen,
 every prompt and every confirmation goes through this file.
 
+Keys and commands follow Claude Code, so people can switch without relearning.
+
 Environment from oppx: OPENAI_API_BASE / OPENAI_API_KEY (the loopback proxy),
-OPPX_SERVER, OPPX_CONTEXT, OPPX_WEB ("1"/"0"), OPPX_VERSION, OPPX_BIN.
+OPPX_SERVER, OPPX_CONTEXT, OPPX_WEB ("1"/"0"), OPPX_VERSION, OPPX_BIN,
+OPPX_INITIAL (a first prompt) and OPPX_PRINT ("1": answer once and exit).
 """
 
+import datetime
 import difflib
 import os
 import re
+import select
 import shlex
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -22,11 +29,14 @@ from pathlib import Path
 
 import aider
 import aider.coders.base_coder as base_coder
+import httpx
 import aider.main as aider_main
 from aider.commands import SwitchCoder
 from aider.io import AutoCompleter, InputOutput
 from aider.mdstream import MarkdownStream
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -50,9 +60,28 @@ CONTEXT = int(os.environ.get("OPPX_CONTEXT", "32768"))
 WEB = os.environ.get("OPPX_WEB", "1") == "1"
 VERSION = os.environ.get("OPPX_VERSION", "")
 OPPX_BIN = os.environ.get("OPPX_BIN", "oppx")
+PRINT_MODE = os.environ.get("OPPX_PRINT") == "1"
 MODEL_LABEL = "openphalanx-coder"
+MEMORY_FILE = "OPENPHALANX.md"  # our CLAUDE.md
+EXTRA_MEMORY = ("AGENTS.md",)  # read too when present
 
 console = Console(highlight=False)
+
+
+class UiState:
+    """Prompt state shared with key bindings and the status bar."""
+
+    plan_mode = False  # shift+tab: discuss only, no edits (Aider's ask mode)
+    interrupted = False
+    queued: list = []  # whole lines typed while the model was working
+    prefill = ""  # a partly typed line, put back at the next prompt
+    last_ctrl_c = 0.0
+    hint = ""
+    hint_until = 0.0
+    vi = False
+
+
+UI = UiState()
 
 # Aider status lines that mean nothing to an OpenPhalanx user.
 SUPPRESS = [
@@ -73,6 +102,8 @@ SUPPRESS = [
         r"^Restored previous conversation",
         r"^Update git (name|email)",
         r"^\^C KeyboardInterrupt",
+        r"^\^C again to exit",
+        r"is already in the chat",
         r"^Applied edit to ",  # shown as a diff after the turn instead
     )
 ]
@@ -87,6 +118,111 @@ def step(markup: str, color: str = MUTED) -> None:
     out(f"  [{color}]{ELBOW}[/]  {markup}")
 
 
+def headline(markup: str, color: str = ACCENT) -> None:
+    out(f"\n[{color}]{BULLET}[/] {markup}")
+
+
+# ---------------------------------------------------------------------------
+# Esc interrupts a running answer (Ctrl-C does too)
+# ---------------------------------------------------------------------------
+
+
+class EscWatcher:
+    """While the model works, reads the terminal in cbreak mode and turns a
+    lone Esc into SIGINT, which Aider already handles as "interrupt". Paused
+    whenever we need to ask the user something mid-turn."""
+
+    def __init__(self):
+        self.fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+        self._stop = threading.Event()
+        self._paused = threading.Event()
+        self._thread = None
+        self._saved = None
+
+    def _raw(self):
+        import termios
+        import tty
+
+        if self.fd is not None and self._saved is None:
+            self._saved = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+
+    def _restore(self):
+        import termios
+
+        if self.fd is not None and self._saved is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self._saved)
+            self._saved = None
+
+    def _run(self):
+        while not self._stop.is_set():
+            if self._paused.is_set():
+                time.sleep(0.05)
+                continue
+            r, _, _ = select.select([self.fd], [], [], 0.1)
+            if not r or self._paused.is_set():
+                continue
+            data = os.read(self.fd, 64)
+            # A lone ESC; arrow keys and the like arrive as ESC + more bytes.
+            if data == b"\x1b":
+                os.kill(os.getpid(), signal.SIGINT)
+            elif not data.startswith(b"\x1b"):
+                self._typed(data.decode("utf-8", "ignore"))
+
+    def _typed(self, text: str):
+        """Keeps what the user types while the model works (Claude-style
+        type-ahead): finished lines are queued, the rest is pre-filled."""
+        for ch in text:
+            if ch in "\r\n":
+                if UI.prefill.strip():
+                    UI.queued.append(UI.prefill.strip())
+                UI.prefill = ""
+            elif ch in "\x7f\b":
+                UI.prefill = UI.prefill[:-1]
+            elif ch.isprintable():
+                UI.prefill += ch
+
+    def __enter__(self):
+        if self.fd is not None:
+            self._raw()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        self._restore()
+
+    def pause(self):
+        if self._thread:
+            self._paused.set()
+            time.sleep(0.12)  # let the reader leave select()
+            self._restore()
+
+    def resume(self):
+        if self._thread:
+            self._raw()
+            self._paused.clear()
+
+
+WATCHER: EscWatcher | None = None
+
+
+def _interrupted(self):
+    """Replaces Aider's Ctrl-C handler, which exits on a second press within
+    2 s. Here an interrupt only stops the answer; quitting happens at the
+    prompt (Ctrl-C twice or Ctrl-D), as in Claude Code. The message is
+    printed after the answer's live view has closed (see run_turn)."""
+    UI.interrupted = True
+
+
+# ---------------------------------------------------------------------------
+# Aider's IO, restyled
+# ---------------------------------------------------------------------------
+
+
 class OppxIO(InputOutput):
     """Aider's output and prompts, restyled and filtered."""
 
@@ -99,7 +235,6 @@ class OppxIO(InputOutput):
         kwargs["fancy_input"] = False  # we run our own prompt_toolkit session
         super().__init__(*args, **kwargs)
         self._session = None
-        self.coder = None  # set by the main loop, for the status bar
 
     # ---- output -----------------------------------------------------------
     def _route(self, message: str, color: str) -> None:
@@ -114,9 +249,6 @@ class OppxIO(InputOutput):
             m = re.match(r"^Creating empty file (.+)$", line)
             if m:
                 step(f"Created [bold]{escape(m.group(1))}[/]", GREEN)
-                continue
-            if line.strip() == "^C again to exit":
-                step("Interrupted · press Ctrl-C again to exit", YELLOW)
                 continue
             out(f"  [{color}]{escape(line)}[/]")
 
@@ -136,8 +268,8 @@ class OppxIO(InputOutput):
                 step("First edit didn't match the file exactly; retrying", YELLOW)
                 self._retry_shown = True
             return True
-        if "Only 3 reflections allowed" in m or "reflections allowed, stopping" in m:
-            step("Couldn't apply the edit after several tries; try rephrasing or /add the file", RED)
+        if "reflections allowed, stopping" in m:
+            step("Couldn't apply the edit after several tries; try rephrasing or @-mention the file", RED)
             return True
         return False
 
@@ -197,55 +329,84 @@ class OppxIO(InputOutput):
         return answer or default
 
     def _ask_line(self, message: str) -> str:
+        if PRINT_MODE:
+            return ""  # never block a one-shot run on a question
+        if WATCHER:
+            WATCHER.pause()
         try:
             return PromptSession().prompt(message)
         except (EOFError, KeyboardInterrupt):
             return ""
+        finally:
+            if WATCHER:
+                WATCHER.resume()
 
     # ---- input --------------------------------------------------------------
     def get_input(self, root, rel_fnames, addable_rel_fnames, commands, abs_read_only_fnames=None, edit_format=None):
-        completer = AutoCompleter(root, rel_fnames, addable_rel_fnames, commands, self.encoding, abs_read_only_fnames)
+        completer = MentionCompleter(
+            AutoCompleter(root, rel_fnames, addable_rel_fnames, commands, self.encoding, abs_read_only_fnames),
+            sorted(set(rel_fnames) | set(addable_rel_fnames)),
+        )
         if self._session is None:
             try:
                 history = FileHistory(self.input_history_file) if self.input_history_file else InMemoryHistory()
             except OSError:
                 history = InMemoryHistory()
-            self._session = PromptSession(history=history, key_bindings=_keys(), multiline=True)
-        # Only conversational modes mean something to the user (not "diff"/"whole").
-        mode = f" {edit_format}" if edit_format in ("ask", "architect", "help", "context") else ""
+            self._session = PromptSession(
+                history=history, key_bindings=_keys(), multiline=True, enable_history_search=False
+            )
+        self._session.app.editing_mode = EditingMode.VI if UI.vi else EditingMode.EMACS
         width = console.size.width
         out(f"[{MUTED}]{'─' * width}[/]")
         text = self._session.prompt(
-            HTML(f'<prompt>{mode.strip() + " " if mode else ""}&gt; </prompt>'),
+            lambda: HTML("<plan>⏸ </plan><prompt>&gt; </prompt>" if UI.plan_mode else "<prompt>&gt; </prompt>"),
             completer=completer,
             complete_while_typing=True,
-            placeholder=HTML('<placeholder>Ask about the code, or describe a change… (/help)</placeholder>'),
+            placeholder=HTML('<placeholder>Try "explain this repo", "fix the failing test", or /help</placeholder>'),
             bottom_toolbar=lambda: self._toolbar(rel_fnames),
             style=PROMPT_STYLE,
             prompt_continuation="  ",
+            refresh_interval=0.5,
+            default=UI.prefill,
         )
+        UI.prefill = ""
         out(f"[{MUTED}]{'─' * width}[/]")
         text = text.strip()
         self.user_input(text)
         return text
 
     def _toolbar(self, rel_fnames):
+        if UI.hint and time.time() < UI.hint_until:
+            return HTML(f" <hint>{UI.hint}</hint>")
         files = len(rel_fnames)
         web = "web search on" if WEB else "web search off"
+        mode = "<plan>⏸ plan mode on</plan> (shift+tab to cycle) · " if UI.plan_mode else "? for shortcuts · "
         return HTML(
-            f' <b>{SERVER}</b> · {MODEL_LABEL} · {CONTEXT // 1024}k context · {web} · '
-            f'{files} file{"s" if files != 1 else ""} in chat · <i>esc⏎ newline · ⏎ send</i>'
+            f" {mode}<b>{SERVER}</b> · {MODEL_LABEL} · {CONTEXT // 1024}k context · {web} · "
+            f'{files} file{"s" if files != 1 else ""} in chat'
         )
 
 
 PROMPT_STYLE = Style.from_dict(
     {
         "prompt": f"{ACCENT} bold",
+        "plan": f"{YELLOW} bold",
+        "hint": f"{YELLOW}",
         "placeholder": f"{MUTED} italic",
         "bottom-toolbar": f"bg:#111725 {MUTED}",
         "bottom-toolbar.text": f"{MUTED}",
     }
 )
+
+SHORTCUTS = [
+    ("! for bash mode", "@ to mention a file", "# to save to memory"),
+    ("/ for commands", "shift+tab plan mode", "esc to interrupt"),
+    ("\\⏎ for a new line", "ctrl-r history search", "ctrl-c ×2 / ctrl-d to exit"),
+]
+
+
+def _flash(text: str, seconds: float = 2.0) -> None:
+    UI.hint, UI.hint_until = text, time.time() + seconds
 
 
 def _keys() -> KeyBindings:
@@ -257,13 +418,62 @@ def _keys() -> KeyBindings:
         if buf.complete_state:
             buf.complete_state = None  # accept the completion, don't send yet
             return
+        if buf.document.text_before_cursor.endswith("\\"):
+            buf.delete_before_cursor(1)
+            buf.insert_text("\n")  # backslash + Enter: new line, as in Claude Code
+            return
+        if buf.text.strip() == "?":
+            buf.reset()
+            show_shortcuts()
+            return
         buf.validate_and_handle()
 
     @kb.add("escape", "enter")
     def _(event):
         event.current_buffer.insert_text("\n")
 
+    @kb.add("c-c")
+    def _(event):
+        buf = event.current_buffer
+        if buf.text:
+            buf.reset()  # clear the line first
+            return
+        now = time.time()
+        if now - UI.last_ctrl_c < 2.0:
+            event.app.exit(exception=EOFError)
+            return
+        UI.last_ctrl_c = now
+        _flash("Press Ctrl-C again to exit")
+
+    @kb.add("s-tab")
+    def _(event):
+        UI.plan_mode = not UI.plan_mode
+        _flash("⏸ plan mode on: the model discusses and plans, no edits" if UI.plan_mode else "plan mode off: edits allowed")
+
     return kb
+
+
+def show_shortcuts():
+    for row in SHORTCUTS:
+        out("  " + "".join(f"[{MUTED}]{c:<28}[/]" for c in row))
+
+
+class MentionCompleter(Completer):
+    """Aider's completions, plus `@path` file mentions."""
+
+    def __init__(self, inner, files):
+        self.inner = inner
+        self.files = files
+
+    def get_completions(self, document, complete_event):
+        word = document.get_word_before_cursor(WORD=True)
+        if word.startswith("@"):
+            stem = word[1:].lower()
+            for f in self.files:
+                if stem in f.lower():
+                    yield Completion("@" + f, start_position=-len(word), display=f)
+            return
+        yield from self.inner.get_completions(document, complete_event)
 
 
 class BulletStream(MarkdownStream):
@@ -325,7 +535,7 @@ class Thinking:
             secs = int(time.time() - self._start)
             word = self.WORDS[(secs // 6) % len(self.WORDS)]
             frame = self.FRAMES[i % len(self.FRAMES)]
-            sys.stdout.write(f"\r\x1b[2K\x1b[38;2;94;234;212m{frame}\x1b[0m {word}… \x1b[2m({secs}s · ctrl-c to interrupt)\x1b[0m")
+            sys.stdout.write(f"\r\x1b[2K\x1b[38;2;94;234;212m{frame}\x1b[0m {word}… \x1b[2m({secs}s · esc to interrupt)\x1b[0m")
             sys.stdout.flush()
             i += 1
             self._stop.wait(self.delay)
@@ -333,7 +543,8 @@ class Thinking:
         sys.stdout.flush()
 
     def start(self):
-        self._thread.start()
+        if not PRINT_MODE:
+            self._thread.start()
 
     def stop(self):
         self._stop.set()
@@ -396,53 +607,278 @@ def show_edits(coder, before: dict, max_lines: int = 40) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Commands of our own
+# Commands (Claude Code names first)
 # ---------------------------------------------------------------------------
 
 HELP = [
-    ("/add <files>", "put files in the chat so they can be edited"),
-    ("/drop <files>", "remove files from the chat"),
-    ("/ask <question>", "ask without changing any files"),
-    ("/code <request>", "make a change (the default)"),
-    ("/search <query>", "search the web and add the results to the chat"),
-    ("/web <url>", "add a web page to the chat"),
-    ("/run <command>", "run a shell command and share its output"),
-    ("/test, /lint", "run your tests or linter and fix failures"),
-    ("/clear", "forget the conversation (keep files)"),
-    ("/reset", "forget the conversation and drop all files"),
-    ("/tokens", "show how much of the context is used"),
-    ("/exit", "quit"),
+    ("Conversation", [
+        ("/clear", "start a new conversation (files and memory stay)"),
+        ("/compact", "summarize the conversation to free context"),
+        ("/context", "show how much of the context window is used"),
+        ("/cost", "show tokens used this session"),
+        ("/export [file]", "save this conversation as Markdown"),
+        ("/exit", "quit (also ctrl-c twice, or ctrl-d)"),
+    ]),
+    ("Project", [
+        ("/init", f"write {MEMORY_FILE}, a project summary loaded every session"),
+        ("/memory", f"edit {MEMORY_FILE} (or type: # remember this)"),
+        ("/review", "review your uncommitted changes"),
+        ("/add, /drop <files>", "put files in or out of the chat (or type @file)"),
+    ]),
+    ("Tools", [
+        ("/search <query>", "search the web and add the results"),
+        ("/web <url>", "add a web page to the chat"),
+        ("!<command>", "run a shell command and share its output"),
+        ("/test, /lint", "run your tests or linter and fix failures"),
+    ]),
+    ("Session", [
+        ("/status", "server, model, context and mode"),
+        ("/model", "the model this server runs"),
+        ("/doctor", "check the connection to the server"),
+        ("/vim", "toggle vim key bindings"),
+    ]),
 ]
+
+NOT_AVAILABLE = {
+    "/mcp", "/agents", "/login", "/logout", "/permissions", "/hooks", "/config", "/terminal-setup",
+    "/bug", "/pr_comments", "/ide", "/install-github-app", "/upgrade", "/release-notes", "/add-dir",
+    "/rewind", "/output-style", "/statusline", "/privacy-settings",
+}
 
 
 def show_help():
-    out(f"\n[{ACCENT}]{BULLET}[/] [bold]OpenPhalanx commands[/]")
-    for cmd, what in HELP:
-        out(f"  [{ACCENT}]{cmd:<18}[/] [{MUTED}]{what}[/]")
-    out(f"\n  [{MUTED}]Edits are never committed. Review with git diff; revert with git checkout -- <file>.[/]")
-    out(f"  [{MUTED}]Enter sends · Esc then Enter adds a new line · Ctrl-C interrupts · Ctrl-D quits[/]\n")
+    headline("[bold]OpenPhalanx[/] [dim]· keys and commands follow Claude Code[/]")
+    for section, rows in HELP:
+        out(f"\n  [bold]{section}[/]")
+        for cmd, what in rows:
+            out(f"    [{ACCENT}]{cmd:<22}[/] [{MUTED}]{what}[/]")
+    out(f"\n  [bold]Shortcuts[/]")
+    show_shortcuts()
+    out(f"\n  [{MUTED}]Edits are never committed: review with git diff, revert with git checkout -- <file>.[/]")
+    out(f"  [{MUTED}]Later: oppx -c continues this conversation, oppx -r picks an older one.[/]\n")
 
 
-def welcome(coder):
-    cwd = str(Path.cwd()).replace(str(Path.home()), "~", 1)
-    web = f"[{GREEN}]on[/]" if WEB else f"[{MUTED}]off[/]"
-    lines = [
-        f"[{ACCENT}]✻[/] [bold]Welcome to OpenPhalanx[/]",
-        "",
-        f"  [{MUTED}]/help for commands · /exit to quit[/]",
-        f"  [{MUTED}]cwd:[/] {escape(cwd)}",
-        f"  [{MUTED}]server:[/] {escape(SERVER)} · {MODEL_LABEL} · {CONTEXT // 1024}k context · web search {web}",
+def show_status(coder):
+    headline("[bold]Status[/]")
+    rows = [
+        ("server", f"{SERVER}"),
+        ("model", f"{MODEL_LABEL} · {CONTEXT // 1024}k context"),
+        ("web search", "on" if WEB else "off (oppx without --no-web turns it on)"),
+        ("mode", "plan (no edits)" if UI.plan_mode else "default (edits applied, never committed)"),
+        ("files in chat", ", ".join(coder.get_inchat_relative_files()) or "none"),
+        ("memory", ", ".join(Path(f).name for f in coder.abs_read_only_fnames) or f"none (/init creates {MEMORY_FILE})"),
+        ("oppx", VERSION or "?"),
     ]
-    width = max(Text.from_markup(line).cell_len for line in lines) + 2
-    out(f"[{ACCENT}]╭{'─' * (width + 1)}╮[/]")
-    for line in lines:
-        pad = width - Text.from_markup(line).cell_len
-        out(f"[{ACCENT}]│[/] {line}{' ' * pad}[{ACCENT}]│[/]")
-    out(f"[{ACCENT}]╰{'─' * (width + 1)}╯[/]")
-    files = coder.get_inchat_relative_files()
-    if files:
-        step("In chat: " + ", ".join(escape(f) for f in files))
-    print()
+    for k, v in rows:
+        step(f"[bold]{k:<14}[/] {escape(v)}")
+
+
+def show_cost(coder):
+    sent, recv = coder.total_tokens_sent, coder.total_tokens_received
+    headline("[bold]Session usage[/]")
+    step(f"{sent:,} tokens sent · {recv:,} received · runs on your own server, so $0.00")
+
+
+def compact(coder, instructions: str):
+    before = coder.main_model.token_count(coder.done_messages) if coder.done_messages else 0
+    if not coder.done_messages:
+        step("Nothing to compact yet.")
+        return
+    with Thinking():
+        coder.done_messages = coder.summarizer.summarize_all(coder.done_messages)
+    after = coder.main_model.token_count(coder.done_messages)
+    step(f"Conversation compacted: {before:,} → {after:,} tokens", GREEN)
+
+
+def export(coder, target: str):
+    path = Path(target or f"openphalanx-conversation-{datetime.datetime.now():%Y%m%d-%H%M%S}.md")
+    lines = []
+    for m in coder.done_messages + coder.cur_messages:
+        role = {"user": "You", "assistant": "OpenPhalanx"}.get(m.get("role"), m.get("role"))
+        content = m.get("content")
+        if isinstance(content, list):
+            content = "\n".join(p.get("text", "") for p in content if isinstance(p, dict))
+        lines.append(f"## {role}\n\n{content}\n")
+    path.write_text("\n".join(lines) or "(empty conversation)\n", encoding="utf-8")
+    step(f"Saved the conversation to [bold]{escape(str(path))}[/]", GREEN)
+
+
+def memory_path(coder) -> Path:
+    return Path(coder.root) / MEMORY_FILE
+
+
+def load_memory(coder):
+    for name in (MEMORY_FILE, *EXTRA_MEMORY):
+        p = Path(coder.root) / name
+        if p.is_file():
+            coder.abs_read_only_fnames.add(str(p.resolve()))
+
+
+def remember(coder, note: str):
+    path = memory_path(coder)
+    exists = path.is_file()
+    with path.open("a", encoding="utf-8") as f:
+        if not exists:
+            f.write(f"# {Path(coder.root).name}\n\nNotes for the OpenPhalanx coding assistant.\n\n")
+        f.write(f"- {note.strip()}\n")
+    coder.abs_read_only_fnames.add(str(path.resolve()))
+    step(f"Saved to memory ([bold]{MEMORY_FILE}[/])", GREEN)
+
+
+def edit_memory(coder):
+    path = memory_path(coder)
+    if not path.exists():
+        path.write_text(f"# {Path(coder.root).name}\n\nNotes for the OpenPhalanx coding assistant.\n\n", encoding="utf-8")
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or ("nano" if subprocess.run(["which", "nano"], capture_output=True).returncode == 0 else "vi")
+    subprocess.call([*shlex.split(editor), str(path)])
+    coder.abs_read_only_fnames.add(str(path.resolve()))
+    step(f"Memory updated ([bold]{MEMORY_FILE}[/])", GREEN)
+
+
+INIT_PROMPT = (
+    f"Create a file named {MEMORY_FILE} in the repository root that briefly orients a coding assistant to this "
+    "project: what it does, how to build, test and run it, the main directories and what lives in them, and any "
+    "conventions you can see. Use short Markdown sections and bullet points, at most 60 lines. Base it only on "
+    "what is in this repository."
+)
+
+REVIEW_PROMPT = (
+    "Review the following uncommitted changes as a careful senior engineer. List real problems first "
+    "(bugs, missing error handling, security issues), then smaller suggestions. Be specific and brief. "
+    "Do not rewrite the code.\n\n```diff\n{diff}\n```"
+)
+
+
+INTENT_PROMPT = """Classify the programmer's message to a coding assistant.
+
+Answer "edit" when the message asks to change the code or files in any way: add, write, create, implement, fix, refactor, rename, remove, delete, update, optimize, or "make it ..." — including polite questions such as "can you add tests?".
+Answer "ask" when the message only wants information: a question, an explanation, a review, an opinion, or a plan, without asking for any change to be made.
+
+Examples:
+Message: What does the parse function return? -> ask
+Message: Explain how the cache works in this repo. -> ask
+Message: Why does this test fail? -> ask
+Message: Is this function thread safe? -> ask
+Message: Review my changes. -> ask
+Message: Add a function sub(a, b) to calc.py. -> edit
+Message: Can you add unit tests for config.rs? -> edit
+Message: Fix the failing test. -> edit
+Message: Why does this test fail? Please fix it. -> edit
+Message: Rename x to count. -> edit
+Message: Make the parser faster. -> edit
+
+Reply with exactly one word: ask or edit."""
+
+
+def wants_edit(text: str) -> bool:
+    """One constrained token from the server's model (~40 ms): does this
+    message ask for a change, or only for information? Questions then run
+    without edits, as in Claude Code. Falls back to "edit" on any error."""
+    base, key = os.environ.get("OPENAI_API_BASE"), os.environ.get("OPENAI_API_KEY")
+    if not base or not key:
+        return True
+    try:
+        r = httpx.post(
+            f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": MODEL_LABEL,
+                "messages": [{"role": "system", "content": INTENT_PROMPT}, {"role": "user", "content": text[-2000:]}],
+                "regex": "(ask|edit)",
+                "max_tokens": 2,
+                "temperature": 0,
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip() != "ask"
+    except (httpx.HTTPError, ValueError, KeyError, IndexError):
+        return True
+
+
+def git_diff(root: str) -> str:
+    try:
+        r = subprocess.run(["git", "diff", "HEAD"], cwd=root, capture_output=True, text=True, timeout=20)
+        return r.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def translate(coder, text: str):
+    """Maps Claude-style input to what Aider understands. Returns the text to
+    run, or None when the input was fully handled here."""
+    if text.startswith("!"):
+        cmd = text[1:].strip()
+        return f"/run {cmd}" if cmd else None
+    if text.startswith("#") and not text.startswith("#!"):
+        note = text.lstrip("#").strip()
+        if note:
+            remember(coder, note)
+        return None
+    if not text.startswith("/"):
+        # @file mentions put the file in the chat.
+        for path in re.findall(r"(?<!\S)@(\S+)", text):
+            p = Path(coder.root) / path
+            if p.is_file():
+                coder.commands.cmd_add(path)
+        text = re.sub(r"(?<!\S)@(\S+)", r"\1", text)
+        if UI.plan_mode or not wants_edit(text):
+            return f"/ask {text}"
+        return text
+
+    name, _, arg = text.partition(" ")
+    arg = arg.strip()
+    if name in ("/help", "/?"):
+        show_help()
+    elif name in ("/exit", "/quit"):
+        raise EOFError
+    elif name == "/clear":
+        coder.commands.cmd_clear("")
+        step("Started a new conversation (files and memory kept)", GREEN)
+    elif name == "/compact":
+        compact(coder, arg)
+    elif name == "/cost":
+        show_cost(coder)
+    elif name == "/context":
+        return "/tokens"
+    elif name == "/status":
+        show_status(coder)
+    elif name == "/model":
+        headline(f"[bold]{MODEL_LABEL}[/] · {CONTEXT // 1024}k context on {escape(SERVER)}")
+        step("The model is chosen on the server, in the OpenPhalanx app's Models page.")
+    elif name == "/doctor":
+        subprocess.call([OPPX_BIN, "status"])
+    elif name == "/vim":
+        UI.vi = not UI.vi
+        step(f"Vim key bindings {'on' if UI.vi else 'off'}", GREEN)
+    elif name == "/init":
+        return INIT_PROMPT
+    elif name == "/memory":
+        edit_memory(coder)
+    elif name == "/review":
+        diff = git_diff(coder.root)
+        if not diff.strip():
+            step("No uncommitted changes to review.")
+            return None
+        if len(diff) > 24000:
+            step(f"The diff is large; reviewing the first 24,000 of {len(diff):,} characters.", YELLOW)
+        return "/ask " + REVIEW_PROMPT.format(diff=diff[:24000])
+    elif name == "/export":
+        export(coder, arg)
+    elif name == "/search":
+        if not arg:
+            step("Usage: /search <query>", YELLOW)
+            return None
+        return f"/run {shlex.quote(OPPX_BIN)} search {shlex.quote(arg)}"
+    elif name == "/resume":
+        step("Exit (/exit), then run oppx -r to pick a past conversation, or oppx -c for the latest.")
+    elif name in ("/undo", "/commit", "/git"):
+        step("OpenPhalanx never commits. Use git yourself: git diff, git checkout -- <file>.", YELLOW)
+    elif name in NOT_AVAILABLE:
+        step(f"{name} isn't available in OpenPhalanx. /help lists what is.", YELLOW)
+    else:
+        return text  # Aider's own commands: /add, /drop, /ask, /code, /run, /test, /lint, /web, /tokens …
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +889,7 @@ def welcome(coder):
 def build_coder(argv):
     aider_main.InputOutput = OppxIO  # main() constructs its IO from this name
     base_coder.WaitingSpinner = Thinking
+    base_coder.Coder.keyboard_interrupt = _interrupted
     coder = aider_main.main(argv, return_coder=True)
     # main() installs the engine's crash reporter; errors are ours to report.
     sys.excepthook = sys.__excepthook__
@@ -461,46 +898,106 @@ def build_coder(argv):
     return coder
 
 
+def welcome(coder):
+    cwd = str(Path.cwd()).replace(str(Path.home()), "~", 1)
+    web = f"[{GREEN}]on[/]" if WEB else f"[{MUTED}]off[/]"
+    memory = [Path(f).name for f in coder.abs_read_only_fnames]
+    lines = [
+        f"[{ACCENT}]✻[/] [bold]Welcome to OpenPhalanx![/]",
+        "",
+        f"  [{MUTED}]/help for help, /status for your current setup[/]",
+        "",
+        f"  [{MUTED}]cwd:[/] {escape(cwd)}",
+        f"  [{MUTED}]server:[/] {escape(SERVER)} · {MODEL_LABEL} · {CONTEXT // 1024}k context · web search {web}",
+    ]
+    if memory:
+        lines.append(f"  [{MUTED}]memory:[/] {escape(', '.join(memory))}")
+    width = max(Text.from_markup(line).cell_len for line in lines) + 2
+    out(f"[{ACCENT}]╭{'─' * (width + 1)}╮[/]")
+    for line in lines:
+        pad = width - Text.from_markup(line).cell_len
+        out(f"[{ACCENT}]│[/] {line}{' ' * pad}[{ACCENT}]│[/]")
+    out(f"[{ACCENT}]╰{'─' * (width + 1)}╯[/]")
+    if not memory:
+        out(f"\n [{MUTED}]Tip: run /init to write {MEMORY_FILE}, a project summary loaded every session.[/]")
+    print()
+
+
+INTERRUPT_NOTE = "I see that you interrupted my previous reply."
+
+
+def _was_interrupted(coder) -> bool:
+    # Aider records a mid-stream interrupt in the conversation instead of
+    # calling keyboard_interrupt(); catch both.
+    recent = (coder.done_messages + coder.cur_messages)[-2:]
+    return UI.interrupted or any(m.get("content") == INTERRUPT_NOTE for m in recent)
+
+
+def run_turn(coder, text: str):
+    """Runs one message; returns the coder to continue with (a new one after
+    a mode switch such as /ask, which runs in its own temporary coder)."""
+    global WATCHER
+    coder.io._retry_shown = False
+    UI.interrupted = False
+    before = snapshot(coder)
+    result = coder
+    try:
+        with EscWatcher() as WATCHER:
+            coder.run_one(text, preproc=True)
+    except SwitchCoder as switch:
+        if getattr(switch, "placeholder", None) is not None:
+            coder.io.placeholder = switch.placeholder
+        kwargs = dict(io=coder.io, from_coder=coder)
+        kwargs.update(switch.kwargs)
+        kwargs.pop("show_announcements", None)
+        result = base_coder.Coder.create(**kwargs)
+    except KeyboardInterrupt:
+        UI.interrupted = True
+    finally:
+        WATCHER = None
+    if _was_interrupted(result):
+        step("Interrupted by user", YELLOW)
+    show_edits(coder, before)
+    return result
+
+
 def run(argv) -> int:
     if not aider.__version__.startswith(TESTED_AIDER):
         out(f"[{YELLOW}]warning:[/] this frontend was tested with engine {TESTED_AIDER}.x; found {aider.__version__}.")
     coder = build_coder(argv)
-    io = coder.io
+    load_memory(coder)
+    initial = os.environ.get("OPPX_INITIAL", "").strip()
+
+    if PRINT_MODE:
+        text = translate(coder, initial) if initial else None
+        if text:
+            run_turn(coder, text)
+        return 0
+
     welcome(coder)
+    pending = initial
     while True:
-        try:
-            text = coder.get_input()
-        except KeyboardInterrupt:
-            continue
-        except EOFError:
-            break
+        if not pending and UI.queued:
+            pending = UI.queued.pop(0)
+        if pending:
+            text, pending = pending, ""
+            out(f"[{ACCENT} bold]>[/] {escape(text)}")
+        else:
+            try:
+                text = coder.get_input()
+            except KeyboardInterrupt:
+                continue
+            except EOFError:
+                break
         if not text:
             continue
-        cmd = text.split(maxsplit=1)
-        if cmd[0] in ("/exit", "/quit"):
-            break
-        if cmd[0] == "/help":
-            show_help()
-            continue
-        if cmd[0] == "/search":
-            if len(cmd) < 2:
-                step("Usage: /search <query>", YELLOW)
-                continue
-            text = f"/run {shlex.quote(OPPX_BIN)} search {shlex.quote(cmd[1])}"
-        io._retry_shown = False
-        before = snapshot(coder)
         try:
-            coder.run_one(text, preproc=True)
-            show_edits(coder, before)
-        except SwitchCoder as switch:
-            if getattr(switch, "placeholder", None) is not None:
-                io.placeholder = switch.placeholder
-            kwargs = dict(io=io, from_coder=coder)
-            kwargs.update(switch.kwargs)
-            kwargs.pop("show_announcements", None)
-            coder = base_coder.Coder.create(**kwargs)
-        except KeyboardInterrupt:
-            step("Interrupted", YELLOW)
+            text = translate(coder, text)
+        except EOFError:
+            break
+        if text:
+            coder = run_turn(coder, text)
+            load_memory(coder)  # picks up OPENPHALANX.md right after /init
         print()
     out(f"[{MUTED}]Bye. Your changes are in the working tree; review them with git diff.[/]")
     return 0

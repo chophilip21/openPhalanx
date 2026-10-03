@@ -460,6 +460,40 @@
 
   * Remaining: the user's own look on a real terminal.
 
+* \[ \] **Step 4.8: Claude Code parity, sessions and `oppx --update`**
+
+  * Requested after the first real-terminal test, where the user reported that Ctrl-C couldn't close the session. The old prompt loop deliberately ignored Ctrl-C at the prompt.
+
+  * **Keys and commands like Claude Code:** see `CLAUDE.md` for the full list. `/resume` and launch flags `oppx "prompt"`, `-p`, `-c` and `-r` were added.
+
+  * **Sessions:** the user asked whether Aider already had session management. It has only `--restore-chat-history` over a single history file, and no separate sessions or picker. We now keep one file per conversation, with `-c` (latest), `-r` (picker) and `--resume <id>`.
+
+  * **Fixes found while testing in a pty:**
+
+    * Keys typed during a turn were swallowed by the Esc reader. They're now queued, or pre-filled at the next prompt.
+
+    * An Esc interrupt printed the partial answer twice. "Interrupted" is now printed after the live view closes, and mid-stream interrupts and `/ask` turns are both detected.
+
+    * **A plain question made a destructive edit:** "what does mul return?" deleted `mul`. Added the one-token ask/edit classifier (14/14, about 40 ms). The gateway now skips its search router for these utility calls, so the image was rebuilt.
+
+  * ✅ **Verified in pty sessions** (status bar rendered by answering CPR):
+
+    * Ctrl-C clears the line, and twice exits. Esc interrupts.
+
+    * `/status`, `!echo`, type-ahead `# memory`, Shift+Tab plan mode (no edit), an `@calc.py` question (no edit), `/cost`, `/mcp` (not available) and `/export` all behave.
+
+    * `-p` works when piped. The `-r` picker resumed a session with its history restored, and `-c` works. `--resume nope` gives a clear error, and an initial prompt is sent on start.
+
+  * ✅ **`oppx --update`, verified in an isolated clone with a local remote:**
+
+    * With local changes, it refuses with a clear message.
+
+    * Otherwise it pulled `53e6ac1 → 7a91fd2`, rebuilt, and the installed binary reports `7a91fd2`. It installed `aider 0.86.2`.
+
+    * Run again, it reports "Up to date".
+
+  * Remaining: the user's check on a real terminal.
+
 ## Phase 5: End-to-End Validation & Caching Benchmark
 
 * \[ \] **Step 5.1: Test Simple File Edit**
