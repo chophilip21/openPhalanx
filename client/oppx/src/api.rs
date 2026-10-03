@@ -95,3 +95,33 @@ pub async fn unpair(client: &reqwest::Client, url: &str, token: &str) -> Result<
         _ => bail!("unpair failed: {}", detail(resp).await),
     }
 }
+
+#[derive(Debug, Deserialize)]
+pub struct SearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+/// Web search through the server's private SearXNG.
+pub async fn search(client: &reqwest::Client, url: &str, token: &str, query: &str, max: u8) -> Result<Vec<SearchResult>> {
+    let resp = client
+        .post(format!("{url}/v1/search"))
+        .bearer_auth(token)
+        .json(&json!({ "query": query, "max_results": max }))
+        .timeout(TIMEOUT)
+        .send()
+        .await
+        .with_context(|| format!("cannot reach {url}"))?;
+    match resp.status() {
+        StatusCode::OK => {
+            #[derive(Deserialize)]
+            struct Body {
+                results: Vec<SearchResult>,
+            }
+            Ok(resp.json::<Body>().await?.results)
+        }
+        StatusCode::UNAUTHORIZED => bail!("this device was revoked; pair again"),
+        _ => bail!("search failed: {}", detail(resp).await),
+    }
+}

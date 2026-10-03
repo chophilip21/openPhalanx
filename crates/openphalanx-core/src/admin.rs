@@ -23,6 +23,13 @@ pub struct GatewayMetrics {
     pub requests_failed: u64,
     pub requests_active: u64,
     pub last_request_at: Option<f64>,
+    #[serde(default)]
+    pub web_searches: u64,
+    /// Requests that went through the automatic search router / that searched.
+    #[serde(default)]
+    pub auto_routed: u64,
+    #[serde(default)]
+    pub auto_searched: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -47,6 +54,9 @@ pub struct Status {
     pub pairing: Pairing,
     pub devices: u32,
     pub tls_fingerprint: String,
+    /// Whether the gateway has a SearXNG instance configured.
+    #[serde(default)]
+    pub web_search: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +71,8 @@ pub struct Device {
     pub prompt_tokens: u64,
     #[serde(default)]
     pub completion_tokens: u64,
+    #[serde(default)]
+    pub web_searches: u64,
 }
 
 pub struct AdminClient {

@@ -161,6 +161,14 @@ pub async fn preflight(settings: &Settings) -> Preflight {
         } else {
             Check::new("image", "Backend image", Warn, format!("{} will be downloaded on start (about 16 GB).", settings.image()))
         });
+        if settings.web_search {
+            let present = docker::image_exists(docker::SEARXNG_IMAGE).await.unwrap_or(false);
+            checks.push(if present {
+                Check::new("searxng", "Web search", Pass, "SearXNG ready (private to the backend)")
+            } else {
+                Check::new("searxng", "Web search", Warn, "SearXNG will be downloaded on start (about 0.4 GB).")
+            });
+        }
     }
 
     let container = if docker_ok { docker::inspect().await.ok().flatten() } else { None };
@@ -279,6 +287,14 @@ pub async fn start(settings: &Settings, mut on_progress: impl FnMut(StartProgres
     }
 
     on_progress(StartProgress::Launching);
+    docker::ensure_network().await?;
+    if settings.web_search {
+        if !docker::image_exists(docker::SEARXNG_IMAGE).await? {
+            docker::pull(docker::SEARXNG_IMAGE, |line| on_progress(StartProgress::PullingImage { line })).await?;
+        }
+        let settings_file = write_searxng_settings()?;
+        docker::run_searxng(&settings_file, &admin::new_admin_token()).await?;
+    }
     docker::run(&RunSpec {
         image: settings.image(),
         gpu_index: settings.gpu_index,
@@ -289,6 +305,20 @@ pub async fn start(settings: &Settings, mut on_progress: impl FnMut(StartProgres
         context_len: req.context_len,
         state_dir,
         admin_token: admin::new_admin_token(),
+        web_search: settings.web_search,
     })
     .await
+}
+
+/// Writes the SearXNG settings (no secrets) where the container can read them.
+fn write_searxng_settings() -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = paths::data_dir().join("searxng");
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join("settings.yml");
+    std::fs::write(&file, docker::SEARXNG_SETTINGS)?;
+    // SearXNG runs as its own unprivileged user inside the container.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))?;
+    Ok(file)
 }

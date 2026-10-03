@@ -15,6 +15,14 @@ pub const CONTAINER_NAME: &str = "openphalanx-backend";
 pub const DEFAULT_IMAGE: &str =
     concat!("ghcr.io/chophilip21/openphalanx-backend:", env!("CARGO_PKG_VERSION"));
 pub const ADMIN_PORT: u16 = 9091;
+/// Private bridge network shared by the backend and SearXNG (no published ports for SearXNG).
+pub const NETWORK: &str = "openphalanx";
+pub const SEARXNG_CONTAINER: &str = "openphalanx-searxng";
+/// Pinned multi-arch index digest (SearXNG 2026.10.2).
+pub const SEARXNG_IMAGE: &str =
+    "searxng/searxng@sha256:c642712fcedcdaa78fac44f71eada86aff510745826ba1bd1a368211fea2ce7f";
+pub const SEARXNG_SETTINGS: &str = include_str!("../searxng/settings.yml");
+const SEARXNG_INTERNAL_URL: &str = "http://openphalanx-searxng:8080";
 const MANAGED_LABEL: &str = "io.openphalanx.managed";
 const MODEL_LABEL: &str = "io.openphalanx.model";
 
@@ -168,6 +176,8 @@ pub struct RunSpec {
     pub context_len: u32,
     pub state_dir: PathBuf,
     pub admin_token: String,
+    /// Point the gateway at the SearXNG container.
+    pub web_search: bool,
 }
 
 pub fn run_args(spec: &RunSpec) -> Vec<String> {
@@ -179,6 +189,8 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
         "--gpus".into(),
         format!("\"device={}\"", spec.gpu_index),
         "--ipc=host".into(),
+        "--network".into(),
+        NETWORK.into(),
         "-p".into(),
         format!("{0}:{0}", spec.agent_port),
         // Admin API is reachable from this machine only.
@@ -208,6 +220,10 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
         a.push("-e".into());
         a.push(format!("{k}={v}"));
     }
+    if spec.web_search {
+        a.push("-e".into());
+        a.push(format!("SEARXNG_URL={SEARXNG_INTERNAL_URL}"));
+    }
     a.push(spec.image.clone());
     a
 }
@@ -223,13 +239,64 @@ pub async fn run(spec: &RunSpec) -> Result<()> {
     Ok(())
 }
 
+/// Stops the backend and SearXNG.
 pub async fn stop() -> Result<()> {
     docker(&["stop", "-t", "20", CONTAINER_NAME]).await?;
-    remove().await
+    remove().await?;
+    docker(&["rm", "-f", SEARXNG_CONTAINER]).await?;
+    Ok(())
 }
 
 pub async fn remove() -> Result<()> {
     docker(&["rm", "-f", CONTAINER_NAME]).await?;
+    Ok(())
+}
+
+pub async fn ensure_network() -> Result<()> {
+    if docker(&["network", "inspect", NETWORK]).await?.status.success() {
+        return Ok(());
+    }
+    let out = docker(&["network", "create", "--label", &format!("{MANAGED_LABEL}=true"), NETWORK]).await?;
+    if !out.status.success() {
+        bail!("cannot create Docker network {NETWORK}: {}", stderr(&out));
+    }
+    Ok(())
+}
+
+pub fn searxng_run_args(settings_file: &Path, secret: &str) -> Vec<String> {
+    vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        SEARXNG_CONTAINER.into(),
+        "--network".into(),
+        NETWORK.into(),
+        "--label".into(),
+        format!("{MANAGED_LABEL}=true"),
+        // SearXNG logs full engine URLs (including the query) when an engine
+        // fails; queries can carry code context, so its output is not kept.
+        "--log-driver".into(),
+        "none".into(),
+        // Never chown the host's settings file; it is mounted read-only.
+        "-e".into(),
+        "FORCE_OWNERSHIP=false".into(),
+        "-e".into(),
+        format!("SEARXNG_SECRET={secret}"),
+        "-v".into(),
+        format!("{}:/etc/searxng/settings.yml:ro", settings_file.display()),
+        SEARXNG_IMAGE.into(),
+    ]
+}
+
+/// (Re)starts SearXNG on the private network. No ports are published.
+pub async fn run_searxng(settings_file: &Path, secret: &str) -> Result<()> {
+    docker(&["rm", "-f", SEARXNG_CONTAINER]).await?;
+    let args = searxng_run_args(settings_file, secret);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = docker(&refs).await?;
+    if !out.status.success() {
+        bail!("cannot start SearXNG: {}", stderr(&out));
+    }
     Ok(())
 }
 
@@ -294,6 +361,7 @@ mod tests {
             context_len: 32768,
             state_dir: "/s".into(),
             admin_token: "secret".into(),
+            web_search: true,
         };
         let a = run_args(&spec).join(" ");
         assert!(a.contains("-p 9090:9090"));
@@ -301,7 +369,21 @@ mod tests {
         assert!(a.contains("-v /m:/m:ro") && a.contains("-v /blobs:/blobs:ro"));
         assert!(a.contains("-e MEM_FRACTION_STATIC=0.812"));
         assert!(a.contains("-e HF_HUB_OFFLINE=1"));
+        assert!(a.contains("--network openphalanx"));
+        assert!(a.contains("-e SEARXNG_URL=http://openphalanx-searxng:8080"));
         assert!(a.ends_with(DEFAULT_IMAGE));
+    }
+
+    #[test]
+    fn searxng_is_private_and_never_chowns() {
+        let a = searxng_run_args(Path::new("/d/settings.yml"), "k").join(" ");
+        assert!(!a.contains(" -p "), "SearXNG must not publish ports");
+        assert!(a.contains("--network openphalanx"));
+        assert!(a.contains("FORCE_OWNERSHIP=false"));
+        assert!(a.contains("--log-driver none"), "queries must not be logged");
+        assert!(a.contains("-v /d/settings.yml:/etc/searxng/settings.yml:ro"));
+        assert!(a.contains("searxng/searxng@sha256:"));
+        assert!(SEARXNG_SETTINGS.contains("formats: [json]"));
     }
 
     #[test]

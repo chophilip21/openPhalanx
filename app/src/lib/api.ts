@@ -29,6 +29,9 @@ export type AdminStatus = {
     requests_failed: number;
     requests_active: number;
     last_request_at: number | null;
+    web_searches: number;
+    auto_routed: number;
+    auto_searched: number;
   };
   inference: {
     prompt_tokens_total?: number | null;
@@ -43,6 +46,7 @@ export type AdminStatus = {
   pairing: Pairing;
   devices: number;
   tls_fingerprint: string;
+  web_search: boolean;
 };
 
 export type ServerState = "stopped" | "starting" | "running" | "stopping" | "error" | "external";
@@ -63,6 +67,7 @@ export type Settings = {
   gpu_index: number;
   agent_port: number;
   image: string | null;
+  web_search: boolean;
 };
 
 export type Snapshot = {
@@ -162,6 +167,7 @@ export type Device = {
   requests: number;
   prompt_tokens: number;
   completion_tokens: number;
+  web_searches: number;
 };
 
 export const api = {
@@ -179,6 +185,7 @@ export const api = {
   selectModel: (key: string) => invoke<Settings>("select_model", { key }),
   setContextLen: (contextLen: number) => invoke<Settings>("set_context_len", { contextLen }),
   setGpu: (index: number) => invoke<Settings>("set_gpu", { index }),
+  setWebSearch: (enabled: boolean) => invoke<Settings>("set_web_search", { enabled }),
   download: (key: string) => invoke<void>("download_model", { key }),
   cancelDownload: (key: string) => invoke<void>("cancel_download", { key }),
   clearDownload: (key: string) => invoke<void>("clear_download", { key }),

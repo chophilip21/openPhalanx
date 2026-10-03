@@ -88,6 +88,43 @@ async fn main() -> anyhow::Result<()> {
         plain.lines().filter(|l| l.contains("\"usage\":{")).count(),
         plain.trim_end().ends_with("data: [DONE]")
     );
+    // Web search.
+    let search_marker = "openphalanx-search-marker-5521";
+    let r = http.post(format!("{base}/v1/search")).json(&serde_json::json!({"query": "rust tokio"})).send().await?;
+    println!("search without token: HTTP {}", r.status());
+    let r: serde_json::Value = http
+        .post(format!("{base}/v1/search"))
+        .bearer_auth(device_token)
+        .json(&serde_json::json!({"query": format!("sglang radix attention {search_marker}"), "max_results": 3}))
+        .send()
+        .await?
+        .json()
+        .await?;
+    println!("search: {} results, first: {}", r["results"].as_array().map_or(0, |a| a.len()), r["results"][0]["url"]);
+    let auto_chat = |content: &str, header: bool| {
+        let mut rb = http.post(format!("{base}/v1/chat/completions")).bearer_auth(device_token.to_string());
+        if header {
+            rb = rb.header("x-oppx-web-search", "auto");
+        }
+        rb.json(&serde_json::json!({"messages": [{"role": "user", "content": content}], "max_tokens": 80, "stream": true})).send()
+    };
+    let before = admin.status().await?.gateway;
+    let t0 = std::time::Instant::now();
+    let a1 = auto_chat("What is the latest stable version of the Rust tokio crate?", true).await?.text().await?;
+    let t1 = t0.elapsed().as_secs_f64();
+    let mid = admin.status().await?.gateway;
+    auto_chat("calc.py:\n```python\ndef add(a, b):\n    return a + b\n```\nAdd a function mul(a, b).", true).await?.text().await?;
+    let mid2 = admin.status().await?.gateway;
+    auto_chat("What is the latest stable version of the Rust tokio crate?", false).await?.text().await?;
+    let after = admin.status().await?.gateway;
+    println!(
+        "auto: version question routed={} searched={} ({t1:.1}s, stream ends with [DONE]: {}) | edit routed={} searched={} | no header routed={}",
+        mid.auto_routed - before.auto_routed, mid.auto_searched - before.auto_searched, a1.trim_end().ends_with("data: [DONE]"),
+        mid2.auto_routed - mid.auto_routed, mid2.auto_searched - mid.auto_searched, after.auto_routed - mid2.auto_routed
+    );
+    let gw_logs = docker::logs_tail(100_000).await?;
+    println!("search marker in backend log: {}", gw_logs.matches(search_marker).count());
+
     let big = "x".repeat(5 * 1024 * 1024);
     let r = chat(device_token, serde_json::json!({"messages": [{"role": "user", "content": big}]})).await?;
     println!("5 MiB body: HTTP {}", r.status());

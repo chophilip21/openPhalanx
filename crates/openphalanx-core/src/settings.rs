@@ -36,6 +36,8 @@ pub struct Settings {
     /// Override for the backend image; `None` tracks the app version.
     pub image: Option<String>,
     pub custom_models: Vec<CustomModel>,
+    /// Run a private SearXNG next to the backend for client web search.
+    pub web_search: bool,
 }
 
 impl Default for Settings {
@@ -47,6 +49,7 @@ impl Default for Settings {
             agent_port: 9090,
             image: None,
             custom_models: Vec::new(),
+            web_search: true,
         }
     }
 }

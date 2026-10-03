@@ -149,8 +149,9 @@ Optional environment variables: `MODEL_PATH`, `CONTEXT_LENGTH`, `MEM_FRACTION_ST
 cargo install --path client/oppx              # or: cargo build -p oppx (binary in target/debug/oppx)
 oppx pair <server> <code> [--fingerprint FP | --yes] [--as NAME] [--device-name NAME] [--force]
 oppx status [NAME]                            # certificate pinned ✓, token valid ✓, model ready + context
-oppx aider [--server NAME] [-- aider args]    # local Aider via pinned loopback proxy; never commits
-oppx proxy [NAME] [--port N]                  # proxy only; prints OPENAI_API_BASE and a per-run local key
+oppx aider [--server NAME] [--web] [-- aider args]   # local Aider via pinned loopback proxy; never commits
+oppx proxy [NAME] [--port N] [--web]          # proxy only; prints OPENAI_API_BASE and a per-run local key
+oppx search "query" [-n N]                    # web search via the server's SearXNG (Markdown; use /run in Aider)
 oppx unpair [NAME] [--local-only]             # self-revoke on the server, then forget locally
 oppx servers | oppx use NAME
 ```
@@ -160,15 +161,35 @@ oppx servers | oppx use NAME
 * **Testing without a GUI:** pairing codes can be issued through the admin API: `curl -X POST -H "x-admin-token: $ADMIN_TOKEN" http://127.0.0.1:9091/admin/pairing`. The token is in the container env: `docker inspect openphalanx-backend --format '{{json .Config.Env}}'`.
 * **Stand-in agents:** a fake `aider` script on `PATH` (printing its args and env) is a quick way to test `oppx aider` without the real agent.
 
+## Web search
+
+* **SearXNG:** the `openphalanx-searxng` container is pinned by digest and runs on the private `openphalanx` Docker network with **no published ports**. Its settings live in `crates/openphalanx-core/searxng/settings.yml` and are written to `~/.local/share/openphalanx/searxng/settings.yml` (0644, read-only mount, `FORCE_OWNERSHIP=false`). The secret is passed as `SEARXNG_SECRET`, and `--log-driver none` keeps queries out of logs. The GUI starts it before the backend when `settings.web_search` is on (the default; toggle on the Server page). The backend gets `SEARXNG_URL=http://openphalanx-searxng:8080`.
+* **Gateway:**
+  * `POST /v1/search {query, max_results}` returns `{results: [{title, url, snippet}]}`.
+  * A chat request with `X-Oppx-Web-Search: auto` goes through the **router**: a constrained-JSON call to the same model (`{"search": bool, "query": str}`) on the last ~4,000 characters of the latest user message. Results are appended to the end of that message as `<web_search_results>`, with an "untrusted" note.
+  * Native tool calling was tried and doesn't work with Qwen2.5-Coder-14B (see `milestone.md`, Step 4.5).
+* **Client:** `oppx aider --web` and `oppx proxy --web` add the header, and `oppx search` calls `/v1/search`.
+* **Manual run (without the GUI):**
+
+  ```bash
+  docker network create openphalanx
+  docker run -d --name openphalanx-searxng --network openphalanx --log-driver none \
+    -e FORCE_OWNERSHIP=false -e SEARXNG_SECRET=$(openssl rand -hex 32) \
+    -v $PWD/crates/openphalanx-core/searxng/settings.yml:/etc/searxng/settings.yml:ro \
+    searxng/searxng@sha256:c642712fcedcdaa78fac44f71eada86aff510745826ba1bd1a368211fea2ce7f
+  # then add to the backend's docker run: --network openphalanx -e SEARXNG_URL=http://openphalanx-searxng:8080
+  ```
+
 ## Ports and files
 
 | | |
 |---|---|
-| `9090/tcp` (all interfaces) | Public gateway API, TLS only. `/health` and `/v1/pair` are open. `/v1/whoami`, `/v1/unpair` (self-revoke), `/v1/models` and `/v1/chat/completions` (OpenAI-compatible, streaming) need a device token |
+| `9090/tcp` (all interfaces) | Public gateway API, TLS only. `/health` and `/v1/pair` are open. `/v1/whoami`, `/v1/unpair` (self-revoke), `/v1/search`, `/v1/models` and `/v1/chat/completions` (OpenAI-compatible, streaming) need a device token |
 | `9091/tcp` (`127.0.0.1` only) | Admin API for the GUI; needs the per-launch admin token |
 | `~/.config/openphalanx/settings.json` | Selected model, context length, GPU index, custom models |
 | `~/.local/share/openphalanx/models/` | Models downloaded by the GUI (verified, pinned to a commit) |
 | `~/.local/share/openphalanx/backend-state/` | Backend TLS certificate and paired devices (hashed tokens). Deleting it unpairs every client and changes the fingerprint |
+| `~/.local/share/openphalanx/searxng/settings.yml` | SearXNG settings (no secrets), mounted read-only |
 | `~/.cache/huggingface/hub/` | Existing Hugging Face cache; reused read-only when a model is already there |
 
 Open `9090/tcp` in your firewall for the clients' network. Never expose `9091`.
@@ -179,6 +200,7 @@ Open `9090/tcp` in your firewall for the clients' network. Never expose `9091`.
 * **Pairing codes:** 8 characters, about 39 bits. Each is single-use, valid for 10 minutes, and burned after 5 wrong attempts, with a 1 s delay after each miss.
 * **Device tokens:** each client trades a pairing code for its own random 256-bit device token. The server stores only the SHA-256 hash, and you can revoke any device from the GUI.
 * **Admin API:** the admin API is reachable from the server machine only, and requires a random token generated at each launch.
+* **Web search:** SearXNG is reachable only from the gateway (private network, no ports) and keeps no logs. Automatic search is opt-in per session (`--web`) because router-written queries leave the server for public search engines. Results are injected as untrusted reference text.
 * **No code stored or executed:** the server keeps no code and runs no commands for clients. Request bodies (prompts) are never logged; only per-device request and token counts are kept. Model weights are mounted read-only, and the backend never downloads weights on its own.
 
 ## Development

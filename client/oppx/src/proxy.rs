@@ -30,6 +30,8 @@ struct Upstream {
     url: String,
     token: String,
     local_key: String,
+    /// Ask the gateway to route chat requests through automatic web search.
+    web_search: bool,
 }
 
 /// A bound, not yet running proxy.
@@ -43,7 +45,7 @@ pub struct Proxy {
 
 impl Proxy {
     /// Binds `127.0.0.1:port` (`0` picks a free port).
-    pub async fn bind(server: &Server, port: u16) -> Result<Proxy> {
+    pub async fn bind(server: &Server, port: u16, web_search: bool) -> Result<Proxy> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
             .with_context(|| format!("cannot listen on 127.0.0.1:{port}"))?;
@@ -56,6 +58,7 @@ impl Proxy {
             url: server.url.clone(),
             token: server.token.clone(),
             local_key: local_key.clone(),
+            web_search,
         };
         let app = Router::new()
             .route("/v1/models", get(forward))
@@ -99,6 +102,9 @@ async fn forward(State(up): State<Upstream>, method: Method, uri: Uri, headers: 
     let mut req = up.client.request(method, format!("{}{path}", up.url)).bearer_auth(&up.token);
     if let Some(ct) = headers.get(header::CONTENT_TYPE) {
         req = req.header(header::CONTENT_TYPE, ct.clone());
+    }
+    if up.web_search {
+        req = req.header("x-oppx-web-search", "auto");
     }
     let resp = match req.body(bytes).send().await {
         Ok(r) => r,

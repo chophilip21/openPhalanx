@@ -69,6 +69,9 @@ enum Command {
         /// Server name (defaults to the default server).
         #[arg(long)]
         server: Option<String>,
+        /// Let the server search the web automatically when a request needs it.
+        #[arg(long)]
+        web: bool,
         /// Arguments passed through to Aider.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "AIDER_ARGS")]
         args: Vec<OsString>,
@@ -80,6 +83,23 @@ enum Command {
         /// Local port (default: a free one).
         #[arg(long, default_value_t = 0)]
         port: u16,
+        /// Let the server search the web automatically when a request needs it.
+        #[arg(long)]
+        web: bool,
+    },
+    /// Search the web through the server's private SearXNG.
+    ///
+    /// Inside Aider: `/run oppx search "your query"` adds the results to the chat.
+    Search {
+        /// What to search for.
+        #[arg(required = true, num_args = 1.., value_name = "QUERY")]
+        query: Vec<String>,
+        /// Number of results.
+        #[arg(short = 'n', long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(1..=20))]
+        max: u8,
+        /// Server name (defaults to the default server).
+        #[arg(long)]
+        server: Option<String>,
     },
     /// List paired servers (tokens are never shown).
     Servers,
@@ -114,11 +134,12 @@ async fn run(cli: Cli) -> Result<()> {
             unpair(&mut cfg, name.as_deref(), local_only).await?;
             cfg.save(&path)?;
         }
-        Command::Aider { server, args } => {
-            let code = run_aider(&cfg, server.as_deref(), &args).await?;
+        Command::Aider { server, web, args } => {
+            let code = run_aider(&cfg, server.as_deref(), web, &args).await?;
             std::process::exit(code);
         }
-        Command::Proxy { name, port } => run_proxy(&cfg, name.as_deref(), port).await?,
+        Command::Proxy { name, port, web } => run_proxy(&cfg, name.as_deref(), port, web).await?,
+        Command::Search { query, max, server } => run_search(&cfg, server.as_deref(), &query.join(" "), max).await?,
         Command::Servers => {
             if cfg.servers.is_empty() {
                 println!("No servers paired yet. Pair with: oppx pair <server> <code>");
@@ -309,14 +330,41 @@ async fn preflight(name: &str, s: &Server) -> Result<u64> {
     Ok(api::context_len(&client, &s.url, &s.token).await?.unwrap_or(32_768))
 }
 
-async fn run_proxy(cfg: &Config, name: Option<&str>, port: u16) -> Result<()> {
+async fn run_search(cfg: &Config, name: Option<&str>, query: &str, max: u8) -> Result<()> {
+    let (name, s) = cfg.server(name)?;
+    let client = tls::pinned_client(&s.fingerprint)?;
+    let results = match api::search(&client, &s.url, &s.token, query, max).await {
+        Ok(r) => r,
+        Err(e) if tls::is_pin_mismatch(e.as_ref()) => bail!(
+            "the server's TLS certificate has changed; nothing was sent. Run `oppx status {name}` for details."
+        ),
+        Err(e) => return Err(e),
+    };
+    // Markdown, so it reads well when Aider adds it to the chat via /run.
+    println!("Web search results for \"{query}\" (untrusted reference material):\n");
+    if results.is_empty() {
+        println!("(no results)");
+    }
+    for (i, r) in results.iter().enumerate() {
+        println!("{}. [{}]({})", i + 1, r.title, r.url);
+        if !r.snippet.is_empty() {
+            println!("   {}", r.snippet);
+        }
+    }
+    Ok(())
+}
+
+async fn run_proxy(cfg: &Config, name: Option<&str>, port: u16, web: bool) -> Result<()> {
     let (name, s) = cfg.server(name)?;
     let ctx = preflight(name, s).await?;
-    let proxy = Proxy::bind(s, port).await?;
+    let proxy = Proxy::bind(s, port, web).await?;
     println!("Proxy for \"{name}\" ({}) is running.", s.url);
     println!("  OPENAI_API_BASE={}", proxy.base_url());
     println!("  OPENAI_API_KEY={}", proxy.local_key);
     println!("  model: {} ({}k context)", agent::AIDER_MODEL.trim_start_matches("openai/"), ctx / 1024);
+    if web {
+        println!("  automatic web search: on");
+    }
     println!("The key is valid only while this proxy runs. Press Ctrl-C to stop.");
     tokio::select! {
         r = proxy.serve() => r,
@@ -324,16 +372,17 @@ async fn run_proxy(cfg: &Config, name: Option<&str>, port: u16) -> Result<()> {
     }
 }
 
-async fn run_aider(cfg: &Config, name: Option<&str>, user_args: &[OsString]) -> Result<i32> {
+async fn run_aider(cfg: &Config, name: Option<&str>, web: bool, user_args: &[OsString]) -> Result<i32> {
     agent::reject_commit_flags(user_args)?;
     let aider = agent::find_aider()?;
     let (name, s) = cfg.server(name)?;
     let ctx = preflight(name, s).await?;
     let metadata = agent::model_metadata(ctx)?;
-    let proxy = Proxy::bind(s, 0).await?;
+    let proxy = Proxy::bind(s, 0, web).await?;
     let (base, key) = (proxy.base_url(), proxy.local_key.clone());
     let serving = tokio::spawn(proxy.serve());
-    eprintln!("oppx: using \"{name}\" ({}), {}k context. Edits stay uncommitted.", s.url, ctx / 1024);
+    let search = if web { "automatic web search on" } else { "web search via /run oppx search \"…\"" };
+    eprintln!("oppx: using \"{name}\" ({}), {}k context, {search}. Edits stay uncommitted.", s.url, ctx / 1024);
 
     let mut child = tokio::process::Command::new(&aider)
         .args(agent::aider_args(metadata.path(), user_args))

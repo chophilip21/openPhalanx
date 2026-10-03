@@ -139,6 +139,16 @@
       {:else}
         <div class="muted">No model selected.</div>
       {/if}
+      <label class="toggle" title={idle ? "" : "Stop the server to change this"}>
+        <input type="checkbox" checked={snap?.settings.web_search ?? true} disabled={!idle}
+          onchange={(e) => api.setWebSearch(e.currentTarget.checked).then(refreshPreflight)} />
+        <span>
+          Web search for clients
+          <span class="muted small-text">
+            {#if !idle && admin}{admin.web_search ? `on · ${admin.gateway.web_searches} searches` : "off"}{:else}private SearXNG on this server{/if}
+          </span>
+        </span>
+      </label>
       {#if gpu}
         <div class="gpu">
           <Icon name="cpu" size={14} />
@@ -180,5 +190,8 @@
   .model-name { font-size: 16px; font-weight: 600; }
   .small-text { font-size: 12.5px; }
   .vram { margin-top: 14px; }
+  .toggle { display: flex; gap: 10px; align-items: flex-start; margin-top: 14px; font-size: 13px; cursor: pointer; }
+  .toggle input { margin-top: 3px; }
+  .toggle span { display: flex; flex-direction: column; }
   .gpu { display: flex; align-items: center; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 12.5px; flex-wrap: wrap; }
 </style>

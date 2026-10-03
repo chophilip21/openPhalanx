@@ -69,6 +69,8 @@ Then, in any git repo:
 oppx aider                        # extra Aider options go after --, e.g. oppx aider -- src/main.rs
 ```
 
+Need current information (new library versions, recent APIs, error messages)? `oppx aider --web` lets the server search the web automatically when a request needs it, through a private [SearXNG](https://docs.searxng.org) instance on the server. Without `--web`, ask for a search inside Aider with `/run oppx search "your query"`.
+
 Aider edits your files locally and never commits; review with `git diff` and commit yourself. Remove a laptop with `oppx unpair` (or revoke it in the app's **Devices** page). Other OpenAI-compatible tools can use the server through `oppx proxy`.
 
 ## Learn more

@@ -72,7 +72,7 @@
             <span class="muted small">Paired {ago(d.created_at)}</span>
             <span class="muted small">Last seen {ago(d.last_seen)}</span>
             <span class="muted small" title="Prompt / generated tokens (counted when the client reports usage)">
-              {d.requests} request{d.requests === 1 ? "" : "s"} · {tokens(d.prompt_tokens)} in / {tokens(d.completion_tokens)} out
+              {d.requests} request{d.requests === 1 ? "" : "s"} · {tokens(d.prompt_tokens)} in / {tokens(d.completion_tokens)} out{d.web_searches ? ` · ${d.web_searches} searches` : ""}
             </span>
             <button class="danger" onclick={() => revoke(d)}>Revoke</button>
           </div>

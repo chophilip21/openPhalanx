@@ -523,6 +523,12 @@ fn set_gpu(state: State<'_, AppState>, index: u32) -> CmdResult<Settings> {
     state.update_settings(|s| s.gpu_index = index)
 }
 
+/// Takes effect on the next start (SearXNG starts alongside the backend).
+#[tauri::command]
+fn set_web_search(state: State<'_, AppState>, enabled: bool) -> CmdResult<Settings> {
+    state.update_settings(|s| s.web_search = enabled)
+}
+
 /// Where a model key downloads from and to.
 fn download_target(settings: &Settings, key: &str) -> CmdResult<(String, String, std::path::PathBuf)> {
     if let Some(id) = key.strip_prefix("catalog:") {
@@ -770,6 +776,7 @@ pub fn run() {
             select_model,
             set_context_len,
             set_gpu,
+            set_web_search,
             download_model,
             cancel_download,
             clear_download,

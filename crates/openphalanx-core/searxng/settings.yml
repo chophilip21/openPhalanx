@@ -1,0 +1,16 @@
+# SearXNG settings for the OpenPhalanx backend. Mounted read-only into the
+# openphalanx-searxng container, which is reachable only from the gateway on
+# the private "openphalanx" Docker network. The secret key comes from the
+# SEARXNG_SECRET environment variable, so this file holds nothing sensitive.
+use_default_settings: true
+general:
+  instance_name: "OpenPhalanx search"
+server:
+  limiter: false
+  public_instance: false
+  image_proxy: false
+search:
+  safe_search: 0
+  formats: [json]
+outgoing:
+  request_timeout: 4.0
