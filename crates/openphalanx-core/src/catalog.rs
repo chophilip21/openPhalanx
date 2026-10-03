@@ -1,0 +1,62 @@
+//! Curated catalog of coding models. Openphalanx never redistributes weights:
+//! every entry points to the publisher's own Hugging Face repo, pinned to a
+//! commit, and downloads are verified against that commit's SHA-256 hashes.
+//! Sizes and attention shapes come from each repo's file listing and config.json.
+
+use serde::{Deserialize, Serialize};
+
+use crate::vram::ArchSpec;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogEntry {
+    /// Hugging Face repo id, e.g. `Qwen/Qwen2.5-Coder-14B-Instruct-AWQ`.
+    pub id: String,
+    /// Pinned commit; downloads use exactly this revision.
+    pub revision: String,
+    pub name: String,
+    pub params: String,
+    pub quant: String,
+    /// Total size of the `.safetensors` files.
+    pub weight_bytes: u64,
+    pub max_context: u32,
+    pub license: String,
+    pub arch: ArchSpec,
+    #[serde(default)]
+    pub recommended: bool,
+    #[serde(default)]
+    pub min_compute_capability: Option<f32>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+impl CatalogEntry {
+    pub fn source_url(&self) -> String {
+        format!("https://huggingface.co/{}/tree/{}", self.id, self.revision)
+    }
+}
+
+pub fn catalog() -> Vec<CatalogEntry> {
+    serde_json::from_str(include_str!("../catalog.json")).expect("embedded catalog.json is valid")
+}
+
+pub fn find(id: &str) -> Option<CatalogEntry> {
+    catalog().into_iter().find(|e| e.id == id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_is_well_formed() {
+        let entries = catalog();
+        assert!(!entries.is_empty());
+        assert_eq!(entries.iter().filter(|e| e.recommended).count(), 1);
+        for e in &entries {
+            assert_eq!(e.revision.len(), 40, "{} revision must be a full commit sha", e.id);
+            assert!(e.id.contains('/'), "{}", e.id);
+            assert!(e.weight_bytes > 1_000_000_000, "{}", e.id);
+            assert!(e.arch.kv_layers > 0 && e.arch.kv_heads > 0 && e.arch.head_dim > 0);
+        }
+    }
+}

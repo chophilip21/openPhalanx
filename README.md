@@ -134,6 +134,13 @@ Openphalanx operates on a decoupled client-server architecture where a lightweig
 
 ## Phase 3: Tauri Orchestrator Integration
 
+- The server side will be created with Tauri, distributed only for Linux for now. We will build for other OS once we are sure linux version is stable. 
+- Frontend, make it simple and modern, using Svelte and Vite. Can you get your inspiration from popular VPN providers, like ExpressVPN or NordVPN. 
+- We do not distribute the weights. But we must display trustable catalog of weights and there VRAM Requirement as tables (e.g qwen2.5 that we are using) and download button. User should be able to specify the path themselves as well (either local path, or url that we can attempt to download for the user)
+- We never want to crash the users with OOM, so be careful not to crash. Raise warning early, and if available VRAM is less than the model requirement, do not even allow the user to start the server. 
+- Use github container registry as you have suggested. 
+- Upon clicking start, it should display some kind of pairing code for client to connect to. This could be random everytime, or the same. But think about security and the best practice. 
+
 * \[ \] **Step 3.1: Implement Docker Engine Manager in Tauri**
 
   * Add container lifecycle controls to the Tauri app's Rust backend using the Docker API or `std::process::Command`.
@@ -183,3 +190,9 @@ Openphalanx operates on a decoupled client-server architecture where a lightweig
   * Execute a multi-turn modification task.
 
   * Inspect container logs (`docker logs -f <container_id>`) to verify high KV-cache hit rates on SGLang during subsequent prompt turns.
+
+## Future Improvement
+
+* If you combine SearXNG and /web, we can make something awesome.
+- dependabot, automatic building based on updates on aider and srglang. 
+- Celery? is there anyway to utilize celery here for async work. 

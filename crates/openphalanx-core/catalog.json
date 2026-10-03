@@ -1,0 +1,97 @@
+[
+  {
+    "id": "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+    "revision": "8e8ed243bbe6f9a5aff549a0924562fc719b2b8a",
+    "name": "Qwen2.5 Coder 7B Instruct",
+    "params": "7.6B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 5570829760,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "arch": { "kv_layers": 28, "kv_heads": 4, "head_dim": 128 }
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "revision": "c03e6d358207e414f1eca0bb1891e29f1db0e242",
+    "name": "Qwen2.5 Coder 7B Instruct",
+    "params": "7.6B",
+    "quant": "BF16",
+    "weight_bytes": 15231271864,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "arch": { "kv_layers": 28, "kv_heads": 4, "head_dim": 128 }
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ",
+    "revision": "eb3172f06a6d6b3a15f08947b0668d782e4d2d2c",
+    "name": "Qwen2.5 Coder 14B Instruct",
+    "params": "14.7B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 9980170584,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "recommended": true,
+    "notes": "Tested end to end on an RTX 3090 (24 GB).",
+    "arch": { "kv_layers": 48, "kv_heads": 8, "head_dim": 128 }
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-14B-Instruct",
+    "revision": "aedcc2d42b622764e023cf882b6652e646b95671",
+    "name": "Qwen2.5 Coder 14B Instruct",
+    "params": "14.7B",
+    "quant": "BF16",
+    "weight_bytes": 29540133960,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "arch": { "kv_layers": 48, "kv_heads": 8, "head_dim": 128 }
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ",
+    "revision": "1ed0a6145da0ce550c628e8e8b678f51e695995d",
+    "name": "Qwen2.5 Coder 32B Instruct",
+    "params": "32.5B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 19328993904,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "arch": { "kv_layers": 64, "kv_heads": 8, "head_dim": 128 }
+  },
+  {
+    "id": "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
+    "revision": "dcaee4d4dfc5ee71ad501f01f530e5652438fde0",
+    "name": "Qwen3 Coder 30B-A3B Instruct",
+    "params": "30.5B (3.3B active)",
+    "quant": "FP8",
+    "weight_bytes": 31175618584,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "min_compute_capability": 8.9,
+    "notes": "Mixture-of-experts. FP8 runs natively on Ada/Hopper (compute capability 8.9 or higher).",
+    "arch": { "kv_layers": 48, "kv_heads": 4, "head_dim": 128 }
+  },
+  {
+    "id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "revision": "b2cff646eb4bb1d68355c01b18ae02e7cf42d120",
+    "name": "Qwen3 Coder 30B-A3B Instruct",
+    "params": "30.5B (3.3B active)",
+    "quant": "BF16",
+    "weight_bytes": 61066575656,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "notes": "Mixture-of-experts.",
+    "arch": { "kv_layers": 48, "kv_heads": 4, "head_dim": 128 }
+  },
+  {
+    "id": "Qwen/Qwen3-Coder-Next-FP8",
+    "revision": "da6e2ed27304dd39abadd9c82ef50e8de67bdd4c",
+    "name": "Qwen3 Coder Next",
+    "params": "80B (3B active)",
+    "quant": "FP8",
+    "weight_bytes": 80381394600,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "min_compute_capability": 8.9,
+    "notes": "Hybrid attention: only 1 in 4 layers keeps a KV cache.",
+    "arch": { "kv_layers": 12, "kv_heads": 2, "head_dim": 256 }
+  }
+]
