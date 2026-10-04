@@ -518,6 +518,18 @@
 
     * **Real repo (this one):** "explain this repo", then `/add` of three large files (about 21k tokens), then an edit. Model-requested files were set aside and the edit applied. The final context was 25,500 tokens against a 26,065 budget, with no overflow warnings.
 
+  * **Editing fixes after the user's real-terminal test.** Asked to edit `README.md`, the model printed the whole README instead of an edit, so nothing was applied. Aider then **offered to run the README's `bash` blocks**, and `sudo apt install …` ran and asked for a password.
+
+    * **Shell suggestions off:** `--no-suggest-shell-commands`. Commands run only from `!cmd` or `/run`.
+
+    * **Root cause:** the README contains ```` ``` ```` fences, so Aider switches its edit fence to four backticks, which models tend to ignore (Aider's own source notes this). Fix: a model-agnostic **whole-file retry**. When a change request yields no edit and the chat files are small, it retries once in `whole` format, shows only the diff, then switches back; if that also fails, it says "No changes were made".
+
+    * **Accurate diffs:** the content before an edit is captured in `OppxIO.write_text`, the path all edit formats write through. A file that joined the chat mid-turn now shows its real diff, not "Create … 84 additions".
+
+    * **No CPR warning:** y/N confirmations use plain `input()`, not prompt_toolkit.
+
+    * ✅ **Verified:** the user's exact request on the repo copy produced a 1-line README diff with 0 shell prompts. Called directly against the server, the whole-file retry inserted 2 lines into the fence-heavy README.
+
   * Remaining: the user's check on a real terminal.
 
 * \[ \] **Step 4.10: Model-agnostic follow-ups** (principle in `CLAUDE.md`, from the user: everything must work across SGLang models)

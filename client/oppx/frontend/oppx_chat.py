@@ -72,6 +72,8 @@ class UiState:
     """Prompt state shared with key bindings and the status bar."""
 
     plan_mode = False  # shift+tab: discuss only, no edits (Aider's ask mode)
+    quiet = False  # suppress the model's text (whole-file retries show only the diff)
+    before: dict = {}  # abs path -> content before this turn's first write
     interrupted = False
     queued: list = []  # whole lines typed while the model was working
     prefill = ""  # a partly typed line, put back at the next prompt
@@ -112,6 +114,10 @@ SUPPRESS = [
         r"^- Break your code",
         r"probably safe to try",
         r"best to only add files that need changes",
+        r"Unable to find a fencing strategy",
+        # Aider's background summarizer; the context manager compacts itself.
+        r"^Summarization failed",
+        r"summarizer unexpectedly failed",
         r"^Applied edit to ",  # shown as a diff after the turn instead
     )
 ]
@@ -449,12 +455,26 @@ class OppxIO(InputOutput):
     def rule(self):
         pass  # the prompt draws its own separator
 
+    def write_text(self, filename, content, *args, **kwargs):
+        """Every edit format writes through here: remember the file's content
+        before the turn's first write, so the diff is right even for files
+        that entered the chat mid-turn."""
+        key = str(Path(filename).resolve())
+        if key not in UI.before:
+            try:
+                UI.before[key] = Path(filename).read_text(encoding=self.encoding)
+            except (OSError, UnicodeDecodeError):
+                UI.before[key] = ""
+        return super().write_text(filename, content, *args, **kwargs)
+
     def get_assistant_mdstream(self):
         return BulletStream(
             mdargs=dict(style=self.assistant_output_color, code_theme=self.code_theme, inline_code_lexer="text")
         )
 
     def assistant_output(self, message, pretty=None):
+        if UI.quiet:
+            return
         if not message:
             step("The model returned an empty response.", YELLOW)
             return
@@ -495,8 +515,11 @@ class OppxIO(InputOutput):
         if WATCHER:
             WATCHER.pause()
         try:
-            return PromptSession().prompt(message)
+            # Plain line input: no prompt_toolkit, so no cursor-position
+            # requests whose replies the paused Esc reader could swallow.
+            return input(message)
         except (EOFError, KeyboardInterrupt):
+            print()
             return ""
         finally:
             if WATCHER:
@@ -643,6 +666,8 @@ class BulletStream(MarkdownStream):
     blocks are hidden while they stream; the turn ends with a real diff."""
 
     def update(self, text, final=False):
+        if UI.quiet:
+            return
         text = re.sub(r"\*?SEARCH/REPLACE\*? blocks?", "edit", hide_edit_blocks(text))
         super().update(_bullet(text), final)
 
@@ -736,10 +761,10 @@ def snapshot(coder) -> dict:
     return files
 
 
-def show_edits(coder, before: dict, max_lines: int = 40) -> None:
-    for rel in sorted(coder.aider_edited_files or ()):
+def show_edits(coder, before: dict, max_lines: int = 40, edited=None) -> None:
+    for rel in sorted(edited if edited is not None else (coder.aider_edited_files or ())):
         abs_path = coder.abs_root_path(rel)
-        old = before.get(abs_path) or ""
+        old = UI.before.get(str(Path(abs_path).resolve()), before.get(abs_path)) or ""
         try:
             new = Path(abs_path).read_text(encoding=coder.io.encoding)
         except (OSError, UnicodeDecodeError):
@@ -1135,6 +1160,38 @@ def _was_interrupted(coder) -> bool:
     return UI.interrupted or any(m.get("content") == INTERRUPT_NOTE for m in recent)
 
 
+def _whole_file_retry(coder, text: str, before: dict):
+    """Model-agnostic fallback for a change request that produced no edit
+    (e.g. the diff format's fences collided with fences in a Markdown file,
+    which many models handle badly): ask once more in Aider's whole-file
+    format, show only the resulting diff, then return to the usual format."""
+    count = coder.main_model.token_count
+    try:
+        size = sum(count(Path(f).read_text(encoding=coder.io.encoding, errors="replace")) for f in coder.abs_fnames)
+    except OSError:
+        return coder, set()
+    if not coder.abs_fnames or size > CONTEXT_MGR.budget // 3:
+        return coder, set()
+    files = ", ".join(coder.get_inchat_relative_files())
+    step(f"No edit came through; retrying by rewriting {escape(files)}", YELLOW)
+    whole = base_coder.Coder.create(io=coder.io, from_coder=coder, edit_format="whole", summarize_from_coder=False)
+    whole.stream = False
+    UI.quiet = True
+    try:
+        with EscWatcher() as w:
+            globals()["WATCHER"] = w
+            with Thinking():
+                whole.run_one(text, preproc=False)
+    except KeyboardInterrupt:
+        UI.interrupted = True
+    finally:
+        UI.quiet = False
+        globals()["WATCHER"] = None
+    edited = set(whole.aider_edited_files or ())
+    back = base_coder.Coder.create(io=coder.io, from_coder=whole, edit_format=coder.edit_format, summarize_from_coder=False)
+    return back, edited
+
+
 def run_turn(coder, text: str):
     """Runs one message; returns the coder to continue with (a new one after
     a mode switch such as /ask, which runs in its own temporary coder)."""
@@ -1142,6 +1199,7 @@ def run_turn(coder, text: str):
     global CODER
     coder.io._retry_shown = False
     UI.interrupted = False
+    UI.before = {}
     CODER = coder
     CONTEXT_MGR.start_turn(coder, text)
     before = snapshot(coder)
@@ -1160,9 +1218,18 @@ def run_turn(coder, text: str):
         UI.interrupted = True
     finally:
         WATCHER = None
-    if _was_interrupted(result):
+    interrupted = _was_interrupted(result)
+    if interrupted:
         step("Interrupted by user", YELLOW)
-    show_edits(coder, before)
+    edited = set(coder.aider_edited_files or ())
+    wanted_edit = not text.startswith("/") and result is coder and result.edit_format not in ("ask", "whole")
+    if wanted_edit and not edited and not interrupted:
+        result, edited = _whole_file_retry(result, text, before)
+        if not edited and not UI.interrupted:
+            step("No changes were made. Name the exact place to change, or @-mention the file, and try again.", YELLOW)
+    show_edits(coder, before, edited=edited)
+    for rel in edited:
+        CONTEXT_MGR.note(coder.abs_root_path(rel), PRI_EDITED)
     CONTEXT_MGR.end_turn(result)
     CODER = result
     return result

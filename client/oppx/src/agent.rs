@@ -247,6 +247,10 @@ pub fn aider_args(metadata: &Path, history: &History, restore: bool, user_args: 
         "--yes-always",
         // Never edit the user's .gitignore; .aider* goes to .git/info/exclude instead.
         "--no-gitignore",
+        // Aider offers to run any ```bash block in a reply, even one that is
+        // just quoted file content (e.g. a README's install steps, sudo and all).
+        // Commands run only when the user types them (!cmd / /run).
+        "--no-suggest-shell-commands",
     ]
     .iter()
     .chain(THEME.iter())

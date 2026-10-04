@@ -198,6 +198,10 @@ oppx servers | oppx use NAME
     * **File requests:** the model's requests go through `confirm_ask`. A single file over 60% of the budget is refused with a reason.
     * **Final guard:** `check_tokens` is replaced, so a request is never sent over the limit, and Aider's "proceed anyway / providers won't charge" text is suppressed.
     * **Visibility:** `/context` shows the breakdown, and the status bar shows the percentage used.
+  * **Editing safeguards:**
+    * Aider's `--no-suggest-shell-commands` is always set. Aider otherwise offers to run any `bash` block in a reply, even quoted file content.
+    * A change request that yields no edit gets one model-agnostic retry in `whole` format (`_whole_file_retry`; small files only, output hidden, diff shown), then a "No changes were made" notice.
+    * The content before an edit comes from `OppxIO.write_text`.
   * **Memory:** `OPENPHALANX.md` (and `AGENTS.md` if present) in the repo root is loaded read-only every turn. `/init` asks the model to write it.
   * **Sessions:** one file per conversation in `~/.local/state/oppx/history/<repo>-<id>/<YYYYmmdd-HHMMSS>.md`, with a shared `input.history`. The old single per-repo file is migrated as session `00000000-000000`. `-c` and `-r` pass `--restore-chat-history`.
   * **Testing:** drive it in a pty (Python `pty.fork`, 120×40 via `TIOCSWINSZ`). The driver must **answer cursor-position requests** (`ESC[6n` → `ESC[30;1R`), or prompt_toolkit never draws the status bar. Render the raw bytes with `pyte` to see the real screen.
