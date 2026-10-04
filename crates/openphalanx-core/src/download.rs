@@ -45,6 +45,21 @@ fn wanted(path: &str) -> bool {
     matches!(ext, "json" | "safetensors" | "txt" | "model" | "tiktoken" | "jinja")
 }
 
+/// Mistral repos ship each checkpoint twice: Hugging Face shards
+/// (`model-*.safetensors`, what SGLang loads) and Mistral's own
+/// `consolidated*.safetensors`. Keep only the shards when both exist.
+pub fn is_duplicate_weight(path: &str, all: &[&str]) -> bool {
+    path.starts_with("consolidated")
+        && path.ends_with(".safetensors")
+        && all.iter().any(|p| p.ends_with(".safetensors") && !p.starts_with("consolidated"))
+}
+
+fn drop_duplicate_weights(files: Vec<RemoteFile>) -> Vec<RemoteFile> {
+    let names: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    files.into_iter().filter(|f| !is_duplicate_weight(&f.path, &refs)).collect()
+}
+
 pub async fn list_files(client: &reqwest::Client, repo: &str, revision: &str) -> Result<Vec<RemoteFile>> {
     let url = format!("{HF}/api/models/{repo}/tree/{revision}?recursive=false");
     let resp = client.get(&url).send().await.context("cannot reach huggingface.co")?;
@@ -67,6 +82,7 @@ pub async fn list_files(client: &reqwest::Client, repo: &str, revision: &str) ->
             })
         })
         .collect();
+    let files = drop_duplicate_weights(files);
     if !files.iter().any(|f| f.path.ends_with(".safetensors")) {
         bail!("{repo} has no .safetensors weights, which SGLang needs.");
     }
@@ -303,5 +319,11 @@ mod tests {
         for skip in ["pytorch_model.bin", "model.gguf", "original/consolidated.pth", "README.md", "onnx/model.json"] {
             assert!(!wanted(skip), "{skip}");
         }
+        // Mistral layout: keep the HF shards, drop the consolidated copy.
+        let all = ["consolidated.safetensors", "model-00001-of-00002.safetensors", "config.json"];
+        assert!(is_duplicate_weight("consolidated.safetensors", &all));
+        assert!(!is_duplicate_weight("model-00001-of-00002.safetensors", &all));
+        // A repo with only consolidated weights keeps them.
+        assert!(!is_duplicate_weight("consolidated.safetensors", &["consolidated.safetensors"]));
     }
 }

@@ -98,7 +98,10 @@ export function record(snap: Snapshot) {
     gpuUtil: gpu?.utilization_pct ?? null,
     gpuTemp: gpu?.temperature_c ?? null,
   };
-  const h = (metrics.history[id] ??= []);
+  // Read back through the state proxy (an `??=` result is the raw array,
+  // and pushes to it wouldn't update the charts).
+  if (!metrics.history[id]) metrics.history[id] = [];
+  const h = metrics.history[id];
   h.push(sample);
   const cutoff = now - WINDOW_SECONDS * 1000;
   while (h.length > MAX_SAMPLES || (h.length && h[0].t < cutoff)) h.shift();

@@ -108,7 +108,9 @@ sudo apt install ../target/release/bundle/deb/Openphalanx_0.2.0_amd64.deb
 
 Open **Models**:
 
-* The table shows each model's VRAM need at the selected context length, with a **Fits / Tight / Won't fit** badge measured against your GPU's free memory. The need is deliberately conservative and much larger than the download size. It covers weights as loaded, KV cache for the full context plus 25%, and runtime memory. **Best fit for this GPU** marks the largest model that fits with headroom.
+* **Context window** (slider at the top) is a server setting: the most tokens one request can use, passed to SGLang when the server starts. It doesn't filter models; it changes each model's KV-cache need, so the VRAM column and badges follow it. The panel shows how far the selected model can go on this GPU.
+* The table lists Qwen (2.5 Coder, 3 Coder, 3.6), Gemma 4, gpt-oss and Devstral, filterable by family or by "only models that fit". Official repos, plus a few widely used 4-bit **Community** quantizations (labelled with who made them) where the publisher ships no build that fits 24 GB.
+* The table shows each model's VRAM need at the chosen context window, with a **Fits / Tight / Won't fit** badge measured against your GPU's free memory, and the longest context that would fit. The need is deliberately conservative and much larger than the download size. It covers weights as loaded, KV cache for the full context plus 25%, and runtime memory. **Best fit for this GPU** marks the largest model that fits with headroom.
 * Click **Download** on a model that fits. The default, Qwen2.5-Coder-14B-Instruct-AWQ, is already selected, and it is reused if it is in `~/.cache/huggingface`.
 * To use your own model, enter a local folder (with `config.json` and `.safetensors`) or a Hugging Face URL under **Add your own model**. Its VRAM need is checked before anything downloads.
 
@@ -302,6 +304,19 @@ OPENAI_API_BASE=… OPENAI_API_KEY=… scripts/probe_routing.py     # via `oppx 
 
 The backend image tag follows the version in the root `Cargo.toml`, so bump both together when changing `docker/`. The base SGLang image is pinned by digest in `docker/Dockerfile.server`.
 
+## Model catalog and VRAM estimate
+
+* **Adding models:** write a spec (id, name, family, params, quant, and `quantized_by` for community builds), run `scripts/catalog_entry.py specs.json`, and paste the entries into `catalog.json`. `scripts/catalog_entry.py --check` verifies every entry's weight size, attention shape and context against Hugging Face.
+* **Release date** (`released`, shown as a year on the Models page): the repo's creation date on Hugging Face; community quantizations take their base model's date (`base_model` in the spec).
+* **Check the architecture first:** the pinned SGLang must have the model class (`sglang/srt/models/` in the image). All current entries were checked against SGLang 0.5.21.
+* **Weights counted:** only root-level `.safetensors` (subfolders like gpt-oss's `original/` and `metal/` are skipped), and Mistral's duplicate `consolidated*.safetensors` are dropped when HF shards exist. The downloader applies the same rule.
+* **KV cache** (`vram::ArchSpec`), as SGLang allocates it:
+  * full-attention layers × context;
+  * sliding-window layers (Gemma 4, gpt-oss) × 0.8 of the context (`--swa-full-tokens-ratio`);
+  * Gemma 4's full layers use their own shape (`global_head_dim`, `num_global_key_value_heads`);
+  * hybrid linear-attention models (Qwen3-Next, Qwen3.6) × 1.9, for the recurrent-state pool (`--mamba-full-memory-ratio` 0.9).
+* **Not yet validated on hardware:** everything except Qwen2.5-Coder-14B-AWQ. MXFP4 (gpt-oss) is counted at 4 bits, since SGLang's Marlin and Triton kernels keep it packed on Ampere. Milestone Step 5.3 runs the matrix.
+
 ## Releasing
 
 * **CI** (`.github/workflows/ci.yml`, every PR and push to `dev`/`main`): app build and type check, `cargo clippy -D warnings`, `cargo test` for core and `oppx`, ruff (syntax and undefined names) for the gateway, frontend and scripts, shell syntax, and the PR title check for PRs into `main`. The GPU lifecycle test stays manual.
@@ -333,7 +348,7 @@ app/                     Tauri 2 + Svelte 5 server GUI (Linux)
   src/                   frontend: pages, components, typed command bindings
   src-tauri/             Rust shell: Tauri commands, 2 s status monitor, log streaming
 crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight (no Tauri, unit-tested)
-  catalog.json           curated models pinned to Hugging Face commits; optional per-model
+  catalog.json           curated models pinned to Hugging Face commits (built with scripts/catalog_entry.py); optional per-model
                          edit_format and reasoning_parser (passed as EDIT_FORMAT, --reasoning-parser)
 docker/                  backend image: SGLang + gateway under supervisord (no agent code)
   server/gateway.py      TLS gateway: pairing, device tokens, admin API
@@ -343,6 +358,7 @@ client/oppx/             client CLI: config.rs (paired servers, 0600 file), tls.
 .github/workflows/       ci.yml (every PR/push), release.yml (merged PR into main -> release)
 scripts/publish-image.sh build and push the backend image to GHCR
 scripts/probe_routing.py score the search router and ask/edit check against the loaded model
+scripts/catalog_entry.py catalog entries from Hugging Face (pinned commit, weight size, attention shape); --check re-verifies
 scripts/bench_session.py 10-turn prefix-cache benchmark through a real oppx session
 scripts/bump_version.py  version bump from a PR title, plus the CHANGELOG.md entry
 scripts/gen_docs.py      docs site sources (README, CLI and API reference, CLAUDE.md, roadmap)

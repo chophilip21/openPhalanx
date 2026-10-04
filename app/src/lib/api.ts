@@ -120,12 +120,20 @@ export type Preflight = {
 export type ModelRow = {
   key: string;
   name: string;
+  /** Catalog family ("Qwen", "Gemma", …); null for custom models. */
+  family: string | null;
+  /** Who made a community quantization; null for official repos. */
+  quantized_by: string | null;
+  /** Longest context that fits the available VRAM; null if not even 2k does. */
+  max_fit_context: number | null;
   repo: string | null;
   source_url: string | null;
   revision: string | null;
   params: string | null;
   quant: string | null;
   license: string | null;
+  /** Year the model was published, e.g. "2025". */
+  released: string | null;
   notes: string | null;
   tested: boolean;
   best_fit: boolean;

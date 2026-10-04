@@ -111,7 +111,17 @@ Roadmap and progress. Completed work is summarized below; details are in `CLAUDE
 
 * \[ \] **Step 5.1: End-to-end validation from a clean laptop.** A fresh install with only the documented steps (the release installer), pair, `status`, then a real session: a question, a multi-file edit, `!cmd` tests, `/undo`, Esc/Ctrl-C, `-c`/`-r`, web on and off. Revoke mid-session and expect a clear error; restart the server and recover without re-pairing. Compare latency with `CLAUDE.md`'s benchmark.
 
-* \[ \] **Step 5.3: Model matrix.** For every catalog model that fits 24 GB at 32k, plus one reasoning model:
+* \[ \] **Step 5.3: Model matrix.**
+  * ✅ **Catalog expanded** from 8 Qwen entries to 28:
+    * Qwen3.6 27B and 35B-A3B, plus Qwen3-Coder-Next in BF16;
+    * Gemma 4 (E4B, 12B, 26B-A4B, 31B; official QAT 4-bit builds);
+    * gpt-oss 20B and 120B;
+    * Devstral Small 1.1, Devstral Small 2 and Devstral 2;
+    * 4-bit community builds where no official one fits 24 GB.
+  * ✅ Every entry is built from Hugging Face by `scripts/catalog_entry.py`, and `--check` passes. Every architecture exists in SGLang 0.5.21.
+  * ✅ **VRAM estimate** now models sliding-window, Gemma 4 global and linear-attention layers, the way SGLang sizes its pools. The downloader skips duplicate Mistral weights.
+  * At 32k on a 3090 the estimate says these fit: Qwen2.5-Coder 7B/14B AWQ, gpt-oss 20B, and Gemma 4 E4B (tight). Gemma 4 12B QAT fits up to about 29k, and Devstral Small 2 AWQ up to about 16k.
+  * Still to do: run each fitting model on hardware. For every catalog model that fits 24 GB at 32k, plus one reasoning model:
   * `probe_routing.py` (at least 90% each);
   * a fixed edit task in `diff` and in `whole`, to set the catalog's `edit_format`;
   * tokenizer ratio, tokens/s, time to first token.
@@ -131,6 +141,10 @@ Roadmap and progress. Completed work is summarized below; details are in `CLAUDE
     * Light and dark themes with a toggle in the nav. It follows the system until you choose, and every colour is a token in `app.css`.
     * The nav collapses to icons below 760 px.
     * Checked in headless Chrome with mock data: both themes, running and stopped, and 1400/1280/720 px widths.
+  * ✅ **Models page:**
+    * The context window is a slider in its own "Server setting" panel. It explains that the window changes memory, not which models are listed, and shows how far the selected model can go on this GPU.
+    * Family filter chips and an "only models that fit" toggle.
+    * Community badges, and "fits at N or less" hints.
 
 * \[ \] **Step 5.5: Distribution and CI/CD.** Your requirements:
 

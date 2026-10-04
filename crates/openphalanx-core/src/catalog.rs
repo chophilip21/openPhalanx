@@ -14,12 +14,22 @@ pub struct CatalogEntry {
     /// Pinned commit; downloads use exactly this revision.
     pub revision: String,
     pub name: String,
+    /// Model family for grouping and filtering ("Qwen", "Gemma", "gpt-oss", "Devstral").
+    pub family: String,
+    /// Set for community quantizations: who made them (the base model's
+    /// publisher is in the name). Official repos leave it empty.
+    #[serde(default)]
+    pub quantized_by: Option<String>,
     pub params: String,
     pub quant: String,
     /// Total size of the `.safetensors` files.
     pub weight_bytes: u64,
     pub max_context: u32,
     pub license: String,
+    /// First published on Hugging Face (YYYY-MM-DD; for community
+    /// quantizations, the base model's date).
+    #[serde(default)]
+    pub released: Option<String>,
     pub arch: ArchSpec,
     /// Verified end to end on real hardware.
     #[serde(default)]
@@ -71,6 +81,9 @@ mod tests {
             assert!(e.weight_bytes > 1_000_000_000, "{}", e.id);
             assert!(e.arch.kv_layers > 0 && e.arch.kv_heads > 0 && e.arch.head_dim > 0);
             assert!(e.params_billions().is_some_and(|p| p > 0.0), "{} params", e.id);
+            assert!(!e.family.is_empty(), "{} family", e.id);
+            // Weights are counted once (no duplicate consolidated copies).
+            assert!(e.arch.kv_bytes_per_token() > 0, "{} arch", e.id);
         }
     }
 }

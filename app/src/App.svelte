@@ -8,6 +8,7 @@
   import Models from "./pages/Models.svelte";
   import { app, connect } from "./lib/store.svelte";
   import { theme, toggleTheme } from "./lib/theme.svelte";
+  import { goto, nav } from "./lib/nav.svelte";
 
   const NAV = [
     { id: "home", label: "Server", icon: "power" },
@@ -16,7 +17,6 @@
     { id: "logs", label: "Logs", icon: "terminal" },
   ];
 
-  let page = $state("home");
   let failed = $state("");
 
   onMount(() => {
@@ -24,7 +24,6 @@
   });
 
   const st = $derived(app.snapshot?.server.state ?? "stopped");
-  const goto = (p: string) => (page = p);
 </script>
 
 <div class="shell">
@@ -34,7 +33,7 @@
       <span>Openphalanx</span>
     </div>
     {#each NAV as item}
-      <button class="nav-item" class:active={page === item.id} onclick={() => (page = item.id)}>
+      <button class="nav-item" class:active={nav.page === item.id} onclick={() => goto(item.id)}>
         <Icon name={item.icon} size={18} />
         <span>{item.label}</span>
         {#if item.id === "home"}<span class="pip {st}"></span>{/if}
@@ -53,11 +52,11 @@
       <div class="page"><div class="error-banner">{failed}</div></div>
     {:else if !app.snapshot}
       <div class="page muted">Connecting…</div>
-    {:else if page === "home"}
+    {:else if nav.page === "home"}
       <Home {goto} />
-    {:else if page === "models"}
+    {:else if nav.page === "models"}
       <Models />
-    {:else if page === "devices"}
+    {:else if nav.page === "devices"}
       <Devices />
     {:else}
       <Logs />

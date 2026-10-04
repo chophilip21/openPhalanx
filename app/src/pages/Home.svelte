@@ -8,6 +8,7 @@
   import { api, errorText, type Preflight } from "../lib/api";
   import { gib, tokens } from "../lib/format";
   import { app } from "../lib/store.svelte";
+  import { goto as navigate, nav } from "../lib/nav.svelte";
 
   let { goto }: { goto: (page: string) => void } = $props();
 
@@ -48,7 +49,21 @@
     return () => clearInterval(t);
   });
 
+  // "Press start" hint after choosing a model; gone once the server moves.
+  $effect(() => {
+    if (!idle && nav.startHint) nav.startHint = null;
+  });
+  const showHint = $derived(!!nav.startHint && idle);
+
+  // While starting, point to the Logs page (loading takes a few minutes).
+  let logsHintClosed = $state(false);
+  $effect(() => {
+    if (st !== "starting") logsHintClosed = false; // show again on the next start
+  });
+  const showLogsHint = $derived(st === "starting" && !logsHintClosed);
+
   async function toggle() {
+    nav.startHint = null;
     actionError = "";
     acting = true;
     try {
@@ -79,7 +94,25 @@
         <span class="eyebrow">{snap?.endpoint ? `Agent API · ${snap.endpoint}` : "Agent API"}</span>
       </div>
 
-      <PowerButton state={st} disabled={!canToggle} onclick={toggle} />
+      {#if showHint}
+        <div class="hint" class:blocked-hint={!canToggle} role="status">
+          <span>
+            <strong>{nav.startHint}</strong> is selected.
+            {#if canToggle}
+              Press the power button to start the server.
+            {:else if blocking}
+              It can't start yet: {blocking.detail}
+            {:else}
+              Checking whether it can start…
+            {/if}
+          </span>
+          <button class="ghost close" onclick={() => (nav.startHint = null)} aria-label="Dismiss"><Icon name="x" size={14} /></button>
+        </div>
+      {/if}
+
+      <div class="power-wrap" class:beckon={showHint && canToggle}>
+        <PowerButton state={st} disabled={!canToggle} onclick={toggle} />
+      </div>
 
       <h2 class="headline">{headline}</h2>
       <p class="detail">
@@ -94,7 +127,16 @@
         {/if}
       </p>
 
-      {#if actionError}
+      {#if showLogsHint}
+      <div class="hint info" role="status">
+        <Icon name="terminal" size={16} />
+        <span>Loading the model can take up to a few minutes. Follow its progress live in Logs.</span>
+        <button class="logs-btn" onclick={() => navigate("logs")}>Open Logs</button>
+        <button class="ghost close" onclick={() => (logsHintClosed = true)} aria-label="Dismiss"><Icon name="x" size={14} /></button>
+      </div>
+    {/if}
+
+    {#if actionError}
         <div class="error-banner"><Icon name="alert" size={16} /><span class="selectable">{actionError}</span></div>
       {/if}
       {#each snap?.warnings ?? [] as w}
@@ -178,4 +220,51 @@
   .toggle { display: flex; gap: 10px; align-items: flex-start; margin-top: 14px; font-size: 13px; cursor: pointer; }
   .toggle input { margin-top: 3px; }
   .toggle span { display: flex; flex-direction: column; }
+  .hint {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 520px;
+    padding: 10px 12px 10px 16px;
+    border-radius: 12px;
+    background: var(--on-soft);
+    border: 1px solid var(--on);
+    color: var(--text);
+    font-size: 13.5px;
+    text-align: left;
+    box-shadow: var(--shadow);
+    animation: drop 0.35s ease-out;
+  }
+  .hint::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    bottom: -7px;
+    width: 12px;
+    height: 12px;
+    transform: translateX(-50%) rotate(45deg);
+    background: inherit;
+    border-right: 1px solid var(--on);
+    border-bottom: 1px solid var(--on);
+    background-color: var(--surface);
+    background-image: linear-gradient(var(--on-soft), var(--on-soft));
+  }
+  .hint.blocked-hint { background: var(--busy-soft); border-color: var(--busy); }
+  .hint.blocked-hint::after { border-color: var(--busy); background-image: linear-gradient(var(--busy-soft), var(--busy-soft)); }
+  .hint .close { padding: 4px; margin-left: auto; }
+  .power-wrap { border-radius: 50%; }
+  .power-wrap.beckon { animation: beckon 1.6s ease-in-out infinite; }
+  @keyframes beckon {
+    0%, 100% { filter: drop-shadow(0 0 0 transparent); }
+    50% { filter: drop-shadow(0 0 22px var(--on-glow)); }
+  }
+  @keyframes drop {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: none; }
+  }
+  .hint.info { background: var(--surface); border-color: var(--busy); animation: drop 0.35s ease-out; }
+  .hint.info::after { bottom: auto; top: -7px; transform: translateX(-50%) rotate(225deg); border-color: var(--busy); background-image: none; }
+  .hint.info :global(svg) { color: var(--busy); flex-shrink: 0; }
+  .logs-btn { padding: 5px 12px; font-size: 12.5px; white-space: nowrap; }
 </style>

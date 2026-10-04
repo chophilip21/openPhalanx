@@ -107,13 +107,33 @@ pub fn arch_from_config(config: &Value) -> Result<(ArchSpec, u32, Option<String>
         Some(d) => d,
         None => num("hidden_size").context("config.json lacks hidden_size")? / heads.max(1),
     };
-    // Hybrid models: only full-attention layers keep a KV cache.
-    let kv_layers = if let Some(types) = c.get("layer_types").and_then(Value::as_array) {
-        types.iter().filter(|t| t.as_str() == Some("full_attention")).count() as u64
+    // Mixed attention: count full, sliding-window and linear layers apart.
+    let types: Vec<&str> = c
+        .get("layer_types")
+        .and_then(Value::as_array)
+        .map(|t| t.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let count = |kind: &str| types.iter().filter(|t| **t == kind).count() as u64;
+    let (full, swa, linear) = if !types.is_empty() {
+        (count("full_attention"), count("sliding_attention"), count("linear_attention"))
     } else if let Some(interval) = num("full_attention_interval").filter(|i| *i > 0) {
-        layers / interval
+        (layers / interval, 0, layers - layers / interval)
     } else {
-        layers
+        (layers, 0, 0)
+    };
+    // Some models (Gemma 4) give full-attention layers their own shape.
+    let full_heads = num("num_global_key_value_heads").unwrap_or(kv_heads);
+    let full_dim = num("global_head_dim").unwrap_or(head_dim);
+    let window = num("sliding_window").unwrap_or(0);
+    let spec = ArchSpec {
+        kv_layers: full as u32,
+        kv_heads: full_heads as u32,
+        head_dim: full_dim as u32,
+        swa_layers: swa as u32,
+        swa_kv_heads: if swa > 0 { kv_heads as u32 } else { 0 },
+        swa_head_dim: if swa > 0 { head_dim as u32 } else { 0 },
+        swa_window: if swa > 0 { window as u32 } else { 0 },
+        linear_layers: linear as u32,
     };
     let max_context = num("max_position_embeddings").unwrap_or(32_768) as u32;
     let architecture = config
@@ -128,7 +148,7 @@ pub fn arch_from_config(config: &Value) -> Result<(ArchSpec, u32, Option<String>
         .and_then(Value::as_str)
         .map(str::to_string);
     Ok((
-        ArchSpec { kv_layers: kv_layers as u32, kv_heads: kv_heads as u32, head_dim: head_dim as u32 },
+        spec,
         max_context,
         architecture,
         quant,
@@ -148,9 +168,13 @@ pub fn inspect_local(dir: &Path) -> Result<ModelInfo> {
     .context("config.json is not valid JSON")?;
     let (arch, max_context, architecture, quant) = arch_from_config(&config)?;
     let mut weight_bytes = 0;
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "safetensors") {
+    let names: Vec<String> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    for name in &names {
+        let path = dir.join(name);
+        if path.extension().is_some_and(|e| e == "safetensors") && !crate::download::is_duplicate_weight(name, &refs) {
             // metadata() follows symlinks (HF cache snapshots are symlinks).
             weight_bytes += std::fs::metadata(&path)
                 .with_context(|| format!("broken file {}", path.display()))?
@@ -288,12 +312,21 @@ mod tests {
             "num_attention_heads":40,"num_key_value_heads":8,"hidden_size":5120,
             "max_position_embeddings":32768,"quantization_config":{"quant_method":"awq"}});
         let (arch, ctx, name, quant) = arch_from_config(&qwen).unwrap();
-        assert_eq!(arch, ArchSpec { kv_layers: 48, kv_heads: 8, head_dim: 128 });
+        assert_eq!(arch, ArchSpec::dense(48, 8, 128));
         assert_eq!((ctx, name.as_deref(), quant.as_deref()), (32768, Some("Qwen2ForCausalLM"), Some("awq")));
 
+        // Gemma 4: sliding-window layers plus full layers with their own shape.
+        let gemma = json!({"architectures":["Gemma4ForConditionalGeneration"],"text_config":{
+            "num_hidden_layers":4,"num_attention_heads":16,"num_key_value_heads":8,"head_dim":256,
+            "global_head_dim":512,"num_global_key_value_heads":2,"sliding_window":1024,"hidden_size":2816,
+            "layer_types":["sliding_attention","sliding_attention","sliding_attention","full_attention"]}});
+        assert_eq!(
+            arch_from_config(&gemma).unwrap().0,
+            ArchSpec { swa_layers: 3, swa_kv_heads: 8, swa_head_dim: 256, swa_window: 1024, ..ArchSpec::dense(1, 2, 512) }
+        );
         let next = json!({"num_hidden_layers":48,"num_attention_heads":16,"num_key_value_heads":2,
             "head_dim":256,"hidden_size":2048,"full_attention_interval":4});
-        assert_eq!(arch_from_config(&next).unwrap().0, ArchSpec { kv_layers: 12, kv_heads: 2, head_dim: 256 });
+        assert_eq!(arch_from_config(&next).unwrap().0, ArchSpec { linear_layers: 36, ..ArchSpec::dense(12, 2, 256) });
     }
 
     #[test]
@@ -313,7 +346,7 @@ mod tests {
 
         let info = inspect_local(&snap).unwrap();
         assert_eq!(info.weight_bytes, 1000);
-        assert_eq!(info.arch, ArchSpec { kv_layers: 2, kv_heads: 4, head_dim: 64 });
+        assert_eq!(info.arch, ArchSpec::dense(2, 4, 64));
 
         assert_eq!(find_in_hf_cache(tmp.path(), "Org/M", None), Some(snap.clone()));
         assert_eq!(find_in_hf_cache(tmp.path(), "Org/M", Some("other")), None);

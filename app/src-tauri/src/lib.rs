@@ -56,6 +56,10 @@ struct Inner {
     phase: Phase,
     /// Set once we launched or adopted a container; an exit is then a crash.
     expect_running: bool,
+    /// Bumped by every user stop. A monitor tick that read the container
+    /// before (or during) a stop must not adopt it or call its exit a crash:
+    /// `docker stop` takes up to 20 s and ticks run every 2 s.
+    stop_epoch: u64,
     /// Request a pairing code as soon as the admin API answers.
     want_pairing: bool,
     /// Free VRAM per GPU, last measured while our container was not running.
@@ -114,6 +118,7 @@ async fn admin_client() -> Option<AdminClient> {
 async fn build_snapshot(app: &AppHandle) -> Snapshot {
     let st = app.state::<AppState>();
     let settings = st.settings();
+    let epoch = st.inner.lock().unwrap().stop_epoch;
     let gpus = gpu::query().await.unwrap_or_default();
     let container = docker::inspect().await.ok().flatten();
     let running = container.as_ref().is_some_and(|c| c.state.running);
@@ -141,7 +146,7 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
 
     let exited_unexpectedly = {
         let inner = st.inner.lock().unwrap();
-        matches!(inner.phase, Phase::Idle) && inner.expect_running && !running
+        matches!(inner.phase, Phase::Idle) && inner.expect_running && !running && inner.stop_epoch == epoch
     };
     let crash_message = if exited_unexpectedly {
         let logs = docker::logs_tail(120).await.unwrap_or_default();
@@ -158,7 +163,7 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
         for g in &gpus {
             inner.idle_free_vram.insert(g.index, g.free_bytes);
         }
-    } else if managed {
+    } else if managed && matches!(inner.phase, Phase::Idle) && inner.stop_epoch == epoch {
         inner.expect_running = true; // adopt a container from a previous session
     }
     if let Some(message) = crash_message {
@@ -343,9 +348,13 @@ async fn stop_server(state: State<'_, AppState>) -> CmdResult<()> {
         inner.phase = Phase::Stopping;
         inner.expect_running = false;
         inner.want_pairing = false;
+        inner.stop_epoch += 1;
     }
     let result = docker::stop().await;
-    state.inner.lock().unwrap().phase = Phase::Idle;
+    let mut inner = state.inner.lock().unwrap();
+    inner.phase = Phase::Idle;
+    inner.expect_running = false;
+    inner.stop_epoch += 1; // ticks that overlapped the stop are stale too
     result.map_err(err)
 }
 
@@ -398,12 +407,20 @@ async fn revoke_device(id: String) -> CmdResult<()> {
 struct ModelRow {
     key: String,
     name: String,
+    /// Catalog family ("Qwen", "Gemma", …); none for custom models.
+    family: Option<String>,
+    /// Who made a community quantization; none for official repos.
+    quantized_by: Option<String>,
+    /// Longest context that fits the available VRAM (none: not even 2k fits).
+    max_fit_context: Option<u32>,
     repo: Option<String>,
     source_url: Option<String>,
     revision: Option<String>,
     params: Option<String>,
     quant: Option<String>,
     license: Option<String>,
+    /// Year the model was published (catalog), e.g. "2025".
+    released: Option<String>,
     notes: Option<String>,
     /// Verified end to end on real hardware (catalog flag).
     tested: bool,
@@ -457,9 +474,15 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
             let m = server::resolve(&settings, key)?;
             let entry = key.strip_prefix("catalog:").and_then(catalog::find);
             let requirement = m.requirement(settings.context_len, gpu.as_ref().and_then(|g| g.compute_capability));
+            let cc = gpu.as_ref().and_then(|g| g.compute_capability);
+            let max_fit_context =
+                available.and_then(|free| vram::max_fitting_context(m.max_context, free, |c| m.requirement(c, cc)));
             Some(ModelRow {
                 key: key.clone(),
                 name: m.label.clone(),
+                family: entry.as_ref().map(|e| e.family.clone()),
+                quantized_by: entry.as_ref().and_then(|e| e.quantized_by.clone()),
+                max_fit_context,
                 repo: m.repo.clone(),
                 source_url: entry.as_ref().map(|e| e.source_url()).or_else(|| {
                     m.repo.as_ref().map(|r| format!("https://huggingface.co/{r}"))
@@ -468,6 +491,7 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
                 params: entry.as_ref().map(|e| e.params.clone()),
                 quant: m.quant.clone(),
                 license: entry.as_ref().map(|e| e.license.clone()),
+                released: entry.as_ref().and_then(|e| e.released.as_ref()).map(|d| d.chars().take(4).collect()),
                 notes: entry.as_ref().and_then(|e| e.notes.clone()),
                 tested: entry.as_ref().is_some_and(|e| e.tested),
                 best_fit: false,

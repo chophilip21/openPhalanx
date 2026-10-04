@@ -34,19 +34,56 @@ pub const TIGHT_MARGIN: u64 = 3 * GIB / 2;
 /// Never hand SGLang more than this fraction of the card.
 pub const MAX_MEM_FRACTION: f64 = 0.90;
 
-/// Attention shape needed to size the KV cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// SGLang sizes the sliding-window layers' pool at this share of the full
+/// layers' tokens (`--swa-full-tokens-ratio`, default 0.8, with the radix cache on).
+pub const SWA_POOL_RATIO: f64 = 0.8;
+/// Hybrid linear-attention models (Qwen3-Next, Qwen3.5/3.6) keep a recurrent
+/// state pool sized at this share of the KV cache (`--mamba-full-memory-ratio`).
+pub const LINEAR_STATE_RATIO: f64 = 0.9;
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
+/// Attention shape needed to size the KV cache. Dense models only set the
+/// first three fields; the rest describe mixed-attention models.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchSpec {
-    /// Layers that keep a KV cache (all layers, except in hybrid-attention models).
+    /// Full-attention layers (every layer in a plain dense model).
     pub kv_layers: u32,
     pub kv_heads: u32,
     pub head_dim: u32,
+    /// Sliding-window layers (Gemma, gpt-oss), with their own shape.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub swa_layers: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub swa_kv_heads: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub swa_head_dim: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub swa_window: u32,
+    /// Linear-attention layers (no KV cache, but a recurrent state pool).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub linear_layers: u32,
 }
 
 impl ArchSpec {
-    /// K and V, fp16/bf16 KV cache.
+    /// A plain dense model: every layer has full attention.
+    pub const fn dense(kv_layers: u32, kv_heads: u32, head_dim: u32) -> Self {
+        ArchSpec { kv_layers, kv_heads, head_dim, swa_layers: 0, swa_kv_heads: 0, swa_head_dim: 0, swa_window: 0, linear_layers: 0 }
+    }
+
+    /// KV cache bytes per context token (K and V, 16-bit), as SGLang
+    /// allocates it: sliding-window layers count at `SWA_POOL_RATIO`, and a
+    /// hybrid linear-attention model adds its recurrent state pool.
     pub fn kv_bytes_per_token(&self) -> u64 {
-        2 * self.kv_layers as u64 * self.kv_heads as u64 * self.head_dim as u64 * 2
+        let full = 2 * self.kv_layers as u64 * self.kv_heads as u64 * self.head_dim as u64 * 2;
+        let swa = 2 * self.swa_layers as u64 * self.swa_kv_heads as u64 * self.swa_head_dim as u64 * 2;
+        let mut bytes = full as f64 + swa as f64 * SWA_POOL_RATIO;
+        if self.linear_layers > 0 {
+            bytes *= 1.0 + LINEAR_STATE_RATIO;
+        }
+        bytes.ceil() as u64
     }
 }
 
@@ -111,6 +148,32 @@ pub struct FitCheck {
     pub message: String,
 }
 
+/// Smallest context the app offers.
+pub const MIN_CONTEXT: u32 = 2048;
+
+/// The longest context (in steps of 1,024 tokens, up to `max_context`) whose
+/// requirement still fits in `free_bytes`; `None` if not even `MIN_CONTEXT` does.
+pub fn max_fitting_context(max_context: u32, free_bytes: u64, need: impl Fn(u32) -> Requirement) -> Option<u32> {
+    let fits = |ctx: u32| need(ctx).total_bytes <= free_bytes;
+    if max_context < MIN_CONTEXT || !fits(MIN_CONTEXT) {
+        return None;
+    }
+    // The requirement grows with the context, so binary search the 1k steps.
+    let (mut lo, mut hi) = (MIN_CONTEXT / 1024, max_context / 1024);
+    if fits(max_context) {
+        return Some(max_context);
+    }
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid * 1024) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Some(lo * 1024)
+}
+
 pub fn check(req: &Requirement, free_bytes: u64) -> FitCheck {
     let headroom = free_bytes as i64 - req.total_bytes as i64;
     let (fit, message) = if headroom < 0 {
@@ -164,7 +227,7 @@ pub fn fmt_gib(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    const QWEN14B: ArchSpec = ArchSpec { kv_layers: 48, kv_heads: 8, head_dim: 128 };
+    const QWEN14B: ArchSpec = ArchSpec::dense(48, 8, 128);
     const QWEN14B_AWQ_DOWNLOAD: u64 = 9_980_170_584;
     const RTX3090_TOTAL: u64 = 24_576 * 1024 * 1024;
     const AMPERE: Option<f32> = Some(8.6);
@@ -222,7 +285,7 @@ mod tests {
 
     #[test]
     fn fp8_counts_double_without_native_support() {
-        let arch = ArchSpec { kv_layers: 48, kv_heads: 4, head_dim: 128 };
+        let arch = ArchSpec::dense(48, 4, 128);
         let ampere = requirement(10 * GIB, Some("FP8"), &arch, 8192, Some(8.6));
         let ada = requirement(10 * GIB, Some("fp8"), &arch, 8192, Some(8.9));
         let unknown = requirement(10 * GIB, Some("FP8"), &arch, 8192, None);
@@ -232,8 +295,31 @@ mod tests {
 
     #[test]
     fn qwen32b_awq_does_not_fit_a_24gb_card() {
-        let arch = ArchSpec { kv_layers: 64, kv_heads: 8, head_dim: 128 };
+        let arch = ArchSpec::dense(64, 8, 128);
         let r = requirement(19_328_993_904, Some("AWQ 4-bit"), &arch, 8192, AMPERE);
         assert_eq!(check(&r, RTX3090_TOTAL - GIB).fit, Fit::Insufficient);
+    }
+
+    #[test]
+    fn mixed_attention_kv() {
+        // gpt-oss-20b: 12 full + 12 sliding layers, 8 KV heads of 64.
+        let gpt_oss = ArchSpec { swa_layers: 12, swa_kv_heads: 8, swa_head_dim: 64, swa_window: 128, ..ArchSpec::dense(12, 8, 64) };
+        assert_eq!(gpt_oss.kv_bytes_per_token(), (24_576.0 * (1.0 + SWA_POOL_RATIO)).ceil() as u64);
+        // Qwen3.6-27B: 16 full-attention layers plus the linear-attention state pool.
+        let qwen36 = ArchSpec { linear_layers: 48, ..ArchSpec::dense(16, 4, 256) };
+        let full = 2 * 16 * 4 * 256 * 2;
+        assert_eq!(qwen36.kv_bytes_per_token(), (full as f64 * (1.0 + LINEAR_STATE_RATIO)).ceil() as u64);
+        // A dense spec serializes without the optional fields.
+        assert_eq!(serde_json::to_string(&ArchSpec::dense(1, 2, 3)).unwrap(), r#"{"kv_layers":1,"kv_heads":2,"head_dim":3}"#);
+    }
+
+    #[test]
+    fn longest_fitting_context() {
+        let need = |ctx| requirement(9_980_170_584, Some("AWQ 4-bit"), &ArchSpec::dense(48, 8, 128), ctx, Some(8.6));
+        let free = 24 * GIB;
+        let best = max_fitting_context(131_072, free, need).unwrap();
+        assert!(need(best).total_bytes <= free && need(best + 1024).total_bytes > free);
+        assert_eq!(max_fitting_context(32_768, 100 * GIB, need), Some(32_768));
+        assert_eq!(max_fitting_context(32_768, GIB, need), None);
     }
 }
