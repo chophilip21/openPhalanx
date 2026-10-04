@@ -46,6 +46,7 @@ import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 SGLANG_ROOT = f"http://127.0.0.1:{os.environ.get('SGLANG_PORT', '8080')}"
@@ -58,6 +59,16 @@ STATE_DIR = Path(os.environ.get("STATE_DIR", "/state"))
 # Largest accepted request body. A 32k-token prompt is ~130 KB of text.
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", str(4 * 1024 * 1024)))
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "").rstrip("/")
+CONTEXT_LENGTH = int(os.environ.get("CONTEXT_LENGTH") or 32768)
+
+# Safety bars. SGLang itself rejects over-length input cleanly and queues
+# overload (verified: 12 concurrent 20k-token requests all completed), so the
+# risks are one client monopolizing the GPU and confusing errors.
+MAX_ACTIVE = int(os.environ.get("MAX_ACTIVE_REQUESTS", "8"))  # server-wide, in flight
+MAX_PER_DEVICE = int(os.environ.get("MAX_DEVICE_REQUESTS", "4"))  # per device, in flight
+QUEUE_WAIT_S = float(os.environ.get("QUEUE_WAIT_S", "120"))  # then 503 "busy"
+RATE_PER_MINUTE = int(os.environ.get("RATE_PER_MINUTE", "120"))  # per device
+MAX_OUTPUT_TOKENS = CONTEXT_LENGTH // 2
 SEARCH_TIMEOUT_S = 8.0
 ROUTER_TIMEOUT_S = 15.0
 # Only the tail of the latest message is routed; Aider puts the request last.
@@ -615,6 +626,60 @@ async def _send_with_auto_search(body: dict, device: dict) -> httpx.Response:
     return await _send(searched)
 
 
+class _Busy(Exception):
+    pass
+
+
+_global_slots = asyncio.Semaphore(MAX_ACTIVE)
+_device_slots: dict[str, asyncio.Semaphore] = {}
+_device_hits: dict[str, list[float]] = {}
+
+
+def _rate_limited(device_id: str) -> bool:
+    now = time.time()
+    hits = [t for t in _device_hits.get(device_id, []) if now - t < 60]
+    hits.append(now)
+    _device_hits[device_id] = hits
+    return len(hits) > RATE_PER_MINUTE
+
+
+async def _acquire(device_id: str) -> None:
+    """Waits for a device slot, then a server slot; raises _Busy after QUEUE_WAIT_S."""
+    dev = _device_slots.setdefault(device_id, asyncio.Semaphore(MAX_PER_DEVICE))
+    try:
+        await asyncio.wait_for(dev.acquire(), QUEUE_WAIT_S)
+    except asyncio.TimeoutError:
+        raise _Busy from None
+    try:
+        await asyncio.wait_for(_global_slots.acquire(), QUEUE_WAIT_S)
+    except asyncio.TimeoutError:
+        dev.release()
+        raise _Busy from None
+
+
+def _release(device_id: str) -> None:
+    _global_slots.release()
+    _device_slots[device_id].release()
+
+
+def _sanitize(body: dict) -> str | None:
+    """Clamps generation settings; returns an error message for requests that
+    cannot possibly fit (cheap check before SGLang tokenizes them)."""
+    body["n"] = 1
+    body.pop("best_of", None)
+    for key in ("max_tokens", "max_completion_tokens"):
+        v = body.get(key)
+        if isinstance(v, int) and v > MAX_OUTPUT_TOKENS:
+            body[key] = MAX_OUTPUT_TOKENS
+    chars = sum(len(_text_of(m.get("content"))) for m in body.get("messages", []) if isinstance(m, dict))
+    if chars > CONTEXT_LENGTH * 8:  # far beyond any tokenizer's ratio
+        return (
+            f"The request is about {chars:,} characters, far beyond the model's {CONTEXT_LENGTH:,}-token "
+            "context. Send less (fewer or smaller files)."
+        )
+    return None
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, device: dict = Depends(require_device)) -> Response:
     try:
@@ -625,8 +690,13 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
         body = json.loads(raw)
     except ValueError:
         body = None
-    if not isinstance(body, dict):
-        return openai_error(400, "Request body must be a JSON object.")
+    if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
+        return openai_error(400, "Request body must be a JSON object with a messages list.")
+    if _rate_limited(device["id"]):
+        return openai_error(429, f"Too many requests from this device (over {RATE_PER_MINUTE}/minute).", "rate_limit_exceeded")
+    problem = _sanitize(body)
+    if problem:
+        return openai_error(413, problem)
     # One served model: whatever name the client sends, it gets this one.
     body["model"] = MODEL_NAME
     auto_search = (
@@ -646,6 +716,14 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
         client_wants_usage = bool(options.get("include_usage"))
         body["stream_options"] = {**options, "include_usage": True}
 
+    try:
+        await _acquire(device["id"])
+    except _Busy:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": "The server is busy with other requests; try again shortly.", "type": "server_busy"}},
+            headers={"retry-after": "10"},
+        )
     devices.touch(device)
     metrics.requests_total += 1
     metrics.requests_active += 1
@@ -655,9 +733,12 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
             resp = await _send_with_auto_search(body, device)
         else:
             resp = await _send(body)
-    except httpx.HTTPError:
+    except (httpx.HTTPError, asyncio.CancelledError) as e:
         metrics.requests_active -= 1
         metrics.requests_failed += 1
+        _release(device["id"])
+        if isinstance(e, asyncio.CancelledError):
+            raise
         return openai_error(503, "The model is still loading; try again shortly.", "service_unavailable")
     if resp.status_code >= 400:
         metrics.requests_failed += 1
@@ -669,8 +750,23 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
         finally:
             await resp.aclose()
             metrics.requests_active -= 1
+            _release(device["id"])
         _record_usage(device, content)
         return Response(content, status_code=resp.status_code, media_type=media_type)
+
+    done = False
+
+    async def cleanup():
+        """Idempotent: from the relay's finally, or from the response's
+        background task if the client left before streaming started."""
+        nonlocal done
+        if done:
+            return
+        done = True
+        # Closing the upstream stream makes SGLang abort the generation.
+        await resp.aclose()
+        metrics.requests_active -= 1
+        _release(device["id"])
 
     async def relay():
         # Re-frame on SSE event boundaries so the usage event can be inspected
@@ -704,13 +800,10 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
         except httpx.HTTPError:
             metrics.requests_failed += 1
         finally:
-            # Also runs when the client disconnects; closing the upstream
-            # stream makes SGLang abort the generation.
-            await resp.aclose()
-            metrics.requests_active -= 1
+            await cleanup()
 
     return StreamingResponse(
-        relay(), status_code=resp.status_code, media_type=media_type, headers={"cache-control": "no-cache"}
+        relay(), status_code=resp.status_code, media_type=media_type, headers={"cache-control": "no-cache"}, background=BackgroundTask(cleanup)
     )
 
 

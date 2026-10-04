@@ -10,6 +10,7 @@ Working notes for developing this repo: architecture, operations, commands and c
   * Roadmap status (phases, steps, checkboxes, verification notes) goes in `milestone.md`.
 * **Agents never commit directly:** any agent launcher or config (Aider, `oppx aider`, etc.) must use `--no-auto-commits --no-dirty-commits`. The user reviews with `git diff` and commits themselves.
 * **Commits:** never commit or push unless the user explicitly asks for that commit. Finish with an uncommitted diff and a summary.
+* **Model-agnostic:** everything that makes the experience seamless must work with any model SGLang serves. Use constrained decoding (regex or JSON schema) rather than per-model tool-call or reasoning parsers, put unavoidable per-model differences in catalog data, and check accuracy with probe sets against the loaded model rather than tuning prompts to one model.
 * **Branching:** work happens on `dev`; `main` holds the initial history only.
 * **Toolchain on the server node:** `cargo` is in `~/.cargo/bin` (not on the non-interactive `PATH`), so use `export PATH=$HOME/.cargo/bin:$PATH`. `uv`/`uvx` are in `~/.local/bin`.
 * **Versioning:** the backend image tag equals the workspace version in `Cargo.toml`. Bump `Cargo.toml`, `app/package.json` and `app/src-tauri/tauri.conf.json` together when `docker/` changes.
@@ -183,6 +184,20 @@ oppx servers | oppx use NAME
   * **Esc interrupt:** `EscWatcher` holds the terminal in cbreak mode during a turn and turns a lone Esc into SIGINT. It pauses whenever a question needs an answer. Keystrokes typed during a turn are kept: finished lines are queued as the next messages, and a partial line is pre-filled.
   * **Interrupts:** Aider's `keyboard_interrupt` (which exits on a double press) is replaced. A mid-stream interrupt is detected from the "I see that you interrupted…" note Aider records; check the coder returned after `SwitchCoder` too.
   * **Ask/edit routing:** each normal message goes through a one-token `ask`/`edit` classification by the server's model through the proxy (about 40 ms, 14/14 on probes). Questions run as `/ask`, so they can't edit. Without it, Qwen-14B in diff mode deleted `mul` when asked "what does mul return?". The gateway skips the web-search router for requests that carry `regex` or `response_format`.
+  * **Context manager** (`ContextManager` in `oppx_chat.py`):
+    * **Hooks:** it wraps `Coder.format_messages`, so every request Aider builds is fitted first.
+    * **Budget:** `(context − 4096 reserved for the answer) / 1.10`, with the margin covering the gap between Aider's generic token count and the model's real tokenizer. That's 26,065 tokens at 32k.
+    * **Making room, cheapest loss first:**
+      1. summarize the conversation (`summarizer.summarize_all`);
+      2. set aside files the model requested that are least recently used;
+      3. halve the repo map down to 1,024 tokens;
+      4. set aside older files you added or that were edited.
+
+      Files used in the current turn are never set aside. Set-aside files stay visible as signatures in the repo map.
+    * **Repo map:** capped at 8,192 tokens (`map_mul_no_files=1`). Aider alone lets it grow to about 28k when no files are in the chat, which caused a 46k-token request on this repo.
+    * **File requests:** the model's requests go through `confirm_ask`. A single file over 60% of the budget is refused with a reason.
+    * **Final guard:** `check_tokens` is replaced, so a request is never sent over the limit, and Aider's "proceed anyway / providers won't charge" text is suppressed.
+    * **Visibility:** `/context` shows the breakdown, and the status bar shows the percentage used.
   * **Memory:** `OPENPHALANX.md` (and `AGENTS.md` if present) in the repo root is loaded read-only every turn. `/init` asks the model to write it.
   * **Sessions:** one file per conversation in `~/.local/state/oppx/history/<repo>-<id>/<YYYYmmdd-HHMMSS>.md`, with a shared `input.history`. The old single per-repo file is migrated as session `00000000-000000`. `-c` and `-r` pass `--restore-chat-history`.
   * **Testing:** drive it in a pty (Python `pty.fork`, 120×40 via `TIOCSWINSZ`). The driver must **answer cursor-position requests** (`ESC[6n` → `ESC[30;1R`), or prompt_toolkit never draws the status bar. Render the raw bytes with `pyte` to see the real screen.
@@ -236,6 +251,13 @@ Open `9090/tcp` in your firewall for the clients' network. Never expose `9091`.
 * **Device tokens:** each client trades a pairing code for its own random 256-bit device token. The server stores only the SHA-256 hash, and you can revoke any device from the GUI.
 * **Admin API:** the admin API is reachable from the server machine only, and requires a random token generated at each launch.
 * **Web search:** SearXNG is reachable only from the gateway (private network, no ports) and keeps no logs. Automatic search is on by default (the user's choice; `--no-web` opts out). Router-written queries leave the server for public search engines, so they can carry fragments of a request. Results are injected as untrusted reference text.
+* **Safety bars** (gateway, any client):
+  * forces `n=1` and drops `best_of`, and clamps `max_tokens` to half the context;
+  * answers `413` for bodies over 8 characters per context token, before SGLang sees them;
+  * allows at most 4 requests in flight per device and 8 server-wide, queueing for up to 120 s before a `503` with `retry-after`;
+  * limits each device to 120 requests a minute (`429`).
+
+  The settings live in `gateway.py`, and the `MAX_ACTIVE_REQUESTS`, `MAX_DEVICE_REQUESTS`, `QUEUE_WAIT_S` and `RATE_PER_MINUTE` variables override them. Slots are released through an idempotent cleanup that also runs as the response's background task, so a client that disconnects before streaming starts can't leak one. SGLang itself rejects over-length input with a clean 400 and queues overload: 12 concurrent 20k-token requests all completed.
 * **No code stored or executed:** the server keeps no code and runs no commands for clients. Request bodies (prompts) are never logged; only per-device request and token counts are kept. Model weights are mounted read-only, and the backend never downloads weights on its own.
 
 ## Development

@@ -104,6 +104,14 @@ SUPPRESS = [
         r"^\^C KeyboardInterrupt",
         r"^\^C again to exit",
         r"is already in the chat",
+        # Aider's context warnings; the context manager below handles this.
+        r"Your estimated chat context",
+        r"^To reduce the chat context",
+        r"^- Use /drop",
+        r"^- Use /clear",
+        r"^- Break your code",
+        r"probably safe to try",
+        r"best to only add files that need changes",
         r"^Applied edit to ",  # shown as a diff after the turn instead
     )
 ]
@@ -120,6 +128,155 @@ def step(markup: str, color: str = MUTED) -> None:
 
 def headline(markup: str, color: str = ACCENT) -> None:
     out(f"\n[{color}]{BULLET}[/] {markup}")
+
+
+# ---------------------------------------------------------------------------
+# Context manager: keep every request inside the model's context window
+# ---------------------------------------------------------------------------
+
+OUTPUT_RESERVE = 4096  # room left for the model's answer
+TOKEN_MARGIN = 0.10  # Aider counts with a generic tokenizer; Qwen's differs a little
+MAP_MAX, MAP_MIN = 8192, 1024  # repo map share of the budget (Aider alone allows ~28k)
+# File priorities: higher stays longer.
+PRI_MODEL, PRI_USER, PRI_EDITED = 1, 2, 3
+
+
+class ContextManager:
+    """Fits each request into the budget before it is sent, cheapest loss first:
+    1. summarize older conversation (like Claude's auto-compact);
+    2. set aside files the model asked for and never edited, least recently
+       used first; they stay visible in the repo map as signatures;
+    3. shrink the repo map (down to MAP_MIN);
+    4. set aside older files you added, then older edited files.
+    The current turn's files are never set aside."""
+
+    def __init__(self):
+        self.budget = int((CONTEXT - OUTPUT_RESERVE) / (1 + TOKEN_MARGIN))
+        self.turn = 0
+        self.files = {}  # abs path -> [priority, last turn used]
+        self.used = 0  # tokens of the last request, for the status bar
+        self.notes = []  # what was done to make room this turn
+
+    def note(self, abs_path: str, priority: int):
+        cur = self.files.get(abs_path)
+        self.files[abs_path] = [max(priority, cur[0]) if cur else priority, self.turn]
+
+    def start_turn(self, coder, user_text: str):
+        self.turn += 1
+        self.notes = []
+        # Files already in the chat that we haven't seen came from /add or @.
+        for f in coder.abs_fnames:
+            if f not in self.files:
+                self.note(f, PRI_USER)
+        for f in coder.abs_fnames:
+            if Path(f).name in user_text or coder.get_rel_fname(f) in user_text:
+                self.note(f, max(self.files[f][0], PRI_USER))
+
+    def end_turn(self, coder):
+        # Model requests are recorded in accept_file; anything else new came
+        # from /add or an @mention.
+        for f in coder.abs_fnames:
+            if f not in self.files:
+                self.note(f, PRI_USER)
+        for rel in coder.aider_edited_files or ():
+            self.note(coder.abs_root_path(rel), PRI_EDITED)
+        try:
+            self.used = _raw_tokens(coder)
+        except Exception:  # noqa: BLE001 - only feeds the status bar
+            pass
+
+    def file_tokens(self, coder, rel: str) -> int:
+        try:
+            text = Path(coder.abs_root_path(rel)).read_text(encoding=coder.io.encoding, errors="replace")
+        except OSError:
+            return 0
+        return coder.main_model.token_count(text)
+
+    def accept_file(self, coder, rel: str) -> bool:
+        """Called when the model asks for a file: refuse ones that can't fit."""
+        n = self.file_tokens(coder, rel)
+        if n > self.budget * 0.6:
+            step(f"Not loading [bold]{escape(rel)}[/]: {n:,} tokens is too large for the "
+                 f"{CONTEXT // 1024}k context. Ask about specific functions instead.", YELLOW)
+            return False
+        self.note(coder.abs_root_path(rel), PRI_MODEL)
+        return True
+
+    def _droppable(self, coder, max_priority: int):
+        cands = [
+            (self.files.get(f, [PRI_MODEL, 0])[0], self.files.get(f, [PRI_MODEL, 0])[1], f)
+            for f in coder.abs_fnames
+            if self.files.get(f, [PRI_MODEL, 0])[1] < self.turn
+            and self.files.get(f, [PRI_MODEL, 0])[0] <= max_priority
+        ]
+        return sorted(cands)  # lowest priority, then least recently used
+
+    def fit(self, coder):
+        rm = coder.repo_map
+        if rm is not None:
+            rm.map_mul_no_files = 1
+            rm.max_map_tokens = MAP_MAX
+        total = _raw_tokens(coder)
+        compacted = False
+        set_aside = []
+        while total > self.budget:
+            history = coder.main_model.token_count(coder.done_messages) if coder.done_messages else 0
+            if not compacted and history > 1024:
+                compacted = True
+                before = history
+                with Thinking():
+                    coder.done_messages = coder.summarizer.summarize_all(coder.done_messages)
+                after = coder.main_model.token_count(coder.done_messages)
+                self.notes.append(f"summarized the conversation ({before:,} → {after:,} tokens)")
+            elif cands := self._droppable(coder, PRI_MODEL):
+                f = cands[0][2]
+                coder.abs_fnames.discard(f)
+                set_aside.append(coder.get_rel_fname(f))
+            elif rm is not None and rm.max_map_tokens > MAP_MIN:
+                rm.max_map_tokens = max(MAP_MIN, rm.max_map_tokens // 2)
+            elif cands := self._droppable(coder, PRI_EDITED):
+                f = cands[0][2]
+                coder.abs_fnames.discard(f)
+                set_aside.append(coder.get_rel_fname(f))
+            else:
+                break
+            total = _raw_tokens(coder)
+        if set_aside:
+            self.notes.append("set aside " + ", ".join(set_aside) + " (still in the repo map; mention them to bring back)")
+        for n in self.notes:
+            step(f"Context: {escape(n)}", MUTED)
+        self.notes = []
+        self.used = total
+
+
+CONTEXT_MGR = ContextManager()
+_orig_format_messages = base_coder.Coder.format_messages
+
+
+def _raw_tokens(coder) -> int:
+    return coder.main_model.token_count(_orig_format_messages(coder).all_messages())
+
+
+def _fitted_format_messages(self):
+    """Every request Aider sends is built here: fit it first."""
+    if not getattr(self, "_oppx_fitting", False):
+        self._oppx_fitting = True
+        try:
+            CONTEXT_MGR.fit(self)
+        finally:
+            self._oppx_fitting = False
+    return _orig_format_messages(self)
+
+
+def _check_tokens(self, messages):
+    """Final guard (replaces Aider's "proceed anyway?"): never send a request
+    that can't fit; the server would reject it anyway."""
+    n = self.main_model.token_count(messages)
+    if n * (1 + TOKEN_MARGIN) <= CONTEXT - 512:
+        return True
+    step(f"This request needs about {n:,} tokens, more than the model's {CONTEXT:,}-token context "
+         "even after making room. Drop files (/drop) or split the request.", RED)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +365,7 @@ class EscWatcher:
 
 
 WATCHER: EscWatcher | None = None
+CODER = None  # the active coder, for confirmations that need it
 
 
 def _interrupted(self):
@@ -318,8 +476,11 @@ class OppxIO(InputOutput):
             ok = answer in ("y", "yes")
             step("Allowed" if ok else "Declined", GREEN if ok else MUTED)
             return ok
-        # Everything else (adding files the model needs, creating files,
-        # adding command output to the chat) is routine: say yes quietly.
+        # Files the model asks for: load them if they can fit.
+        if "add file" in q.lower() and subject and CODER is not None:
+            return CONTEXT_MGR.accept_file(CODER, str(subject))
+        # Everything else (creating files, adding command output to the chat)
+        # is routine: say yes quietly.
         return True
 
     def prompt_ask(self, question, default="", subject=None):
@@ -380,9 +541,10 @@ class OppxIO(InputOutput):
             return HTML(f" <hint>{UI.hint}</hint>")
         files = len(rel_fnames)
         web = "web search on" if WEB else "web search off"
+        used = f"context {min(99, round(100 * CONTEXT_MGR.used / CONTEXT))}% · " if CONTEXT_MGR.used else ""
         mode = "<plan>⏸ plan mode on</plan> (shift+tab to cycle) · " if UI.plan_mode else "? for shortcuts · "
         return HTML(
-            f" {mode}<b>{SERVER}</b> · {MODEL_LABEL} · {CONTEXT // 1024}k context · {web} · "
+            f" {mode}{used}<b>{SERVER}</b> · {MODEL_LABEL} · {CONTEXT // 1024}k context · {web} · "
             f'{files} file{"s" if files != 1 else ""} in chat'
         )
 
@@ -673,6 +835,43 @@ def show_status(coder):
         step(f"[bold]{k:<14}[/] {escape(v)}")
 
 
+def show_context(coder):
+    """Claude-style context view: what fills the window and how much room is left."""
+    chunks = _orig_format_messages(coder)
+    count = coder.main_model.token_count
+    parts = [
+        ("Instructions", count(chunks.system + chunks.examples + chunks.reminder)),
+        ("Memory files", count(chunks.readonly_files) if chunks.readonly_files else 0),
+        ("Repo map", count(chunks.repo) if chunks.repo else 0),
+        ("Conversation", count(chunks.done + chunks.cur) if (chunks.done or chunks.cur) else 0),
+    ]
+    files = []
+    for f in sorted(coder.abs_fnames):
+        try:
+            n = count(Path(f).read_text(encoding=coder.io.encoding, errors="replace"))
+        except OSError:
+            continue
+        pri = CONTEXT_MGR.files.get(f, [PRI_MODEL, 0])[0]
+        why = {PRI_EDITED: "edited", PRI_USER: "added by you", PRI_MODEL: "requested by the model"}[pri]
+        files.append((coder.get_rel_fname(f), n, why))
+    total = sum(n for _, n in parts) + sum(n for _, n, _ in files)
+    budget = CONTEXT_MGR.budget
+    width = 40
+    filled = min(width, round(width * total / CONTEXT))
+    mark = min(width - 1, round(width * budget / CONTEXT))
+    bar = "".join("█" if i < filled else ("│" if i == mark else "░") for i in range(width))
+    color = GREEN if total <= budget * 0.8 else (YELLOW if total <= budget else RED)
+    headline(f"[bold]Context[/] [{MUTED}]· {total:,} of {CONTEXT:,} tokens[/]")
+    out(f"  [{color}]{bar}[/] [{MUTED}]{100 * total // CONTEXT}% used · │ = budget ({budget:,}), "
+        f"the rest is kept for the answer[/]")
+    for name, n in parts:
+        out(f"    [{MUTED}]{name:<16}[/] {n:>7,}")
+    for name, n, why in files:
+        out(f"    [{ACCENT}]{escape(name)[:44]:<44}[/] {n:>7,}  [{MUTED}]{why}[/]")
+    out(f"  [{MUTED}]When a request would go over budget, OpenPhalanx summarizes older conversation, then sets aside "
+        f"the least recently used files (they stay in the repo map), then shrinks the repo map.[/]")
+
+
 def show_cost(coder):
     sent, recv = coder.total_tokens_sent, coder.total_tokens_received
     headline("[bold]Session usage[/]")
@@ -687,6 +886,7 @@ def compact(coder, instructions: str):
     with Thinking():
         coder.done_messages = coder.summarizer.summarize_all(coder.done_messages)
     after = coder.main_model.token_count(coder.done_messages)
+    CONTEXT_MGR.used = _raw_tokens(coder)
     step(f"Conversation compacted: {before:,} → {after:,} tokens", GREEN)
 
 
@@ -839,8 +1039,8 @@ def translate(coder, text: str):
         compact(coder, arg)
     elif name == "/cost":
         show_cost(coder)
-    elif name == "/context":
-        return "/tokens"
+    elif name in ("/context", "/tokens"):
+        show_context(coder)
     elif name == "/status":
         show_status(coder)
     elif name == "/model":
@@ -890,6 +1090,8 @@ def build_coder(argv):
     aider_main.InputOutput = OppxIO  # main() constructs its IO from this name
     base_coder.WaitingSpinner = Thinking
     base_coder.Coder.keyboard_interrupt = _interrupted
+    base_coder.Coder.format_messages = _fitted_format_messages
+    base_coder.Coder.check_tokens = _check_tokens
     coder = aider_main.main(argv, return_coder=True)
     # main() installs the engine's crash reporter; errors are ours to report.
     sys.excepthook = sys.__excepthook__
@@ -937,8 +1139,11 @@ def run_turn(coder, text: str):
     """Runs one message; returns the coder to continue with (a new one after
     a mode switch such as /ask, which runs in its own temporary coder)."""
     global WATCHER
+    global CODER
     coder.io._retry_shown = False
     UI.interrupted = False
+    CODER = coder
+    CONTEXT_MGR.start_turn(coder, text)
     before = snapshot(coder)
     result = coder
     try:
@@ -958,6 +1163,8 @@ def run_turn(coder, text: str):
     if _was_interrupted(result):
         step("Interrupted by user", YELLOW)
     show_edits(coder, before)
+    CONTEXT_MGR.end_turn(result)
+    CODER = result
     return result
 
 

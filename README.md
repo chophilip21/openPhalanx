@@ -72,7 +72,7 @@ oppx -c                           # continue the last conversation (oppx -r to p
 oppx -p "explain src/main.rs"     # answer once and exit
 ```
 
-Keys and commands work like Claude Code: `/help`, `@file` to mention a file, `!cmd` to run a shell command, `# note` to save to project memory, `/init` to write a project summary, Shift+Tab for plan mode (no edits), Esc to interrupt, Ctrl-C twice to exit. Questions are answered without touching your files; requests are applied as edits.
+The context window is managed for you: when a conversation grows, older messages are summarized and unused files are set aside automatically (`/context` shows what's in it). Keys and commands work like Claude Code: `/help`, `@file` to mention a file, `!cmd` to run a shell command, `# note` to save to project memory, `/init` to write a project summary, Shift+Tab for plan mode (no edits), Esc to interrupt, Ctrl-C twice to exit. Questions are answered without touching your files; requests are applied as edits.
 
 When a request needs current information (new library versions, recent APIs, error messages), the server searches the web automatically through a private [SearXNG](https://docs.searxng.org) instance; `oppx --no-web` turns that off.
 

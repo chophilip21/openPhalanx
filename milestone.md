@@ -494,6 +494,42 @@
 
   * Remaining: the user's check on a real terminal.
 
+* \[ \] **Step 4.9: Smart context management and server safety bars**
+
+  * **Problem:** on a real repo, "explain the project" built a **46k-token** request for a 32k model. With no files in the chat, Aider lets the repo map grow to about 28k tokens. The frontend then auto-accepted every file the model asked for, and Aider offered to "proceed anyway" with "providers won't charge", which is meaningless for a local server.
+
+  * **Context manager** (frontend; details in `CLAUDE.md`): a budget based on the window, an answer reserve and the tokenizer margin, rather than a fixed percentage.
+
+    * **Priorities:** your message and memory first, then files edited or added by you, then files the model asked for, then the repo map, then old conversation.
+
+    * **Making room, cheapest first:** summarize the conversation (auto-compact), set aside the least recently used model-requested files (still visible in the repo map), then shrink the repo map.
+
+    * **Limits:** files too big to fit are refused with a reason, and nothing is ever sent over the limit. `/context` and the status bar show usage.
+
+  * **Server safety bars** (gateway): `n=1`, a `max_tokens` clamp, an early `413` for impossible inputs, per-device and global concurrency limits with a bounded queue (`503` "busy" with `retry-after`), a per-device rate limit (`429`), and disconnect-safe slot release.
+
+  * ✅ **Verified:**
+
+    * **SGLang under abuse:** 60k-token input and `max_tokens=100000` got clean 400s; 12 concurrent 20k-token requests all completed and the server stayed healthy.
+
+    * **Gateway:** `n=3` returns 1 choice; `max_tokens=100000` is clamped and returns 200; 300k characters gets a 413 with an explanation.
+
+    * **Concurrency and rate:** 12 concurrent requests from one device ran at most 4 at once, and all finished. 130 rapid requests gave 106 × 200 and 24 × 429, exactly the 120-per-minute limit. Active requests went back to 0, so no slot leaked.
+
+    * **Real repo (this one):** "explain this repo", then `/add` of three large files (about 21k tokens), then an edit. Model-requested files were set aside and the edit applied. The final context was 25,500 tokens against a 26,065 budget, with no overflow warnings.
+
+  * Remaining: the user's check on a real terminal.
+
+* \[ \] **Step 4.10: Model-agnostic follow-ups** (principle in `CLAUDE.md`, from the user: everything must work across SGLang models)
+
+  * **Edit format per model:** a catalog field (`edit_format`, e.g. `whole` for small models) instead of the hard-coded `diff`, passed through `oppx` from the server's model information.
+
+  * **Reasoning models** (`<think>` output): pick SGLang's reasoning parser from catalog data, with a generic fallback that strips think blocks.
+
+  * **Probe harness:** score the web-search router and the ask/edit classifier against whatever model is loaded (the 16 and 14 probes used so far), so a model that is bad at them is caught without code changes.
+
+  * **Exact token counts:** optionally count with the server's tokenizer instead of Aider's approximation, which would allow a smaller margin.
+
 ## Phase 5: End-to-End Validation & Caching Benchmark
 
 * \[ \] **Step 5.1: Test Simple File Edit**
