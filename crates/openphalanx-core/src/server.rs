@@ -25,7 +25,14 @@ pub struct ResolvedModel {
     pub arch: ArchSpec,
     pub max_context: u32,
     pub min_compute_capability: Option<f32>,
+    /// Shown to clients so they know exactly which model they talk to.
+    pub model_id: String,
+    pub edit_format: Option<String>,
+    pub reasoning_parser: Option<String>,
 }
+
+/// Edit format when the catalog doesn't name one.
+pub const DEFAULT_EDIT_FORMAT: &str = "diff";
 
 impl ResolvedModel {
     pub fn context_len(&self, wanted: u32) -> u32 {
@@ -64,6 +71,9 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
             arch: e.arch,
             max_context: e.max_context,
             min_compute_capability: e.min_compute_capability,
+            model_id: e.id.clone(),
+            edit_format: e.edit_format.clone(),
+            reasoning_parser: e.reasoning_parser.clone(),
         });
     }
     let c = settings.custom_models.iter().find(|c| c.key == key)?;
@@ -82,6 +92,9 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
         arch: c.arch,
         max_context: c.max_context,
         min_compute_capability: None,
+        model_id: c.repo.clone().unwrap_or_else(|| c.label.clone()),
+        edit_format: None,
+        reasoning_parser: None,
     })
 }
 
@@ -306,6 +319,9 @@ pub async fn start(settings: &Settings, mut on_progress: impl FnMut(StartProgres
         state_dir,
         admin_token: admin::new_admin_token(),
         web_search: settings.web_search,
+        model_id: model.model_id.clone(),
+        edit_format: model.edit_format.clone().unwrap_or_else(|| DEFAULT_EDIT_FORMAT.to_string()),
+        reasoning_parser: model.reasoning_parser.clone(),
     })
     .await
 }

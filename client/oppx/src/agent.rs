@@ -230,14 +230,35 @@ fn entry_modified(path: &Path) -> std::time::SystemTime {
     std::fs::metadata(path).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH)
 }
 
+/// Aider model settings for the served model. Aider falls back to
+/// `edit_format: whole` and no repo map for model names it doesn't know (ours
+/// is `openphalanx-coder`), so state them explicitly. `reasoning_tag` strips
+/// `<think>` blocks before edits are parsed, for any model that emits them.
+pub fn model_settings(edit_format: &str) -> Result<tempfile::NamedTempFile> {
+    let yaml = format!(
+        "- name: {AIDER_MODEL}\n  edit_format: {edit_format}\n  use_repo_map: true\n  reasoning_tag: think\n"
+    );
+    let mut f = tempfile::Builder::new().prefix("oppx-settings-").suffix(".yml").tempfile()?;
+    f.write_all(yaml.as_bytes())?;
+    f.flush()?;
+    Ok(f)
+}
+
 /// Aider's arguments: our defaults, then the user's (which may override the
 /// defaults), then the no-commit flags (which nothing may override).
-pub fn aider_args(metadata: &Path, history: &History, restore: bool, user_args: &[OsString]) -> Vec<OsString> {
+pub fn aider_args(
+    metadata: &Path,
+    settings: &Path,
+    edit_format: &str,
+    history: &History,
+    restore: bool,
+    user_args: &[OsString],
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "--model",
         AIDER_MODEL,
         "--edit-format",
-        "diff",
+        edit_format,
         "--no-show-model-warnings",
         "--no-check-update",
         "--no-show-release-notes",
@@ -263,6 +284,8 @@ pub fn aider_args(metadata: &Path, history: &History, restore: bool, user_args: 
     if restore {
         args.push("--restore-chat-history".into());
     }
+    args.push("--model-settings-file".into());
+    args.push(settings.as_os_str().to_owned());
     args.push("--model-metadata-file".into());
     args.push(metadata.as_os_str().to_owned());
     args.extend(user_args.iter().cloned());
@@ -353,7 +376,7 @@ mod tests {
     fn no_commit_flags_come_last() {
         let user = vec![OsString::from("--edit-format"), OsString::from("whole"), OsString::from("src/main.rs")];
         let history = History { chat: "/h/c.md".into(), input: "/h/i".into() };
-        let args = aider_args(Path::new("/tmp/m.json"), &history, false, &user);
+        let args = aider_args(Path::new("/tmp/m.json"), Path::new("/tmp/s.yml"), "diff", &history, false, &user);
         for flag in ["--no-show-release-notes", "--yes-always", "--no-gitignore"] {
             assert!(args.iter().any(|a| a == flag), "{flag}");
         }
@@ -415,6 +438,14 @@ mod tests {
     #[test]
     fn frontend_is_embedded() {
         assert!(FRONTEND.contains("def run(argv)") && FRONTEND.contains("return_coder=True"));
+    }
+
+    #[test]
+    fn model_settings_name_the_model() {
+        let f = model_settings("whole").unwrap();
+        let y = std::fs::read_to_string(f.path()).unwrap();
+        assert!(y.contains("name: openai/openphalanx-coder") && y.contains("edit_format: whole"));
+        assert!(y.contains("use_repo_map: true") && y.contains("reasoning_tag: think"));
     }
 
     #[test]

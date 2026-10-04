@@ -186,7 +186,7 @@ oppx servers | oppx use NAME
   * **Ask/edit routing:** each normal message goes through a one-token `ask`/`edit` classification by the server's model through the proxy (about 40 ms, 14/14 on probes). Questions run as `/ask`, so they can't edit. Without it, Qwen-14B in diff mode deleted `mul` when asked "what does mul return?". The gateway skips the web-search router for requests that carry `regex` or `response_format`.
   * **Context manager** (`ContextManager` in `oppx_chat.py`):
     * **Hooks:** it wraps `Coder.format_messages`, so every request Aider builds is fitted first.
-    * **Budget:** `(context − 4096 reserved for the answer) / 1.10`, with the margin covering the gap between Aider's generic token count and the model's real tokenizer. That's 26,065 tokens at 32k.
+    * **Budget:** `(context − 4096 reserved for the answer) / factor`. The factor covers the gap between Aider's generic token count and the model's real tokenizer: 1.10 until calibrated (26,065 tokens at 32k), then the measured ratio × 1.03. After each answer, `ContextManager.calibrate` counts the request it just sent with the server's tokenizer (`POST /v1/tokenize` via the proxy, in a background thread) and keeps a running average. On Qwen2.5-Coder the ratio is about 1.01, giving 27,541 tokens.
     * **Making room, cheapest loss first:**
       1. summarize the conversation (`summarizer.summarize_all`);
       2. set aside files the model requested that are least recently used;
@@ -198,10 +198,12 @@ oppx servers | oppx use NAME
     * **File requests:** the model's requests go through `confirm_ask`. A single file over 60% of the budget is refused with a reason.
     * **Final guard:** `check_tokens` is replaced, so a request is never sent over the limit, and Aider's "proceed anyway / providers won't charge" text is suppressed.
     * **Visibility:** `/context` shows the breakdown, and the status bar shows the percentage used.
+  * **Progress display:** one `TurnSpinner` runs from Enter to the end of the turn. It's paused by any output (`out()` and the spinner share `OUT_LOCK`) and restarted on each wait; Aider's `WaitingSpinner` is mapped onto it. `Coder.show_pretty` is forced to True. Aider disables streaming and its spinner whenever it picks a non-```` ``` ```` fence (any Markdown file with code blocks in the chat), which looked like a freeze. The edit-block hider understands every fence Aider may pick: ```` ``` ````, four backticks, and `<source>`, `<code>` and `<pre>` tags.
   * **Editing safeguards:**
     * Aider's `--no-suggest-shell-commands` is always set. Aider otherwise offers to run any `bash` block in a reply, even quoted file content.
     * A change request that yields no edit gets one model-agnostic retry in `whole` format (`_whole_file_retry`; small files only, output hidden, diff shown), then a "No changes were made" notice.
     * The content before an edit comes from `OppxIO.write_text`.
+  * **Model info:** `oppx` reads `GET /v1/info` at start-up and passes `OPPX_MODEL_ID` (shown in the welcome box, status bar and `/status`) and a `--model-settings-file` with the server's `edit_format` and `use_repo_map: true` (Aider otherwise assumes `whole` and no repo map for our model name). Reasoning output (`<think>` spans, a lone `</think>`, Aider's "► THINKING / ► ANSWER" markers) is hidden by `hide_reasoning`, and the spinner keeps going while the model reasons.
   * **Memory:** `OPENPHALANX.md` (and `AGENTS.md` if present) in the repo root is loaded read-only every turn. `/init` asks the model to write it.
   * **Sessions:** one file per conversation in `~/.local/state/oppx/history/<repo>-<id>/<YYYYmmdd-HHMMSS>.md`, with a shared `input.history`. The old single per-repo file is migrated as session `00000000-000000`. `-c` and `-r` pass `--restore-chat-history`.
   * **Testing:** drive it in a pty (Python `pty.fork`, 120×40 via `TIOCSWINSZ`). The driver must **answer cursor-position requests** (`ESC[6n` → `ESC[30;1R`), or prompt_toolkit never draws the status bar. Render the raw bytes with `pyte` to see the real screen.
@@ -238,7 +240,7 @@ oppx servers | oppx use NAME
 
 | | |
 |---|---|
-| `9090/tcp` (all interfaces) | Public gateway API, TLS only. `/health` and `/v1/pair` are open. `/v1/whoami`, `/v1/unpair` (self-revoke), `/v1/search`, `/v1/models` and `/v1/chat/completions` (OpenAI-compatible, streaming) need a device token |
+| `9090/tcp` (all interfaces) | Public gateway API, TLS only. `/health` and `/v1/pair` are open. `/v1/whoami`, `/v1/unpair` (self-revoke), `/v1/info` (model id, context, edit format), `/v1/tokenize`, `/v1/search`, `/v1/models` and `/v1/chat/completions` (OpenAI-compatible, streaming) need a device token |
 | `9091/tcp` (`127.0.0.1` only) | Admin API for the GUI; needs the per-launch admin token |
 | `~/.config/openphalanx/settings.json` | Selected model, context length, GPU index, custom models |
 | `~/.local/share/openphalanx/models/` | Models downloaded by the GUI (verified, pinned to a commit) |
@@ -281,6 +283,7 @@ cargo run -p openphalanx-core --example download -- <repo> <dir>  # verified, re
 
 docker build -f docker/Dockerfile.server -t ghcr.io/chophilip21/openphalanx-backend:0.2.0 docker/
 scripts/publish-image.sh                                        # build and push to GHCR (needs write:packages)
+OPENAI_API_BASE=… OPENAI_API_KEY=… scripts/probe_routing.py     # via `oppx proxy --no-web`; run after any model change
 ```
 
 The backend image tag follows the version in the root `Cargo.toml`, so bump both together when changing `docker/`. The base SGLang image is pinned by digest in `docker/Dockerfile.server`.
@@ -304,12 +307,14 @@ app/                     Tauri 2 + Svelte 5 server GUI (Linux)
   src/                   frontend: pages, components, typed command bindings
   src-tauri/             Rust shell: Tauri commands, 2 s status monitor, log streaming
 crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight (no Tauri, unit-tested)
-  catalog.json           curated models pinned to Hugging Face commits
+  catalog.json           curated models pinned to Hugging Face commits; optional per-model
+                         edit_format and reasoning_parser (passed as EDIT_FORMAT, --reasoning-parser)
 docker/                  backend image: SGLang + gateway under supervisord (no agent code)
   server/gateway.py      TLS gateway: pairing, device tokens, admin API
 client/oppx/             client CLI: config.rs (paired servers, 0600 file), tls.rs (fingerprint pinning),
                          api.rs (gateway calls), main.rs (clap commands)
 scripts/publish-image.sh build and push the backend image to GHCR
+scripts/probe_routing.py score the search router and ask/edit check against the loaded model
 milestone.md             roadmap and progress
 ```
 

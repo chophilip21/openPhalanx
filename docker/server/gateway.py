@@ -7,7 +7,7 @@ SGLang inference server, which listens on the container's loopback only.
 Two listeners share one process (and therefore pairing/metrics state):
 
 * Public API (``AGENT_PORT``, TLS): ``/health`` and ``/v1/pair`` are open;
-  everything else (``/v1/whoami``, ``/v1/unpair`` and the OpenAI-compatible inference proxy,
+  everything else (``/v1/whoami``, ``/v1/info``, ``/v1/tokenize``, ``/v1/unpair`` and the OpenAI-compatible inference proxy,
   ``/v1/models`` and ``/v1/chat/completions``, and ``/v1/search``) needs a
   device token. Request bodies (prompts, i.e. client code) and search
   queries are never logged or stored.
@@ -60,6 +60,16 @@ STATE_DIR = Path(os.environ.get("STATE_DIR", "/state"))
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", str(4 * 1024 * 1024)))
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "").rstrip("/")
 CONTEXT_LENGTH = int(os.environ.get("CONTEXT_LENGTH") or 32768)
+# What clients are told about the model (set by the GUI from its catalog).
+def _model_id(path: str) -> str:
+    """A Hugging Face cache snapshot path reads better as its repo id."""
+    m = re.search(r"models--([^/]+?)--([^/]+)/snapshots/", path)
+    return f"{m.group(1)}/{m.group(2)}" if m else path
+
+
+MODEL_ID = os.environ.get("MODEL_ID") or _model_id(os.environ.get("MODEL_PATH", ""))
+EDIT_FORMAT = os.environ.get("EDIT_FORMAT", "diff")
+MAX_TOKENIZE_CHARS = 2_000_000
 
 # Safety bars. SGLang itself rejects over-length input cleanly and queues
 # overload (verified: 12 concurrent 20k-token requests all completed), so the
@@ -353,6 +363,36 @@ async def whoami(device: dict = Depends(require_device)) -> dict:
     """Lets a client confirm its token is still valid (e.g. `oppx status`)."""
     devices.touch(device)
     return {"device_id": device["id"], "device_name": device["name"], "model": MODEL_NAME}
+
+
+@app.get("/v1/info")
+async def info(device: dict = Depends(require_device)) -> dict:
+    """Which model this server runs and how clients should drive it, so the
+    client adapts to any model instead of assuming one."""
+    return {
+        "served_name": MODEL_NAME,
+        "model_id": MODEL_ID,
+        "context_length": CONTEXT_LENGTH,
+        "edit_format": EDIT_FORMAT,
+        "web_search": bool(SEARXNG_URL),
+        "ready": await sglang_ready(),
+    }
+
+
+class TokenizeRequest(BaseModel):
+    text: str = Field(max_length=MAX_TOKENIZE_CHARS)
+
+
+@app.post("/v1/tokenize")
+async def tokenize(req: TokenizeRequest, device: dict = Depends(require_device)) -> Response:
+    """Exact token count with the served model's own tokenizer (the client
+    calibrates its context budget with it)."""
+    try:
+        r = await upstream().post("/v1/tokenize", json={"model": MODEL_NAME, "prompt": req.text}, timeout=30)
+        r.raise_for_status()
+        return JSONResponse({"count": int(r.json()["count"])})
+    except (httpx.HTTPError, KeyError, ValueError):
+        return openai_error(503, "The model is still loading; try again shortly.", "service_unavailable")
 
 
 @app.post("/v1/unpair")

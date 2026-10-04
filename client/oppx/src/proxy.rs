@@ -63,7 +63,8 @@ impl Proxy {
         let app = Router::new()
             .route("/v1/models", get(forward))
             .route("/v1/chat/completions", post(forward))
-            .fallback(|| async { error(StatusCode::NOT_FOUND, "oppx proxy only serves /v1/models and /v1/chat/completions") })
+            .route("/v1/tokenize", post(forward))
+            .fallback(|| async { error(StatusCode::NOT_FOUND, "oppx proxy only serves /v1/models, /v1/chat/completions and /v1/tokenize") })
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(state);
         Ok(Proxy { addr, local_key, listener, app })

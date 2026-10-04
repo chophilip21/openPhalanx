@@ -412,9 +412,12 @@ async fn status(cfg: &Config, name: Option<&str>) -> Result<()> {
         Ok(_) => api::whoami(&client, &s.url, &s.token).await,
         Err(_) => Ok(None),
     };
-    let ctx = match (&health, &me) {
-        (Ok(h), Ok(Some(_))) if h.sglang == "ready" => api::context_len(&client, &s.url, &s.token).await.ok().flatten(),
-        _ => None,
+    let (ctx, info) = match (&health, &me) {
+        (Ok(h), Ok(Some(_))) if h.sglang == "ready" => match api::info(&client, &s.url, &s.token).await.ok().flatten() {
+            Some(i) => (Some(i.context_length), Some(i)),
+            None => (api::context_len(&client, &s.url, &s.token).await.ok().flatten(), None),
+        },
+        _ => (None, None),
     };
     sp.clear();
     let health = match health {
@@ -443,7 +446,8 @@ async fn status(cfg: &Config, name: Option<&str>) -> Result<()> {
     rows.push(ui::ok("device", format!("{} {}", me.device_name, ui::dim(format!("({})", me.device_id)))));
     rows.push(if health.sglang == "ready" {
         let ctx = ctx.map(|c| format!(" · {}k context", c / 1024)).unwrap_or_default();
-        ui::ok("model", format!("{} ready{ctx}", me.model))
+        let id = info.map(|i| format!(" {}", ui::dim(format!("({})", i.model_id)))).unwrap_or_default();
+        ui::ok("model", format!("{} ready{ctx}{id}", me.model))
     } else {
         ui::warn("model", "loading; try again in a minute")
     });
@@ -479,17 +483,24 @@ async fn unpair(cfg: &mut Config, name: Option<&str>, local_only: bool) -> Resul
 
 /// Confirms the server is usable before starting anything, and returns its
 /// model's context window.
-async fn preflight(name: &str, s: &Server) -> Result<u64> {
+/// What the session needs to know about the server's model.
+struct ModelInfo {
+    ctx: u64,
+    model_id: String,
+    edit_format: String,
+}
+
+async fn preflight(name: &str, s: &Server) -> Result<ModelInfo> {
     let sp = ui::spinner(format!("Checking {name}"));
     let result = preflight_inner(name, s).await;
     match &result {
-        Ok(ctx) => sp.done(format!("{name} ready · {}k context", ctx / 1024)),
+        Ok(m) => sp.done(format!("{name} ready · {} · {}k context", m.model_id, m.ctx / 1024)),
         Err(_) => sp.clear(),
     }
     result
 }
 
-async fn preflight_inner(name: &str, s: &Server) -> Result<u64> {
+async fn preflight_inner(name: &str, s: &Server) -> Result<ModelInfo> {
     let client = tls::pinned_client(&s.fingerprint)?;
     let health = match api::health(&client, &s.url).await {
         Ok(h) => h,
@@ -504,7 +515,12 @@ async fn preflight_inner(name: &str, s: &Server) -> Result<u64> {
     if health.sglang != "ready" {
         bail!("the model on \"{name}\" is still loading; try again in a minute (`oppx status` shows progress)");
     }
-    Ok(api::context_len(&client, &s.url, &s.token).await?.unwrap_or(32_768))
+    if let Some(i) = api::info(&client, &s.url, &s.token).await? {
+        return Ok(ModelInfo { ctx: i.context_length, model_id: i.model_id, edit_format: i.edit_format });
+    }
+    // Older server without /v1/info.
+    let ctx = api::context_len(&client, &s.url, &s.token).await?.unwrap_or(32_768);
+    Ok(ModelInfo { ctx, model_id: agent::AIDER_MODEL.trim_start_matches("openai/").into(), edit_format: "diff".into() })
 }
 
 async fn run_search(cfg: &Config, name: Option<&str>, query: &str, max: u8) -> Result<()> {
@@ -536,7 +552,7 @@ async fn run_search(cfg: &Config, name: Option<&str>, query: &str, max: u8) -> R
 
 async fn run_proxy(cfg: &Config, name: Option<&str>, port: u16, web: bool) -> Result<()> {
     let (name, s) = cfg.server(name)?;
-    let ctx = preflight(name, s).await?;
+    let info = preflight(name, s).await?;
     let proxy = Proxy::bind(s, port, web).await?;
     ui::panel(
         &format!("Proxy for {name}"),
@@ -544,9 +560,10 @@ async fn run_proxy(cfg: &Config, name: Option<&str>, port: u16, web: bool) -> Re
             format!("OPENAI_API_BASE={}", ui::accent(proxy.base_url())),
             format!("OPENAI_API_KEY={}", ui::accent(&proxy.local_key)),
             ui::dim(format!(
-                "model {} · {}k context · web search {}",
+                "model {} ({}) · {}k context · web search {}",
                 agent::AIDER_MODEL.trim_start_matches("openai/"),
-                ctx / 1024,
+                info.model_id,
+                info.ctx / 1024,
                 if web { "automatic" } else { "off" }
             )),
         ],
@@ -616,12 +633,13 @@ fn choose_session(root: &std::path::Path, choice: &SessionChoice) -> Result<(age
 
 fn ago(t: std::time::SystemTime) -> String {
     let secs = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-    match secs {
-        0..=59 => "  just now".into(),
-        60..=3599 => format!("{:>2} min ago", secs / 60),
-        3600..=86_399 => format!("{:>2} h ago", secs / 3600),
-        _ => format!("{:>2} d ago", secs / 86_400),
-    }
+    let text = match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{} min ago", secs / 60),
+        3600..=86_399 => format!("{} h ago", secs / 3600),
+        _ => format!("{} d ago", secs / 86_400),
+    };
+    format!("{text:>10}")
 }
 
 async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args: &[OsString]) -> Result<i32> {
@@ -632,8 +650,10 @@ async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args:
     if !launch.print {
         ui::banner();
     }
-    let ctx = preflight(name, s).await?;
+    let info = preflight(name, s).await?;
+    let ctx = info.ctx;
     let metadata = agent::model_metadata(ctx)?;
+    let settings = agent::model_settings(&info.edit_format)?;
     let cwd = std::env::current_dir()?;
     let repo = agent::repo_root(&cwd);
     let (history, restore) = choose_session(repo.as_deref().unwrap_or(&cwd), &launch.session)?;
@@ -647,7 +667,7 @@ async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args:
     let proxy = Proxy::bind(s, 0, web).await?;
     let (base, key) = (proxy.base_url(), proxy.local_key.clone());
     let serving = tokio::spawn(proxy.serve());
-    let args = agent::aider_args(metadata.path(), &history, restore, user_args);
+    let args = agent::aider_args(metadata.path(), settings.path(), &info.edit_format, &history, restore, user_args);
     let mut command = if classic {
         let search = if web { "web search on (--no-web to disable)" } else { "web search off: /run oppx search \"…\"" };
         eprintln!(
@@ -667,6 +687,7 @@ async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args:
             .args(&args)
             .env("OPPX_SERVER", name)
             .env("OPPX_CONTEXT", ctx.to_string())
+            .env("OPPX_MODEL_ID", &info.model_id)
             .env("OPPX_WEB", if web { "1" } else { "0" })
             .env("OPPX_VERSION", env!("CARGO_PKG_VERSION"))
             .env("OPPX_BIN", std::env::current_exe().unwrap_or_else(|_| "oppx".into()))

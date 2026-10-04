@@ -418,7 +418,7 @@
 
     * A real edit made 0 searches. The lifecycle routing checks still pass.
 
-* \[ \] **Step 4.6: CLI experience**
+* \[x\] **Step 4.6: CLI experience**
 
   * Requested by the user after the first second-machine test.
 
@@ -434,9 +434,9 @@
 
   * Also in this round: Aider must be installed with Python 3.12 or older. With 3.13 it crashes on a missing `audioop` module; this was found on the second desktop. The README, the `oppx` install hint and the troubleshooting table now say so.
 
-  * Previewed in a pty at 120 and 80 columns: the large and compact banners, the welcome screen, launching via plain `oppx`, and every panel line the same width. Still to do: the user's look on a real terminal before checking this off.
+  * Previewed in a pty at 120 and 80 columns: the large and compact banners, the welcome screen, launching via plain `oppx`, and every panel line the same width. ✅ The user checked it on a real terminal.
 
-* \[ \] **Step 4.7: OpenPhalanx chat frontend (Claude-style, Aider hidden)**
+* \[x\] **Step 4.7: OpenPhalanx chat frontend (Claude-style, Aider hidden)**
 
   * Requested by the user, with a performance requirement of no noticeable slowdown. A Python frontend on Aider's engine was chosen over a Rust agent (which would mean rebuilding the editing engine and risking edit quality) and over rewriting Aider's output in a pty (fragile).
 
@@ -458,9 +458,9 @@
 
   * **Aider pinned:** installs use `aider-chat==0.86.2` (Python 3.12), because the frontend relies on Aider internals.
 
-  * Remaining: the user's own look on a real terminal.
+  * ✅ The user checked it on a real terminal ("the Python frontend looks amazing, and web search works perfectly fine too").
 
-* \[ \] **Step 4.8: Claude Code parity, sessions and `oppx --update`**
+* \[x\] **Step 4.8: Claude Code parity, sessions and `oppx --update`**
 
   * Requested after the first real-terminal test, where the user reported that Ctrl-C couldn't close the session. The old prompt loop deliberately ignored Ctrl-C at the prompt.
 
@@ -492,9 +492,9 @@
 
     * Run again, it reports "Up to date".
 
-  * Remaining: the user's check on a real terminal.
+  * ✅ The user checked it on a real terminal.
 
-* \[ \] **Step 4.9: Smart context management and server safety bars**
+* \[x\] **Step 4.9: Smart context management and server safety bars**
 
   * **Problem:** on a real repo, "explain the project" built a **46k-token** request for a 32k model. With no files in the chat, Aider lets the repo map grow to about 28k tokens. The frontend then auto-accepted every file the model asked for, and Aider offered to "proceed anyway" with "providers won't charge", which is meaningless for a local server.
 
@@ -530,47 +530,148 @@
 
     * ✅ **Verified:** the user's exact request on the repo copy produced a 1-line README diff with 0 shell prompts. Called directly against the server, the whole-file retry inserted 2 lines into the fence-heavy README.
 
-  * Remaining: the user's check on a real terminal.
+  * **"Frozen" CLI fix** (user report: no thinking status, then the answer appeared all at once):
 
-* \[ \] **Step 4.10: Model-agnostic follow-ups** (principle in `CLAUDE.md`, from the user: everything must work across SGLang models)
+    * **Cause:** Aider's `show_pretty()` turns off streaming *and* its spinner when the edit fence isn't plain triple backticks, which happens whenever a Markdown file with code blocks is in the chat. The steps before the first token (classification, repo map, context fitting) also had no indicator.
 
-  * **Edit format per model:** a catalog field (`edit_format`, e.g. `whole` for small models) instead of the hard-coded `diff`, passed through `oppx` from the server's model information.
+    * **Fix:** one spinner for the whole turn; streaming always on; edit-block hiding for every fence style. The picker's age column is aligned too.
 
-  * **Reasoning models** (`<think>` output): pick SGLang's reasoning parser from catalog data, with a generic fallback that strips think blocks.
+    * ✅ **Verified** with `README.md` and `CLAUDE.md` in the chat, which forces a different fence: 73 spinner frames over the 8 s before the first token, a streamed answer (6 progressive redraws), and an edit applied with a correct 1-line diff and 0 raw edit markers on screen.
 
-  * **Probe harness:** score the web-search router and the ask/edit classifier against whatever model is loaded (the 16 and 14 probes used so far), so a model that is bad at them is caught without code changes.
+  * ✅ The user checked it on a real terminal.
 
-  * **Exact token counts:** optionally count with the server's tokenizer instead of Aider's approximation, which would allow a smaller margin.
+* \[x\] **Step 4.10: Model-agnostic follow-ups** (principle in `CLAUDE.md`, from the user: everything must work across SGLang models)
 
-## Phase 5: End-to-End Validation & Caching Benchmark
+  * **Per-model data lives in the catalog, not in code.** `catalog.json` entries can set `edit_format` (default `diff`; e.g. `whole` for small models) and `reasoning_parser` (SGLang's `--reasoning-parser`, for models that think in `<think>` tags). The GUI passes them to the backend as `MODEL_ID`, `EDIT_FORMAT` and `SGLANG_EXTRA_ARGS`.
 
-* \[ \] **Step 5.1: Test Simple File Edit**
+  * **The server describes its model:** new `GET /v1/info` (device token) returns the served name, the real model id, context length, edit format, web search and readiness. A model started by hand shows its Hugging Face id even when `MODEL_PATH` is a cache snapshot path.
 
-  * From a paired client machine, in a git repo:
+  * **`oppx` uses it:**
+
+    * The startup line, `oppx status`, `oppx proxy` and the chat's welcome box, status bar and `/status` show the real model (e.g. `Qwen/Qwen2.5-Coder-14B-Instruct-AWQ`). This also answers the user's request for a way to see which model the server runs.
+
+    * Aider gets a `--model-settings-file` with the server's edit format and `use_repo_map: true`. Aider would otherwise fall back to `whole` and no repo map for our unknown model name. `--edit-format` still overrides it.
+
+    * Older servers without `/v1/info` still work, with the previous defaults.
+
+  * **Reasoning output is hidden:** `<think>…</think>` spans, a stray closing `</think>` (when the chat template opens the tag), and Aider's "► THINKING … ► ANSWER" markers are removed from the display. The spinner keeps running while the model reasons.
+
+  * **Exact token counts:** new `POST /v1/tokenize` (gateway, through the `oppx` proxy) counts with the loaded model's own tokenizer. After each answer the frontend measures the request it just sent, in the background, and keeps a running ratio of real tokens to Aider's estimate. The safety factor drops from a fixed 1.10 to that ratio × 1.03.
+
+  * **Probe harness:** `scripts/probe_routing.py` scores the web-search router (16 probes) and the ask/edit check (14 probes) against any OpenAI-compatible endpoint. It reads the prompts from the shipped files and exits non-zero below 90%.
+
+  * ✅ **Verified** after rebuilding the image and restarting through the lifecycle example (SGLang ready in 201 s, all lifecycle checks pass):
+
+    * `/v1/info` reports `Qwen/Qwen2.5-Coder-14B-Instruct-AWQ`, `diff`, 32k. `oppx status`, `oppx proxy` and a `-p` session show it.
+
+    * `/v1/tokenize` through the proxy: 13,972 tokens for `oppx_chat.py` in 32 ms.
+
+    * Aider's estimate is within 0.5–1.4% of the real count on four repo files. Calibration measured a ratio of 1.011, so the context budget went from 26,065 to 27,541 tokens.
+
+    * Probe harness on Qwen2.5-Coder-14B-AWQ: router 16/16 (median 45 ms), intent check 14/14 (median 41 ms).
+
+    * Reasoning hiding was checked on complete, unfinished and template-opened think blocks, and on Aider's markers; plain answers are untouched. It hasn't been tried on a real reasoning model yet (Step 5.3).
+
+## Phase 5: Validation, Model Matrix & Distribution
+
+Phase 4 delivered the whole client experience, so the original 5.1/5.2 (`oppx aider --message` smoke tests) are out of date. Phase 5 now proves the system in real conditions, across models, and makes it installable by people who aren't us.
+
+* \[ \] **Step 5.1: End-to-end validation from a separate laptop**
+
+  * The user's laptop (`philip-Victus-…`) has been running real sessions against this server since Step 4.6. What's left is a written checklist run on a clean machine, with results recorded here:
+
+    * a fresh install with only the documented steps, then pairing, `oppx status`, and a first session in a real repo;
+
+    * a question, a multi-file edit, a test run with `!cmd`, `/undo`, Esc and Ctrl-C, `-c` and `-r`;
+
+    * web search on and off (`--no-web`);
+
+    * revoking the device in the GUI mid-session, then a clear error on the next request;
+
+    * a server restart mid-session, then recovery without re-pairing.
+
+  * Compare latency with the benchmark in `CLAUDE.md` ("Design decision: agent on the client").
+
+* \[ \] **Step 5.2: Multi-turn prefix-cache benchmark**
+
+  * Script a 10-turn Aider-sized session (questions and edits on this repo) and record, per turn: prompt tokens, cached tokens (`#cached-token` in the SGLang log, or the GUI's "Prefix cache hit"), time to first token, and tokens/s.
+
+  * **New since Step 4.9:** the context manager changes the prompt (summarizing, setting files aside, shrinking the repo map), and every change breaks the cached prefix from that point on. Measure how often that happens. If it costs much, make fitting more stable, e.g. shrink in larger steps less often, or keep the repo map size fixed for a session once it fits.
+
+* \[ \] **Step 5.3: Model matrix**
+
+  * For every catalog model that fits a 24 GB card at 32k (and a reasoning model, to exercise `reasoning_parser` and the think-block hiding):
+
+    * `scripts/probe_routing.py` (router and intent check; at least 90% each);
+
+    * a fixed edit task in `diff` and in `whole` format, to choose each model's `edit_format` for the catalog;
+
+    * tokenizer ratio (from the calibration), tokens/s and time to first token.
+
+  * Record the results in a table here. Fix weak spots with prompt changes that are re-checked on every model, never with a parser for one model.
+
+* \[ \] **Step 5.4: Server GUI review and hardening** (Step 3.2 is still open)
+
+  * The user's first visual review of every page: Server, Models, Devices and Logs.
+
+  * Show the new data: the real model id, per-device concurrency and rate-limit hits (`429`/`503` counts), and the web-search toggle state.
+
+  * Error paths: Docker stopped, GPU busy, a failed download, a port in use, a revoked device.
+
+* \[ \] **Step 5.5: Distribution and CI/CD pipeline**
+
+  * **Requirements, from the user:**
+
+    > We need to package this up and distribute both server and client. Refer to how others distribute packages via `curl` and etc. End-user should not have to install aider-chat, and other dependencies by himself.
+    > Build CI/CD pipeline via github actions, and bump version. Versions gets determined by scale (bug, feature, major level), and by PR header (e.g "[bug]Fix ABCD" 0.0.1-> 0.0.2, or "[FEATURE]ASDFF" which would change to 0.1.2)
+    > We need automatic documentation generator upon new releases.
+
+  * **Client install, one line** (like `rustup`, `uv` and Ollama):
 
     ```bash
-    oppx aider --message "Create a basic HTTP server in main.py using FastAPI"
+    curl -fsSL https://<release host>/install.sh | sh
     ```
 
-  * Confirm that the edit lands in the local working tree, uncommitted, that local tests can be run with `/run`, and compare latency with the benchmark in "Architecture decision".
+    * The script detects the OS and architecture (Linux x86-64/arm64, macOS arm64/x86-64; Windows via PowerShell `irm … | iex` later), downloads the prebuilt `oppx` from the GitHub release, checks its SHA-256, and installs it to `~/.local/bin`.
 
-* \[ \] **Step 5.2: Test RadixAttention Context Caching**
+    * **No manual Aider install:** on first run (and in the installer), `oppx` sets up its own engine with a bundled or downloaded `uv`: a private Python 3.12 environment with `aider-chat==0.86.2` in `~/.local/share/oppx/engine`. It uses that instead of a global `aider`, so the user's Python setup can't break it (the Python 3.13 `audioop` problem goes away).
 
-  * Execute a multi-turn modification task.
+    * **`oppx --update`** switches from "git pull and rebuild" to "download the latest release binary, verify it, replace yourself, then sync the engine". The git mode stays for source checkouts.
 
-  * Verify high prefix-cache hit rates on later turns with the GUI's "Prefix cache hit" stat, or in `docker logs -f openphalanx-backend` (`#cached-token`).
+  * **Server install:**
 
-* \[ \] **Step 5.3: Distribution and CI/CD pipeline**
+    * The GUI as `.deb` and AppImage attached to each release, plus an `install.sh` for the server that checks the NVIDIA driver, Docker and the Container Toolkit, and installs the `.deb`.
 
-- We need to package this up and distribute both server and client. Refer to how others distribute packages via `curl` and etc. End-user should not have to install aider-chat, and other dependencies by himself. 
-- Build CI/CD pipeline via github actions, and bump version. Versions gets determined by scale (bug, feature, major level), and by PR header (e.g "[bug]Fix ABCD" 0.0.1-> 0.0.2, or "[FEATURE]ASDFF" which would change to 0.1.2) 
-- We need automatic documentation generator upon new releases.
+    * The backend image pushed to GHCR (public) with the release version. The 0.2.0 image is built locally but not pushed yet.
 
+  * **CI (every PR, GitHub Actions):** `cargo test`, `cargo clippy -D warnings`, `npm run check`, Python syntax and lint for the gateway and frontend, and a check that the PR title has a valid prefix. The GPU lifecycle test stays manual, or runs on a self-hosted runner on the server node later.
+
+  * **Versioning (on merge to `main`):** the PR title prefix decides the bump, case-insensitive:
+
+    | Prefix | Bump | Example |
+    |---|---|---|
+    | `[bug]` / `[fix]` | patch | 0.2.0 → 0.2.1 |
+    | `[feature]` | minor | 0.2.1 → 0.3.0 |
+    | `[major]` / `[breaking]` | major | 0.3.0 → 1.0.0 |
+
+    * A minor bump resets the patch number (standard semver: `[FEATURE]` on 0.0.2 gives 0.1.0). Confirmed with the user.
+
+    * The workflow bumps `Cargo.toml`, `app/package.json` and `app/src-tauri/tauri.conf.json` together (the rule in `CLAUDE.md`), commits, tags `vX.Y.Z`, and starts the release.
+
+  * **Release workflow (on a tag):** build `oppx` for each target, the `.deb`/AppImage and the backend image; push the image to GHCR; create the GitHub release with binaries, checksums and the install scripts.
+
+  * **Docs generated on release:**
+
+    * Release notes and `CHANGELOG.md` from the merged PR titles, grouped by prefix.
+
+    * A CLI reference generated from `oppx --help` (clap), and the gateway API reference from FastAPI's OpenAPI schema.
+
+    * Published with the user docs to GitHub Pages (e.g. mdBook), so the site always matches the latest release.
 
 ## Future Improvement
 
 1. Optimization work for speed and security. 
-2. Implement sessions that can be resumed, and make sure we are doing context summarization, etc. 
+2. ~~Implement sessions that can be resumed, and make sure we are doing context summarization, etc.~~ Done in Steps 4.8 (sessions, `-c`/`-r`) and 4.9 (auto-compaction and context fitting). 
 3. Another important feature that deserves its own section. right now, our codebase assumes there is one server, and N possible clients. But this is not only the case. There can be N servers that can distribute the workload, and load one large model in a distributed way. And we can also imagine multiple clients, that points at cluster of nodes. 
 
 Scaling from a single GPU workstation to a cluster of nodes handling multiple concurrent clients is the exact use case that frameworks like SGLang and vLLM were built to solve for enterprise deployments.To achieve this, the architecture splits into two distinct problems: distributing the model (across N servers) and distributing the traffic (routing N clients).Here is exactly how this is handled in modern LLM infrastructure.Part 1: Distributing One Large Model Across N ServersIf a model is too large to fit on a single machine (e.g., a 70B parameter model or massive Mixture-of-Experts like DeepSeek), you cluster multiple physical servers together. SGLang supports this natively using Ray and NCCL (NVIDIA Collective Communications Library).Tensor Parallelism (TP) & Pipeline Parallelism (PP):TP slices individual matrix math operations across multiple GPUs. If those GPUs are on different servers, SGLang uses Ray to coordinate them over the network.PP slices the model vertically. Server A handles layers 1–20, and Server B handles layers 21–40. Server A computes the first half and passes the intermediate tensors over the network to Server B to finish.   Prefill/Decode (PD) Disaggregation:This is a highly advanced SGLang feature for clusters. You designate some servers strictly as "Prefill nodes" (their only job is reading massive codebases/prompts) and other servers as "Decode nodes" (their only job is generating the output tokens). Once a Prefill node processes an Aider Repo Map, it transfers the KV cache over the network to the Decode node to stream the answer.   Note: Splitting a single model across multiple physical machines requires extremely fast networking (e.g., InfiniBand or 400GbE RoCE). Standard Gigabit Ethernet is too slow for Tensor Parallelism between physical servers.Part 2: Routing N Clients to N Servers (Load Balancing)If you simply want to increase your capacity to handle many developers (N clients) at once, you run identical copies of your model across multiple independent servers (Data Parallelism).To the clients, there should only ever be one API endpoint. You accomplish this using a router.The SGLang Model Gateway (Router):SGLang has a built-in router (sglang-router) that sits in front of all your GPU servers. You launch your GPU workers, and then launch the router on a head node.   Bashpython -m sglang_router.launch_server --host 0.0.0.0 --port 30000 --dp-size 4

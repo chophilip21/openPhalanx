@@ -28,6 +28,13 @@ pub struct CatalogEntry {
     pub min_compute_capability: Option<f32>,
     #[serde(default)]
     pub notes: Option<String>,
+    /// Edit format the coding agent should use with this model ("diff",
+    /// "whole", "udiff"…); `None` means the default ("diff").
+    #[serde(default)]
+    pub edit_format: Option<String>,
+    /// SGLang `--reasoning-parser` for models that emit thinking blocks.
+    #[serde(default)]
+    pub reasoning_parser: Option<String>,
 }
 
 impl CatalogEntry {

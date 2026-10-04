@@ -178,6 +178,10 @@ pub struct RunSpec {
     pub admin_token: String,
     /// Point the gateway at the SearXNG container.
     pub web_search: bool,
+    /// What clients are told about the model (GET /v1/info).
+    pub model_id: String,
+    pub edit_format: String,
+    pub reasoning_parser: Option<String>,
 }
 
 pub fn run_args(spec: &RunSpec) -> Vec<String> {
@@ -223,6 +227,14 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
     if spec.web_search {
         a.push("-e".into());
         a.push(format!("SEARXNG_URL={SEARXNG_INTERNAL_URL}"));
+    }
+    for (k, v) in [("MODEL_ID", spec.model_id.clone()), ("EDIT_FORMAT", spec.edit_format.clone())] {
+        a.push("-e".into());
+        a.push(format!("{k}={v}"));
+    }
+    if let Some(parser) = &spec.reasoning_parser {
+        a.push("-e".into());
+        a.push(format!("SGLANG_EXTRA_ARGS=--reasoning-parser {parser}"));
     }
     a.push(spec.image.clone());
     a
@@ -362,6 +374,9 @@ mod tests {
             state_dir: "/s".into(),
             admin_token: "secret".into(),
             web_search: true,
+            model_id: "Qwen/X".into(),
+            edit_format: "diff".into(),
+            reasoning_parser: Some("qwen3".into()),
         };
         let a = run_args(&spec).join(" ");
         assert!(a.contains("-p 9090:9090"));
@@ -371,6 +386,8 @@ mod tests {
         assert!(a.contains("-e HF_HUB_OFFLINE=1"));
         assert!(a.contains("--network openphalanx"));
         assert!(a.contains("-e SEARXNG_URL=http://openphalanx-searxng:8080"));
+        assert!(a.contains("-e MODEL_ID=Qwen/X") && a.contains("-e EDIT_FORMAT=diff"));
+        assert!(a.contains("-e SGLANG_EXTRA_ARGS=--reasoning-parser qwen3"));
         assert!(a.ends_with(DEFAULT_IMAGE));
     }
 

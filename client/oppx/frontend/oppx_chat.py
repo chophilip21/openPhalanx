@@ -10,7 +10,8 @@ every prompt and every confirmation goes through this file.
 Keys and commands follow Claude Code, so people can switch without relearning.
 
 Environment from oppx: OPENAI_API_BASE / OPENAI_API_KEY (the loopback proxy),
-OPPX_SERVER, OPPX_CONTEXT, OPPX_WEB ("1"/"0"), OPPX_VERSION, OPPX_BIN,
+OPPX_SERVER, OPPX_CONTEXT, OPPX_MODEL_ID (what the server runs), OPPX_WEB
+("1"/"0"), OPPX_VERSION, OPPX_BIN,
 OPPX_INITIAL (a first prompt) and OPPX_PRINT ("1": answer once and exit).
 """
 
@@ -61,7 +62,9 @@ WEB = os.environ.get("OPPX_WEB", "1") == "1"
 VERSION = os.environ.get("OPPX_VERSION", "")
 OPPX_BIN = os.environ.get("OPPX_BIN", "oppx")
 PRINT_MODE = os.environ.get("OPPX_PRINT") == "1"
-MODEL_LABEL = "openphalanx-coder"
+MODEL_LABEL = "openphalanx-coder"  # the name the gateway serves any model under
+# What the server actually runs (a Hugging Face id or a path); shown to the user.
+MODEL_NAME = os.environ.get("OPPX_MODEL_ID", "").rstrip("/").rsplit("/", 1)[-1] or MODEL_LABEL
 MEMORY_FILE = "OPENPHALANX.md"  # our CLAUDE.md
 EXTRA_MEMORY = ("AGENTS.md",)  # read too when present
 
@@ -123,8 +126,13 @@ SUPPRESS = [
 ]
 
 
+OUT_LOCK = threading.RLock()
+
+
 def out(markup: str) -> None:
-    console.print(markup, soft_wrap=False)
+    with OUT_LOCK:
+        SPIN.clear_line()
+        console.print(markup, soft_wrap=False)
 
 
 def step(markup: str, color: str = MUTED) -> None:
@@ -141,7 +149,11 @@ def headline(markup: str, color: str = ACCENT) -> None:
 # ---------------------------------------------------------------------------
 
 OUTPUT_RESERVE = 4096  # room left for the model's answer
-TOKEN_MARGIN = 0.10  # Aider counts with a generic tokenizer; Qwen's differs a little
+# Aider counts tokens with a generic tokenizer, so its estimates are scaled by
+# a factor: a safe guess until the server's own tokenizer has measured the
+# real ratio (after the first answer), then that ratio plus a little slack.
+UNCALIBRATED_FACTOR = 1.10
+CALIBRATED_SLACK = 1.03
 MAP_MAX, MAP_MIN = 8192, 1024  # repo map share of the budget (Aider alone allows ~28k)
 # File priorities: higher stays longer.
 PRI_MODEL, PRI_USER, PRI_EDITED = 1, 2, 3
@@ -157,11 +169,50 @@ class ContextManager:
     The current turn's files are never set aside."""
 
     def __init__(self):
-        self.budget = int((CONTEXT - OUTPUT_RESERVE) / (1 + TOKEN_MARGIN))
+        self.ratio = None  # server tokens / Aider's estimate, measured
         self.turn = 0
         self.files = {}  # abs path -> [priority, last turn used]
         self.used = 0  # tokens of the last request, for the status bar
         self.notes = []  # what was done to make room this turn
+
+    @property
+    def factor(self) -> float:
+        if self.ratio is None:
+            return UNCALIBRATED_FACTOR
+        return self.ratio * CALIBRATED_SLACK
+
+    @property
+    def budget(self) -> int:
+        return int((CONTEXT - OUTPUT_RESERVE) / self.factor)
+
+    def calibrate(self, coder):
+        """Measures the request we just sent with the server's tokenizer, in
+        the background, so the budget matches whatever model is loaded."""
+        base, key = os.environ.get("OPENAI_API_BASE"), os.environ.get("OPENAI_API_KEY")
+        if not base or not key:
+            return
+        try:
+            text = "\n".join(str(m.get("content") or "") for m in _orig_format_messages(coder).all_messages())
+            text = text[-1_000_000:]
+            estimate = coder.main_model.token_count(text)
+        except Exception:  # noqa: BLE001 - calibration is best effort
+            return
+        if estimate < 500:
+            return  # too little text for a stable ratio
+
+        def run():
+            try:
+                r = httpx.post(f"{base}/tokenize", headers={"Authorization": f"Bearer {key}"},
+                               json={"text": text}, timeout=20)
+                count = r.json()["count"] if r.status_code == 200 else None
+            except Exception:  # noqa: BLE001 - older server or network: keep the guess
+                return
+            if not count:
+                return
+            ratio = min(max(count / estimate, 0.7), 1.5)
+            self.ratio = ratio if self.ratio is None else 0.5 * self.ratio + 0.5 * ratio
+
+        threading.Thread(target=run, daemon=True).start()
 
     def note(self, abs_path: str, priority: int):
         cur = self.files.get(abs_path)
@@ -190,6 +241,7 @@ class ContextManager:
             self.used = _raw_tokens(coder)
         except Exception:  # noqa: BLE001 - only feeds the status bar
             pass
+        self.calibrate(coder)
 
     def file_tokens(self, coder, rel: str) -> int:
         try:
@@ -230,8 +282,9 @@ class ContextManager:
             if not compacted and history > 1024:
                 compacted = True
                 before = history
-                with Thinking():
+                with Thinking(label="Compacting conversation"):
                     coder.done_messages = coder.summarizer.summarize_all(coder.done_messages)
+                SPIN.start()  # keep showing progress until the answer streams
                 after = coder.main_model.token_count(coder.done_messages)
                 self.notes.append(f"summarized the conversation ({before:,} → {after:,} tokens)")
             elif cands := self._droppable(coder, PRI_MODEL):
@@ -278,7 +331,7 @@ def _check_tokens(self, messages):
     """Final guard (replaces Aider's "proceed anyway?"): never send a request
     that can't fit; the server would reject it anyway."""
     n = self.main_model.token_count(messages)
-    if n * (1 + TOKEN_MARGIN) <= CONTEXT - 512:
+    if n * CONTEXT_MGR.factor <= CONTEXT - 512:
         return True
     step(f"This request needs about {n:,} tokens, more than the model's {CONTEXT:,}-token context "
          "even after making room. Drop files (/drop) or split the request.", RED)
@@ -475,6 +528,7 @@ class OppxIO(InputOutput):
     def assistant_output(self, message, pretty=None):
         if UI.quiet:
             return
+        SPIN.stop()
         if not message:
             step("The model returned an empty response.", YELLOW)
             return
@@ -512,6 +566,7 @@ class OppxIO(InputOutput):
     def _ask_line(self, message: str) -> str:
         if PRINT_MODE:
             return ""  # never block a one-shot run on a question
+        SPIN.stop()
         if WATCHER:
             WATCHER.pause()
         try:
@@ -567,7 +622,7 @@ class OppxIO(InputOutput):
         used = f"context {min(99, round(100 * CONTEXT_MGR.used / CONTEXT))}% · " if CONTEXT_MGR.used else ""
         mode = "<plan>⏸ plan mode on</plan> (shift+tab to cycle) · " if UI.plan_mode else "? for shortcuts · "
         return HTML(
-            f" {mode}{used}<b>{SERVER}</b> · {MODEL_LABEL} · {CONTEXT // 1024}k context · {web} · "
+            f" {mode}{used}<b>{SERVER}</b> · {MODEL_NAME} · {CONTEXT // 1024}k context · {web} · "
             f'{files} file{"s" if files != 1 else ""} in chat'
         )
 
@@ -668,13 +723,36 @@ class BulletStream(MarkdownStream):
     def update(self, text, final=False):
         if UI.quiet:
             return
+        text = hide_reasoning(text)
+        if not text.strip() and not final:
+            return  # still reasoning: keep the spinner going
+        SPIN.stop()
         text = re.sub(r"\*?SEARCH/REPLACE\*? blocks?", "edit", hide_edit_blocks(text))
         super().update(_bullet(text), final)
 
 
-_FENCE_BLOCK = re.compile(
-    r"(?ms)^[^\n`]*\n?```[^\n]*\n<<<<<<< SEARCH\n.*?^>>>>>>> REPLACE[^\n]*\n```[^\n]*\n?"
+# Reasoning models think before answering. Aider rewrites the model's
+# reasoning tag (from the catalog, `think` by default) into these markers;
+# raw tags are handled too, in case a model's template opens the tag itself.
+_REASONING = re.compile(
+    r"(?s)(?:-+\n► \*\*THINKING\*\*.*?(?:-+\n► \*\*ANSWER\*\*\s*|$)|<think(?:ing)?>.*?(?:</think(?:ing)?>\s*|$))"
 )
+
+
+def hide_reasoning(text: str) -> str:
+    if "</think>" in text and "<think>" not in text:
+        text = text.split("</think>", 1)[1]
+    return _REASONING.sub("", text).lstrip("\n")
+
+
+# Aider picks ```, ````, <source>, <code>, <pre>, <codeblock> or <sourcecode>
+# fences depending on what the files in the chat contain.
+_OPEN = r"(?:`{3,}[^\n]*|<(?:source|code|pre|codeblock|sourcecode)>[^\n]*)"
+_CLOSE = r"(?:`{3,}|</(?:source|code|pre|codeblock|sourcecode)>)"
+_FENCE_BLOCK = re.compile(
+    rf"(?ms)^[^\n`<]*\n?{_OPEN}\n<<<<<<< SEARCH\n.*?^>>>>>>> REPLACE[^\n]*\n{_CLOSE}[^\n]*\n?"
+)
+_OPEN_LINE = re.compile(rf"^{_OPEN}$")
 _MARKER = "<<<<<<< SEARCH"
 
 
@@ -684,7 +762,7 @@ def hide_edit_blocks(text: str) -> str:
     text = _FENCE_BLOCK.sub("", text)
     lines = text.split("\n")
     for i, line in enumerate(lines):
-        if not line.startswith("```"):
+        if not _OPEN_LINE.match(line):
             continue
         rest = "\n".join(lines[i + 1 :])
         if rest.startswith(_MARKER) or (rest and _MARKER.startswith(rest)) or (not rest and i == len(lines) - 1):
@@ -704,39 +782,80 @@ def _bullet(text: str) -> str:
     return f"{BULLET} {t}"
 
 
-class Thinking:
-    """Replaces Aider's "Waiting for <model>" spinner."""
+class TurnSpinner:
+    """One Claude-style "✻ Thinking… (12s · esc to interrupt)" line for the
+    whole turn: from Enter until the answer starts streaming, and again
+    whenever we wait (edits being applied, a follow-up request, compaction).
+    Anything printed clears the line first (see out()); the spinner redraws
+    on its next tick."""
 
     FRAMES = "·✢✳✶✻✽✻✶✳✢"
     WORDS = ("Thinking", "Reading", "Working", "Considering")
 
-    def __init__(self, text: str = "", delay: float = 0.12):
+    def __init__(self, delay: float = 0.12):
         self.delay = delay
-        self._stop = threading.Event()
+        self.label = None  # fixed label, or None for the rotating words
+        self._active = threading.Event()
+        self._drawn = False
+        self._turn_start = time.time()
         self._thread = threading.Thread(target=self._spin, daemon=True)
-        self._start = time.time()
+        self._thread.start()
+
+    def begin_turn(self):
+        self._turn_start = time.time()
+        self.start()
+
+    def start(self, label: str | None = None):
+        if PRINT_MODE or not sys.stdout.isatty():
+            return
+        self.label = label
+        self._active.set()
+
+    def stop(self):
+        self._active.clear()
+        with OUT_LOCK:
+            self.clear_line()
+
+    def clear_line(self):
+        if self._drawn:
+            sys.stdout.write("\r\x1b[2K")
+            sys.stdout.flush()
+            self._drawn = False
 
     def _spin(self):
         i = 0
-        while not self._stop.is_set():
-            secs = int(time.time() - self._start)
-            word = self.WORDS[(secs // 6) % len(self.WORDS)]
-            frame = self.FRAMES[i % len(self.FRAMES)]
-            sys.stdout.write(f"\r\x1b[2K\x1b[38;2;94;234;212m{frame}\x1b[0m {word}… \x1b[2m({secs}s · esc to interrupt)\x1b[0m")
-            sys.stdout.flush()
+        while True:
+            self._active.wait()
+            with OUT_LOCK:
+                if self._active.is_set():
+                    secs = int(time.time() - self._turn_start)
+                    word = self.label or self.WORDS[(secs // 6) % len(self.WORDS)]
+                    frame = self.FRAMES[i % len(self.FRAMES)]
+                    sys.stdout.write(
+                        f"\r\x1b[2K\x1b[38;2;94;234;212m{frame}\x1b[0m {word}… "
+                        f"\x1b[2m({secs}s · esc to interrupt)\x1b[0m"
+                    )
+                    sys.stdout.flush()
+                    self._drawn = True
             i += 1
-            self._stop.wait(self.delay)
-        sys.stdout.write("\r\x1b[2K")
-        sys.stdout.flush()
+            time.sleep(self.delay)
+
+
+SPIN = TurnSpinner()
+
+
+class Thinking:
+    """Stands in for Aider's "Waiting for <model>" spinner (and wraps our own
+    waits): start/stop drive the shared turn spinner."""
+
+    def __init__(self, text: str = "", label: str | None = None, **_):
+        self.label = label
 
     def start(self):
-        if not PRINT_MODE:
-            self._thread.start()
+        SPIN.start(self.label)
 
     def stop(self):
-        self._stop.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=1)
+        SPIN.stop()
 
     def __enter__(self):
         self.start()
@@ -849,7 +968,7 @@ def show_status(coder):
     headline("[bold]Status[/]")
     rows = [
         ("server", f"{SERVER}"),
-        ("model", f"{MODEL_LABEL} · {CONTEXT // 1024}k context"),
+        ("model", f"{MODEL_NAME} · {CONTEXT // 1024}k context"),
         ("web search", "on" if WEB else "off (oppx without --no-web turns it on)"),
         ("mode", "plan (no edits)" if UI.plan_mode else "default (edits applied, never committed)"),
         ("files in chat", ", ".join(coder.get_inchat_relative_files()) or "none"),
@@ -908,7 +1027,7 @@ def compact(coder, instructions: str):
     if not coder.done_messages:
         step("Nothing to compact yet.")
         return
-    with Thinking():
+    with Thinking(label="Compacting conversation"):
         coder.done_messages = coder.summarizer.summarize_all(coder.done_messages)
     after = coder.main_model.token_count(coder.done_messages)
     CONTEXT_MGR.used = _raw_tokens(coder)
@@ -1069,7 +1188,7 @@ def translate(coder, text: str):
     elif name == "/status":
         show_status(coder)
     elif name == "/model":
-        headline(f"[bold]{MODEL_LABEL}[/] · {CONTEXT // 1024}k context on {escape(SERVER)}")
+        headline(f"[bold]{MODEL_NAME}[/] · {CONTEXT // 1024}k context on {escape(SERVER)}")
         step("The model is chosen on the server, in the OpenPhalanx app's Models page.")
     elif name == "/doctor":
         subprocess.call([OPPX_BIN, "status"])
@@ -1117,6 +1236,11 @@ def build_coder(argv):
     base_coder.Coder.keyboard_interrupt = _interrupted
     base_coder.Coder.format_messages = _fitted_format_messages
     base_coder.Coder.check_tokens = _check_tokens
+    # Aider stops streaming (and its spinner) whenever it picks a non-```
+    # fence, e.g. when a Markdown file with code blocks is in the chat; the
+    # answer then appears all at once after a long silence. Our renderer
+    # handles every fence, so always stream.
+    base_coder.Coder.show_pretty = lambda self: True
     coder = aider_main.main(argv, return_coder=True)
     # main() installs the engine's crash reporter; errors are ours to report.
     sys.excepthook = sys.__excepthook__
@@ -1135,7 +1259,7 @@ def welcome(coder):
         f"  [{MUTED}]/help for help, /status for your current setup[/]",
         "",
         f"  [{MUTED}]cwd:[/] {escape(cwd)}",
-        f"  [{MUTED}]server:[/] {escape(SERVER)} · {MODEL_LABEL} · {CONTEXT // 1024}k context · web search {web}",
+        f"  [{MUTED}]server:[/] {escape(SERVER)} · {MODEL_NAME} · {CONTEXT // 1024}k context · web search {web}",
     ]
     if memory:
         lines.append(f"  [{MUTED}]memory:[/] {escape(', '.join(memory))}")
@@ -1265,13 +1389,16 @@ def run(argv) -> int:
                 break
         if not text:
             continue
+        SPIN.begin_turn()  # visible from Enter on (classification, repo map, context, model)
         try:
             text = translate(coder, text)
         except EOFError:
+            SPIN.stop()
             break
         if text:
             coder = run_turn(coder, text)
             load_memory(coder)  # picks up OPENPHALANX.md right after /init
+        SPIN.stop()
         print()
     out(f"[{MUTED}]Bye. Your changes are in the working tree; review them with git diff.[/]")
     return 0

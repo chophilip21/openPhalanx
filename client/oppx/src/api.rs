@@ -125,3 +125,24 @@ pub async fn search(client: &reqwest::Client, url: &str, token: &str, query: &st
         _ => bail!("search failed: {}", detail(resp).await),
     }
 }
+
+/// What the server says about its model (GET /v1/info).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerInfo {
+    pub served_name: String,
+    pub model_id: String,
+    pub context_length: u64,
+    pub edit_format: String,
+    pub web_search: bool,
+    pub ready: bool,
+}
+
+/// `Ok(None)` for servers older than /v1/info.
+pub async fn info(client: &reqwest::Client, url: &str, token: &str) -> Result<Option<ServerInfo>> {
+    let resp = client.get(format!("{url}/v1/info")).bearer_auth(token).timeout(TIMEOUT).send().await?;
+    match resp.status() {
+        StatusCode::OK => Ok(Some(resp.json().await?)),
+        StatusCode::NOT_FOUND => Ok(None),
+        _ => bail!("info failed: {}", detail(resp).await),
+    }
+}
