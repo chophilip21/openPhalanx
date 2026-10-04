@@ -1,0 +1,548 @@
+[
+  {
+    "id": "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+    "revision": "8e8ed243bbe6f9a5aff549a0924562fc719b2b8a",
+    "name": "Qwen2.5 Coder 7B Instruct",
+    "family": "Qwen",
+    "params": "7.6B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 5570829760,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "released": "2024-09-20",
+    "arch": {
+      "kv_layers": 28,
+      "kv_heads": 4,
+      "head_dim": 128
+    }
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "revision": "c03e6d358207e414f1eca0bb1891e29f1db0e242",
+    "name": "Qwen2.5 Coder 7B Instruct",
+    "family": "Qwen",
+    "params": "7.6B",
+    "quant": "BF16",
+    "weight_bytes": 15231271864,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "released": "2024-09-17",
+    "arch": {
+      "kv_layers": 28,
+      "kv_heads": 4,
+      "head_dim": 128
+    }
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ",
+    "revision": "eb3172f06a6d6b3a15f08947b0668d782e4d2d2c",
+    "name": "Qwen2.5 Coder 14B Instruct",
+    "family": "Qwen",
+    "params": "14.7B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 9980170584,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "released": "2024-11-09",
+    "arch": {
+      "kv_layers": 48,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "tested": true,
+    "notes": "Tested end to end on an RTX 3090 (24 GB)."
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-14B-Instruct",
+    "revision": "aedcc2d42b622764e023cf882b6652e646b95671",
+    "name": "Qwen2.5 Coder 14B Instruct",
+    "family": "Qwen",
+    "params": "14.7B",
+    "quant": "BF16",
+    "weight_bytes": 29540133960,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "released": "2024-11-06",
+    "arch": {
+      "kv_layers": 48,
+      "kv_heads": 8,
+      "head_dim": 128
+    }
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ",
+    "revision": "1ed0a6145da0ce550c628e8e8b678f51e695995d",
+    "name": "Qwen2.5 Coder 32B Instruct",
+    "family": "Qwen",
+    "params": "32.5B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 19328993904,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "released": "2024-11-09",
+    "arch": {
+      "kv_layers": 64,
+      "kv_heads": 8,
+      "head_dim": 128
+    }
+  },
+  {
+    "id": "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
+    "revision": "dcaee4d4dfc5ee71ad501f01f530e5652438fde0",
+    "name": "Qwen3 Coder 30B-A3B Instruct",
+    "family": "Qwen",
+    "params": "30.5B (3.3B active)",
+    "quant": "FP8",
+    "weight_bytes": 31175618584,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2025-07-31",
+    "arch": {
+      "kv_layers": 48,
+      "kv_heads": 4,
+      "head_dim": 128
+    },
+    "min_compute_capability": 8.9,
+    "notes": "Mixture-of-experts. FP8 runs natively on Ada/Hopper (compute capability 8.9 or higher)."
+  },
+  {
+    "id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "revision": "b2cff646eb4bb1d68355c01b18ae02e7cf42d120",
+    "name": "Qwen3 Coder 30B-A3B Instruct",
+    "family": "Qwen",
+    "params": "30.5B (3.3B active)",
+    "quant": "BF16",
+    "weight_bytes": 61066575656,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2025-07-31",
+    "arch": {
+      "kv_layers": 48,
+      "kv_heads": 4,
+      "head_dim": 128
+    },
+    "notes": "Mixture-of-experts."
+  },
+  {
+    "id": "Qwen/Qwen3-Coder-Next-FP8",
+    "revision": "da6e2ed27304dd39abadd9c82ef50e8de67bdd4c",
+    "name": "Qwen3 Coder Next",
+    "family": "Qwen",
+    "params": "80B (3B active)",
+    "quant": "FP8",
+    "weight_bytes": 80381394600,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-02-01",
+    "arch": {
+      "kv_layers": 12,
+      "kv_heads": 2,
+      "head_dim": 256,
+      "linear_layers": 36
+    },
+    "min_compute_capability": 8.9,
+    "notes": "Hybrid attention: only 1 in 4 layers keeps a KV cache."
+  },
+  {
+    "id": "Qwen/Qwen3-Coder-Next",
+    "revision": "a7fbcb5c0e12d62a448eaa0e260346bf5dcc0feb",
+    "name": "Qwen3 Coder Next",
+    "family": "Qwen",
+    "params": "80B (3B active)",
+    "quant": "BF16",
+    "weight_bytes": 159358031480,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-01-30",
+    "arch": {
+      "kv_layers": 12,
+      "kv_heads": 2,
+      "head_dim": 256,
+      "linear_layers": 36
+    }
+  },
+  {
+    "id": "Qwen/Qwen3.6-27B",
+    "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+    "name": "Qwen3.6 27B",
+    "family": "Qwen",
+    "params": "27B",
+    "quant": "BF16",
+    "weight_bytes": 55563006400,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-04-21",
+    "arch": {
+      "kv_layers": 16,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "linear_layers": 48
+    },
+    "reasoning_parser": "qwen3"
+  },
+  {
+    "id": "Qwen/Qwen3.6-27B-FP8",
+    "revision": "e89b16ebf1988b3d6befa7de50abc2d76f26eb09",
+    "name": "Qwen3.6 27B",
+    "family": "Qwen",
+    "params": "27B",
+    "quant": "FP8",
+    "weight_bytes": 30866866928,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-04-21",
+    "arch": {
+      "kv_layers": 16,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "linear_layers": 48
+    },
+    "reasoning_parser": "qwen3"
+  },
+  {
+    "id": "cyankiwi/Qwen3.6-27B-AWQ-INT4",
+    "revision": "e5cc0400fb2403c437c2c40a7c52fb5ae93fda18",
+    "name": "Qwen3.6 27B",
+    "family": "Qwen",
+    "params": "27B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 20443989280,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-04-21",
+    "arch": {
+      "kv_layers": 16,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "linear_layers": 48
+    },
+    "quantized_by": "cyankiwi",
+    "reasoning_parser": "qwen3"
+  },
+  {
+    "id": "Qwen/Qwen3.6-35B-A3B",
+    "revision": "995ad96eacd98c81ed38be0c5b274b04031597b0",
+    "name": "Qwen3.6 35B A3B",
+    "family": "Qwen",
+    "params": "35B (3B active)",
+    "quant": "BF16",
+    "weight_bytes": 71903776776,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-04-15",
+    "arch": {
+      "kv_layers": 10,
+      "kv_heads": 2,
+      "head_dim": 256,
+      "linear_layers": 30
+    },
+    "reasoning_parser": "qwen3"
+  },
+  {
+    "id": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "revision": "95a723d08a9490559dae23d0cff1d9466213d989",
+    "name": "Qwen3.6 35B A3B",
+    "family": "Qwen",
+    "params": "35B (3B active)",
+    "quant": "FP8",
+    "weight_bytes": 37463662160,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-04-15",
+    "arch": {
+      "kv_layers": 10,
+      "kv_heads": 2,
+      "head_dim": 256,
+      "linear_layers": 30
+    },
+    "reasoning_parser": "qwen3"
+  },
+  {
+    "id": "QuantTrio/Qwen3.6-35B-A3B-AWQ",
+    "revision": "119886a1072372348f73ef0df2d801cdcc0f455b",
+    "name": "Qwen3.6 35B A3B",
+    "family": "Qwen",
+    "params": "35B (3B active)",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 25461160912,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-04-15",
+    "arch": {
+      "kv_layers": 10,
+      "kv_heads": 2,
+      "head_dim": 256,
+      "linear_layers": 30
+    },
+    "quantized_by": "QuantTrio",
+    "reasoning_parser": "qwen3"
+  },
+  {
+    "id": "google/gemma-4-E4B-it",
+    "revision": "ee0ef6023621cff504d758262d4e04895a5af4a2",
+    "name": "Gemma 4 E4B",
+    "family": "Gemma",
+    "params": "8B (4B effective)",
+    "quant": "BF16",
+    "weight_bytes": 15992595884,
+    "max_context": 131072,
+    "license": "apache-2.0",
+    "released": "2026-03-02",
+    "arch": {
+      "kv_layers": 7,
+      "kv_heads": 2,
+      "head_dim": 512,
+      "swa_layers": 35,
+      "swa_kv_heads": 2,
+      "swa_head_dim": 256,
+      "swa_window": 512
+    },
+    "reasoning_parser": "gemma4"
+  },
+  {
+    "id": "google/gemma-4-12B-it",
+    "revision": "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+    "name": "Gemma 4 12B",
+    "family": "Gemma",
+    "params": "12B",
+    "quant": "BF16",
+    "weight_bytes": 23919549408,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-05-23",
+    "arch": {
+      "kv_layers": 8,
+      "kv_heads": 1,
+      "head_dim": 512,
+      "swa_layers": 40,
+      "swa_kv_heads": 8,
+      "swa_head_dim": 256,
+      "swa_window": 1024
+    },
+    "reasoning_parser": "gemma4"
+  },
+  {
+    "id": "google/gemma-4-12B-it-qat-w4a16-ct",
+    "revision": "1d2c2d7f2466070e69d6fb3fd5ce9a7d75f2f6ee",
+    "name": "Gemma 4 12B",
+    "family": "Gemma",
+    "params": "12B",
+    "quant": "W4A16 4-bit (QAT)",
+    "weight_bytes": 10264229896,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-06-05",
+    "arch": {
+      "kv_layers": 8,
+      "kv_heads": 1,
+      "head_dim": 512,
+      "swa_layers": 40,
+      "swa_kv_heads": 8,
+      "swa_head_dim": 256,
+      "swa_window": 1024
+    },
+    "reasoning_parser": "gemma4"
+  },
+  {
+    "id": "google/gemma-4-26B-A4B-it",
+    "revision": "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
+    "name": "Gemma 4 26B A4B",
+    "family": "Gemma",
+    "params": "26B (4B active)",
+    "quant": "BF16",
+    "weight_bytes": 51612009916,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-03-11",
+    "arch": {
+      "kv_layers": 5,
+      "kv_heads": 2,
+      "head_dim": 512,
+      "swa_layers": 25,
+      "swa_kv_heads": 8,
+      "swa_head_dim": 256,
+      "swa_window": 1024
+    },
+    "reasoning_parser": "gemma4"
+  },
+  {
+    "id": "amd/gemma-4-26B-A4B-it-w4a16-llmcompressor",
+    "revision": "5f5d9fa560e8eeabead101c85f1d639e1b5f8716",
+    "name": "Gemma 4 26B A4B",
+    "family": "Gemma",
+    "params": "26B (4B active)",
+    "quant": "W4A16 4-bit",
+    "weight_bytes": 15656878852,
+    "max_context": 262144,
+    "license": "gemma",
+    "released": "2026-03-11",
+    "arch": {
+      "kv_layers": 5,
+      "kv_heads": 2,
+      "head_dim": 512,
+      "swa_layers": 25,
+      "swa_kv_heads": 8,
+      "swa_head_dim": 256,
+      "swa_window": 1024
+    },
+    "quantized_by": "AMD",
+    "reasoning_parser": "gemma4"
+  },
+  {
+    "id": "google/gemma-4-31B-it",
+    "revision": "842da3794eaa0b77d5f08bae87a17459d91ff475",
+    "name": "Gemma 4 31B",
+    "family": "Gemma",
+    "params": "31B",
+    "quant": "BF16",
+    "weight_bytes": 62546338248,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-03-11",
+    "arch": {
+      "kv_layers": 10,
+      "kv_heads": 4,
+      "head_dim": 512,
+      "swa_layers": 50,
+      "swa_kv_heads": 16,
+      "swa_head_dim": 256,
+      "swa_window": 1024
+    },
+    "reasoning_parser": "gemma4"
+  },
+  {
+    "id": "google/gemma-4-31B-it-qat-w4a16-ct",
+    "revision": "52f3f65bc7a02d555763bc923bd1d9094898219d",
+    "name": "Gemma 4 31B",
+    "family": "Gemma",
+    "params": "31B",
+    "quant": "W4A16 4-bit (QAT)",
+    "weight_bytes": 23265352448,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-06-04",
+    "arch": {
+      "kv_layers": 10,
+      "kv_heads": 4,
+      "head_dim": 512,
+      "swa_layers": 50,
+      "swa_kv_heads": 16,
+      "swa_head_dim": 256,
+      "swa_window": 1024
+    },
+    "reasoning_parser": "gemma4"
+  },
+  {
+    "id": "openai/gpt-oss-20b",
+    "revision": "6cee5e81ee83917806bbde320786a8fb61efebee",
+    "name": "gpt-oss 20B",
+    "family": "gpt-oss",
+    "params": "21B (3.6B active)",
+    "quant": "MXFP4",
+    "weight_bytes": 13761316904,
+    "max_context": 131072,
+    "license": "apache-2.0",
+    "released": "2025-08-04",
+    "arch": {
+      "kv_layers": 12,
+      "kv_heads": 8,
+      "head_dim": 64,
+      "swa_layers": 12,
+      "swa_kv_heads": 8,
+      "swa_head_dim": 64,
+      "swa_window": 128
+    },
+    "reasoning_parser": "gpt-oss"
+  },
+  {
+    "id": "openai/gpt-oss-120b",
+    "revision": "b5c939de8f754692c1647ca79fbf85e8c1e70f8a",
+    "name": "gpt-oss 120B",
+    "family": "gpt-oss",
+    "params": "117B (5.1B active)",
+    "quant": "MXFP4",
+    "weight_bytes": 65248893184,
+    "max_context": 131072,
+    "license": "apache-2.0",
+    "released": "2025-08-04",
+    "arch": {
+      "kv_layers": 18,
+      "kv_heads": 8,
+      "head_dim": 64,
+      "swa_layers": 18,
+      "swa_kv_heads": 8,
+      "swa_head_dim": 64,
+      "swa_window": 128
+    },
+    "reasoning_parser": "gpt-oss"
+  },
+  {
+    "id": "mistralai/Devstral-Small-2507",
+    "revision": "bd165ab26cebbcc2eea2c4ecbfc07f3ac42b3c39",
+    "name": "Devstral Small 1.1",
+    "family": "Devstral",
+    "params": "24B",
+    "quant": "BF16",
+    "weight_bytes": 47144848872,
+    "max_context": 131072,
+    "license": "apache-2.0",
+    "released": "2025-07-04",
+    "arch": {
+      "kv_layers": 40,
+      "kv_heads": 8,
+      "head_dim": 128
+    }
+  },
+  {
+    "id": "mistralai/Devstral-Small-2-24B-Instruct-2512",
+    "revision": "55c5b41e98c2dbd21b0c8afffc540dcfc9eb5128",
+    "name": "Devstral Small 2",
+    "family": "Devstral",
+    "params": "24B",
+    "quant": "FP8",
+    "weight_bytes": 25793059408,
+    "max_context": 393216,
+    "license": "apache-2.0",
+    "released": "2025-11-28",
+    "arch": {
+      "kv_layers": 40,
+      "kv_heads": 8,
+      "head_dim": 128
+    }
+  },
+  {
+    "id": "cyankiwi/Devstral-Small-2-24B-Instruct-2512-AWQ-4bit",
+    "revision": "9218adca17d7153120cd5d583d24f94a893de529",
+    "name": "Devstral Small 2",
+    "family": "Devstral",
+    "params": "24B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 16067524312,
+    "max_context": 393216,
+    "license": "apache-2.0",
+    "released": "2025-11-28",
+    "arch": {
+      "kv_layers": 40,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "cyankiwi"
+  },
+  {
+    "id": "mistralai/Devstral-2-123B-Instruct-2512",
+    "revision": "1613bf01adb5e1c6fdc196b46e6b173eae75eb4a",
+    "name": "Devstral 2",
+    "family": "Devstral",
+    "params": "125B",
+    "quant": "FP8",
+    "weight_bytes": 128249620192,
+    "max_context": 262144,
+    "license": "other",
+    "released": "2025-11-28",
+    "arch": {
+      "kv_layers": 88,
+      "kv_heads": 8,
+      "head_dim": 128
+    }
+  }
+]

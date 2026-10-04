@@ -1,0 +1,79 @@
+# Every pull request and every push to dev/main: build, lint and test.
+# The GPU lifecycle test (cargo run -p openphalanx-core --example lifecycle)
+# needs an NVIDIA GPU and stays a manual step on the server node.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-title:
+    # PRs into main release a version; the title prefix decides which bump.
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the PR title prefix ([bug], [feature], [major], or a no-release prefix)
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: python3 scripts/bump_version.py --check --title "$TITLE"
+
+  rust:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries for the Tauri app
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev build-essential
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: App frontend (build + type check)
+        working-directory: app
+        run: |
+          npm ci
+          npm run build
+          npm run check
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test -p openphalanx-core -p oppx --locked
+
+  python-and-shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Lint (syntax errors and undefined names)
+        run: |
+          pip install ruff
+          ruff check --select F,E9 --target-version py312 docker/server client/oppx/frontend scripts
+      - name: Shell syntax
+        # Each script with its own interpreter (bash scripts use arrays).
+        run: |
+          for f in scripts/*.sh docker/server/*.sh; do
+            case "$(head -1 "$f")" in *bash*) bash -n "$f" ;; *) sh -n "$f" ;; esac
+          done
+      - name: Version bump rules
+        run: |
+          python3 scripts/bump_version.py --check --title "[bug] x"
+          python3 scripts/bump_version.py --check --title "[FEATURE] x"
+          python3 scripts/bump_version.py --check --title "[docs] x"
+          ! python3 scripts/bump_version.py --check --title "no prefix"

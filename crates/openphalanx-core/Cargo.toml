@@ -1,0 +1,21 @@
+[package]
+name = "openphalanx-core"
+description = "Docker, GPU, model catalog and pairing logic for the Openphalanx server GUI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+dirs = "6"
+futures-util = "0.3"
+hex = "0.4"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"

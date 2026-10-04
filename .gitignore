@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.aider*
+
+# Frontend source lives in app/src/lib (the Python "lib/" rule above would hide it)
+!app/src/lib/

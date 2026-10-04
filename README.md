@@ -1,178 +1,84 @@
 # OpenPhalanx
 
-open-source platform that pools distributed GPU VRAM across local machines to run heavy coding agentic models alongside a headless agent harness, enabling a lightweight CLI client to execute remote AI engineering tasks.
+Run a capable coding model on your own GPU machine, and use it from any laptop on your network.
+
+OpenPhalanx turns a Linux box with an NVIDIA GPU into a private coding-model server: a desktop app picks a model that safely fits your VRAM, starts it, and pairs your laptops with a one-time code. The coding agent ([Aider](https://aider.chat)) runs on the laptop next to your code, so your repo, tests and git stay local and only prompts travel to the server.
 
 ```
-flowchart TB
-    subgraph ClientNode ["Client Node (Work Laptop)"]
-        direction TB
-        CLI["openbase CLI<br/>(Go Thin Client)"]
-        FS[("Local Workspace<br/>& Filesystem")]
-       
-        CLI <-->|"Scans Context / Applies Diffs"| FS
-    end
-
-    subgraph ServerNode ["Server Node (Primary Rig)"]
-        direction TB
-        GUI["Openphalanx GUI<br/>(Tauri / Rust Orchestrator)"]
-        Harness["Headless Agent Harness<br/>(Goose / Aider Server)"]
-        Master["SGLang Server<br/>(Inference Master)"]
-       
-        GUI -.->|"Orchestrates"| Harness
-        GUI -.->|"Orchestrates"| Master
-        Harness <-->|"Local HTTP API"| Master
-    end
-
-    CLI <==>|"Agent Client Protocol (ACP)"| Harness
-
-    classDef clientStyle fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#fff;
-    classDef serverStyle fill:#1e1b4b,stroke:#818cf8,stroke-width:2px,color:#fff;
-    classDef modelStyle fill:#422006,stroke:#fb923c,stroke-width:2px,color:#fff;
-
-    class CLI,FS clientStyle;
-    class GUI,Harness serverStyle;
-    class Master modelStyle;
+  Laptop (client)                              GPU server
+ ┌────────────────────────────┐   HTTPS +   ┌────────────────────────────────┐
+ │ your repo · tests · git    │ device token│ OpenPhalanx app (start/stop,   │
+ │ Aider agent                │ ──────────▶ │   models, pairing, VRAM checks)│
+ │ (edits files locally)      │ ◀────────── │ gateway → SGLang → model       │
+ └────────────────────────────┘   answers   └────────────────────────────────┘
 ```
 
+> **Status:** early development, Linux server only. The server app and the `oppx` client work end to end; see [`milestone.md`](milestone.md) for what's next.
 
-Openphalanx operates on a decoupled client-server architecture where a lightweight Go CLI client on your local workspace handles file-system scanning and patch application while sending low-bandwidth task requests over the Agent Client Protocol (ACP) to a remote, headless agent harness running on your primary server node. The server hosts the execution context and coordinates with SGLang, a high-performance inference engine that leverages RadixAttention to cache repetitive agent context. This enables you to run heavy coding models at peak throughput directly on the server's GPUs without consuming client resources or shuffling massive context windows across the wire.
+## Run the server
 
-## Phase 1: Environment & Tooling Audit
+You need:
 
-* \[x\] **Step 1.1: Verify Server Hardware & Docker Environment**
+* Linux x86-64 with an NVIDIA GPU (24 GB recommended) and a working `nvidia-smi`
+* Docker, with your user in the `docker` group
+* [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+Install the app (Ubuntu/Debian; the installer checks the items above first):
 
-  * Query primary host (Desktop) GPU specs using `nvidia-smi`.
+```bash
+curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/install-server.sh | sh
+```
 
-  * Verify Docker Desktop / Docker Engine is installed and running on the primary server.
+Or build it from source (also needs Rust, Node.js 20+ and the WebKitGTK packages listed in [`CLAUDE.md`](CLAUDE.md)):
 
-  * Verify `nvidia-container-toolkit` is installed so Docker containers can access local GPUs via `--gpus all`.
+```bash
+git clone -b dev https://github.com/chophilip21/openPhalanx.git
+cd openPhalanx/app
+npm install
+npx tauri dev        # or: npx tauri build --bundles deb, then install the .deb
+```
 
-  * ✅ Verified: RTX 3090 (24 GB, driver 580.159.03), Docker 29.5.3 with `nvidia` runtime, NVIDIA Container Toolkit 1.19.1, `lmsysorg/sglang:latest` pulled (SGLang 0.5.21) and sees the GPU via `--gpus all`.
+Then, in the app:
 
-* \[x\] **Step 1.2: Check Client Dependencies**
+1. **Models:** pick a model marked **Fits** (or **Best fit for this GPU**) and click **Download**. VRAM estimates include the KV cache and runtime, not just the download size.
+2. **Server:** press the power button. The first start downloads the server image (~16 GB); loading the model takes 3–4 minutes.
+3. When the button turns green, note the **pairing code** and the server address shown above it.
 
-  * Verify runtime environments on the client node (`Go` or `Rust` for compiling the `openbase` thin client).
+Open port `9090/tcp` to your laptops' network.
 
-  * ✅ Verified: Rust 1.99.0 / Cargo 1.99.0 installed via rustup (`~/.cargo/bin`). Go is not installed, so Rust is the toolchain for `openbase`.
+## Connect a laptop
 
-## Phase 2: Unified Backend Container Setup (SGLang + Aider)
+On the laptop (Linux or macOS), install `oppx`. It sets up its own coding engine, so there's nothing else to install:
 
-* \[x\] **Step 2.1: Create Container Configurations**
+```bash
+curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/install.sh | sh
+oppx --update                     # run any time to update oppx and its engine
+```
 
-  * Create a `docker/Dockerfile.server` derived from `lmsysorg/sglang:latest` that installs `aider-chat` and `supervisor`.
+Or from source, with [Rust](https://rustup.rs): `cargo install --path openPhalanx/client/oppx` in a clone of this repo. The installers need a published [release](https://github.com/chophilip21/openPhalanx/releases); until the first one, use the from-source steps.
 
-  * Create `supervisord.conf` to manage process lifecycle on the server:
+Pair once, with the address and code shown in the app. `oppx` prints the server's certificate fingerprint; check that it matches the one in the app, then confirm:
 
-    * **Process 1 (SGLang):** Starts model inference engine at `http://127.0.0.1:8080/v1`.
+```bash
+oppx pair 192.168.1.77 ABCD-EFGH
+oppx status                       # certificate, device and model all ✓
+```
 
-    * **Process 2 (Aider):** Starts headless agent server bound to `0.0.0.0:9090`, pointing directly to the internal SGLang instance.
+Then, in any git repo:
 
-  * ✅ Implemented:
+```bash
+oppx                              # start a conversation
+oppx "fix the failing test"       # start with a request
+oppx -c                           # continue the last conversation (oppx -r to pick an older one)
+oppx -p "explain src/main.rs"     # answer once and exit
+```
 
-    * `docker/Dockerfile.server`: adds `supervisor` (apt) and installs `aider-chat` in a separate venv (`/opt/aider`) so its pinned deps don't clash with SGLang's environment.
+The context window is managed for you: when a conversation grows, older messages are summarized and unused files are set aside automatically (`/context` shows what's in it). Keys and commands work like Claude Code: `/help`, `@file` to mention a file, `!cmd` to run a shell command, `# note` to save to project memory, `/init` to write a project summary, Shift+Tab for plan mode (no edits), Esc to interrupt, Ctrl-C twice to exit. Questions are answered without touching your files; requests are applied as edits.
 
-    * `docker/server/start-sglang.sh`: SGLang bound to `127.0.0.1:8080` only, served as `openphalanx-coder`. Configurable via `MODEL_PATH` (default `Qwen/Qwen2.5-Coder-14B-Instruct-AWQ`, which fits on a 24 GB card), `MEM_FRACTION_STATIC`, `CONTEXT_LENGTH` and `SGLANG_EXTRA_ARGS`.
+When a request needs current information (new library versions, recent APIs, error messages), the server searches the web automatically through a private [SearXNG](https://docs.searxng.org) instance; `oppx --no-web` turns that off.
 
-    * `docker/server/supervisord.conf`: runs both processes and sends their logs to the container's stdout so `docker logs` works.
+Edits are never committed: review with `git diff` and commit yourself. Remove a laptop with `oppx unpair` (or revoke it in the app's **Devices** page).
 
-    * `docker/server/agent_server.py`: Aider has no built-in server mode, so a FastAPI wrapper on `0.0.0.0:9090` provides one:
+## Learn more
 
-      * `GET /health`: reports agent and SGLang status.
-
-      * `POST /v1/run` `{prompt, files: {path: content}}`: runs Aider on a throwaway git repo and returns `{exit_code, output, diff}`. The client then applies the diff locally.
-
-    * `docker/server/aider-local.sh` (installed as `aider-local`): interactive Aider connected to the in-container SGLang server, for manual testing.
-
-      ```bash
-      # The repo root (this repo) is mounted at /workspace, so Aider edits it directly.
-      # Running as your own uid keeps the files Aider writes owned by you.
-      docker exec -it -u $(id -u):$(id -g) -e HOME=/tmp -w /workspace openphalanx-backend aider-local
-      ```
-
-      Aider only sees *committed* files in its repo map. Use `/add <file>` to give the model a file's contents, `/ask` for questions, and `/run <cmd>` for shell commands. Plain chat text goes only to the LLM.
-
-* \[x\] **Step 2.2: Build and Test Unified Image**
-
-  * Build the unified container image on the server node:
-
-    ```bash
-    docker build -f docker/Dockerfile.server -t openphalanx-backend:latest docker/
-    ```
-
-  * Launch the unified backend container using NVIDIA runtime pass-through:
-
-    ```bash
-    docker run -d --name openphalanx-backend --gpus all \
-      --shm-size 32g \
-      -p 9090:9090 \
-      -v ~/.cache/huggingface:/root/.cache/huggingface \
-      -v "$PWD":/workspace \
-      --ipc=host \
-      openphalanx-backend:latest
-    ```
-
-  * Verify that port `9090` accepts incoming connections from the client network and internal communication to SGLang functions seamlessly.
-
-  * ✅ Verified on the 3090 node (`192.168.1.77`):
-
-    * The image builds with Aider 0.86.2. Startup takes about 3.5 min with the model already cached (weight load plus CUDA graph capture).
-
-    * Qwen2.5-Coder-14B-AWQ runs with a 32k context and about 51.6k tokens of KV cache, using roughly 22.9 GB of 24 GB VRAM.
-
-    * `GET http://192.168.1.77:9090/health` → `{"agent":"ok","sglang":"ready",...}`.
-
-    * `POST /v1/run` edit task: about 8 s end to end, and the diff applies cleanly with `git apply`.
-
-    * `POST /v1/run` new-file task: returns a proper `new file` diff. After applying it, the generated pytest suite passes.
-
-## Phase 3: Tauri Orchestrator Integration
-
-* \[ \] **Step 3.1: Implement Docker Engine Manager in Tauri**
-
-  * Add container lifecycle controls to the Tauri app's Rust backend using the Docker API or `std::process::Command`.
-
-  * Implement pre-flight checks: verify Docker daemon availability, pull/build image if missing, and monitor container runtime health.
-
-* \[ \] **Step 3.2: Configure GUI Controls & Status Dashboard**
-
-  * Expose container logs, GPU VRAM status, and agent connection metrics in the Tauri frontend UI.
-
-## Phase 4: Thin Client CLI (`openbase`) Implementation
-
-* \[ \] **Step 4.1: Scaffold `openbase` CLI Project**
-
-  * Initialize a single-binary project (Go or Rust) inside `client/openbase`.
-
-  * Implement configuration file handling (`~/.openbase/config.json`) to store target Server IP and Port (`9090`).
-
-* \[ \] **Step 4.2: Implement Client Commands**
-
-  * `openbase init --server http://<SERVER_IP>:9090`: Sets target server address.
-
-  * `openbase run "<prompt>"`:
-
-    1. Scans working directory file tree and Git context.
-
-    2. Sends instruction payload over ACP / HTTP to the headless Aider instance running inside the remote server container.
-
-    3. Streams execution output back to terminal stdout.
-
-    4. Safely applies returned diff patches to local files.
-
-## Phase 5: End-to-End Validation & Caching Benchmark
-
-* \[ \] **Step 5.1: Test Simple File Edit**
-
-  * Run a test command from the client machine:
-
-    ```bash
-    openbase run "Create a basic HTTP server in main.py using FastAPI"
-    ```
-
-  * Confirm patch generation accuracy and execution speed.
-
-* \[ \] **Step 5.2: Test RadixAttention Context Caching**
-
-  * Execute a multi-turn modification task.
-
-  * Inspect container logs (`docker logs -f <container_id>`) to verify high KV-cache hit rates on SGLang during subsequent prompt turns.
+* [`CLAUDE.md`](CLAUDE.md): architecture, security model, running without the GUI, development and troubleshooting
+* [`milestone.md`](milestone.md): roadmap and progress

@@ -1,0 +1,238 @@
+"""Wires everything into Aider and runs the conversation loop."""
+
+import os
+import sys
+from pathlib import Path
+
+import aider
+import aider.coders.base_coder as base_coder
+import aider.main as aider_main
+from aider.coders.ask_coder import AskCoder
+from aider.commands import SwitchCoder
+from aider.repomap import RepoMap
+from rich.markup import escape
+from rich.text import Text
+
+from .config import ACCENT, CONTEXT, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, PRINT_MODE, RED, SERVER, TESTED_AIDER, WEB, YELLOW
+from .term import EscWatcher, SESSION, SPIN, Thinking, UI, out, step
+from .render import show_edits, snapshot
+from .context import CONTEXT_MGR, PRI_EDITED, _check_tokens, _fitted_format_messages
+from .oppx_io import OppxIO
+from .cache import _ask_file_mentions, _ask_init, _coder_init, _dump_requests, _stable_ranked_map
+from .commands import load_memory, translate
+
+
+def _interrupted(self):
+    """Replaces Aider's Ctrl-C handler, which exits on a second press within
+    2 s. Here an interrupt only stops the answer; quitting happens at the
+    prompt (Ctrl-C twice or Ctrl-D), as in Claude Code. The message is
+    printed after the answer's live view has closed (see run_turn)."""
+    UI.interrupted = True
+
+
+def build_coder(argv):
+    aider_main.InputOutput = OppxIO  # main() constructs its IO from this name
+    base_coder.WaitingSpinner = Thinking
+    base_coder.Coder.keyboard_interrupt = _interrupted
+    base_coder.Coder.format_messages = _fitted_format_messages
+    base_coder.Coder.check_tokens = _check_tokens
+    # Aider stops streaming (and its spinner) whenever it picks a non-```
+    # fence, e.g. when a Markdown file with code blocks is in the chat; the
+    # answer then appears all at once after a long silence. Our renderer
+    # handles every fence, so always stream.
+    base_coder.Coder.show_pretty = lambda self: True
+    RepoMap.get_ranked_tags_map = _stable_ranked_map
+    base_coder.Coder.__init__ = _coder_init
+    AskCoder.__init__ = _ask_init
+    AskCoder.check_for_file_mentions = _ask_file_mentions
+    if os.environ.get("OPPX_DUMP_REQUESTS"):
+        _dump_requests(os.environ["OPPX_DUMP_REQUESTS"])
+    coder = aider_main.main(argv, return_coder=True)
+    # main() installs the engine's crash reporter; errors are ours to report.
+    sys.excepthook = sys.__excepthook__
+    if not isinstance(coder, base_coder.Coder):
+        sys.exit(coder if isinstance(coder, int) else 1)
+    return coder
+
+
+def welcome(coder):
+    cwd = str(Path.cwd()).replace(str(Path.home()), "~", 1)
+    web = f"[{GREEN}]on[/]" if WEB else f"[{MUTED}]off[/]"
+    memory = [Path(f).name for f in coder.abs_read_only_fnames]
+    lines = [
+        f"[{ACCENT}]✻[/] [bold]Welcome to OpenPhalanx![/]",
+        "",
+        f"  [{MUTED}]/help for help, /status for your current setup[/]",
+        "",
+        f"  [{MUTED}]cwd:[/] {escape(cwd)}",
+        f"  [{MUTED}]server:[/] {escape(SERVER)} · {MODEL_NAME} · {CONTEXT // 1024}k context · web search {web}",
+    ]
+    if memory:
+        lines.append(f"  [{MUTED}]memory:[/] {escape(', '.join(memory))}")
+    width = max(Text.from_markup(line).cell_len for line in lines) + 2
+    out(f"[{ACCENT}]╭{'─' * (width + 1)}╮[/]")
+    for line in lines:
+        pad = width - Text.from_markup(line).cell_len
+        out(f"[{ACCENT}]│[/] {line}{' ' * pad}[{ACCENT}]│[/]")
+    out(f"[{ACCENT}]╰{'─' * (width + 1)}╯[/]")
+    if not memory:
+        out(f"\n [{MUTED}]Tip: run /init to write {MEMORY_FILE}, a project summary loaded every session.[/]")
+    print()
+
+
+INTERRUPT_NOTE = "I see that you interrupted my previous reply."
+
+
+def _was_interrupted(coder) -> bool:
+    # Aider records a mid-stream interrupt in the conversation instead of
+    # calling keyboard_interrupt(); catch both.
+    recent = (coder.done_messages + coder.cur_messages)[-2:]
+    return UI.interrupted or any(m.get("content") == INTERRUPT_NOTE for m in recent)
+
+
+def _whole_file_retry(coder, text: str, before: dict):
+    """Model-agnostic fallback for a change request that produced no edit
+    (e.g. the diff format's fences collided with fences in a Markdown file,
+    which many models handle badly): ask once more in Aider's whole-file
+    format, show only the resulting diff, then return to the usual format."""
+    count = coder.main_model.token_count
+    try:
+        size = sum(count(Path(f).read_text(encoding=coder.io.encoding, errors="replace")) for f in coder.abs_fnames)
+    except OSError:
+        return coder, set()
+    if not coder.abs_fnames or size > CONTEXT_MGR.budget // 3:
+        return coder, set()
+    files = ", ".join(coder.get_inchat_relative_files())
+    step(f"No edit came through; retrying by rewriting {escape(files)}", YELLOW)
+    whole = base_coder.Coder.create(io=coder.io, from_coder=coder, edit_format="whole", summarize_from_coder=False)
+    whole.stream = False
+    UI.quiet = True
+    try:
+        with EscWatcher() as w:
+            SESSION.watcher = w
+            with Thinking():
+                whole.run_one(text, preproc=False)
+    except KeyboardInterrupt:
+        UI.interrupted = True
+    finally:
+        UI.quiet = False
+        SESSION.watcher = None
+    edited = set(whole.aider_edited_files or ())
+    back = base_coder.Coder.create(io=coder.io, from_coder=whole, edit_format=coder.edit_format, summarize_from_coder=False)
+    return back, edited
+
+
+def run_turn(coder, text: str):
+    """Runs one message; returns the coder to continue with (a new one after
+    a mode switch such as /ask, which runs in its own temporary coder)."""
+    coder.io._retry_shown = False
+    UI.interrupted = False
+    UI.server_error = ""
+    UI.before = {}
+    UI.originals = {}
+    SESSION.coder = coder
+    CONTEXT_MGR.start_turn(coder, text)
+    before = snapshot(coder)
+    result = coder
+    try:
+        with EscWatcher() as w:
+            SESSION.watcher = w
+            coder.run_one(text, preproc=True)
+    except SwitchCoder as switch:
+        if getattr(switch, "placeholder", None) is not None:
+            coder.io.placeholder = switch.placeholder
+        kwargs = dict(io=coder.io, from_coder=coder)
+        kwargs.update(switch.kwargs)
+        kwargs.pop("show_announcements", None)
+        result = base_coder.Coder.create(**kwargs)
+    except KeyboardInterrupt:
+        UI.interrupted = True
+    finally:
+        SESSION.watcher = None
+    interrupted = _was_interrupted(result)
+    if interrupted:
+        step("Interrupted by user", YELLOW)
+    edited = set(coder.aider_edited_files or ())
+    wanted_edit = not text.startswith("/") and result is coder and result.edit_format not in ("ask", "whole")
+    if wanted_edit and not edited and not interrupted and not UI.server_error:
+        result, edited = _whole_file_retry(result, text, before)
+        if not edited and not UI.interrupted:
+            step("No changes were made. Name the exact place to change, or @-mention the file, and try again.", YELLOW)
+    show_edits(coder, before, edited=edited)
+    if edited and UI.originals:
+        UI.undo = dict(UI.originals)
+    for rel in edited:
+        CONTEXT_MGR.note(coder.abs_root_path(rel), PRI_EDITED)
+    CONTEXT_MGR.end_turn(result)
+    SESSION.coder = result
+    return result
+
+
+def run(argv) -> int:
+    if not aider.__version__.startswith(TESTED_AIDER):
+        out(f"[{YELLOW}]warning:[/] this frontend was tested with engine {TESTED_AIDER}.x; found {aider.__version__}.")
+    coder = build_coder(argv)
+    load_memory(coder)
+    initial = os.environ.get("OPPX_INITIAL", "").strip()
+
+    if PRINT_MODE:
+        text = translate(coder, initial) if initial else None
+        if text:
+            run_turn(coder, text)
+        return 0
+
+    welcome(coder)
+    pending = initial
+    while True:
+        if not pending and UI.queued:
+            pending = UI.queued.pop(0)
+        if pending:
+            text, pending = pending, ""
+            out(f"[{ACCENT} bold]>[/] {escape(text)}")
+        else:
+            try:
+                text = coder.get_input()
+            except KeyboardInterrupt:
+                continue
+            except EOFError:
+                break
+        if not text:
+            continue
+        SPIN.begin_turn()  # visible from Enter on (classification, repo map, context, model)
+        try:
+            text = translate(coder, text)
+        except EOFError:
+            SPIN.stop()
+            break
+        if text and text.split(" ", 1)[0] in ("/run", "/test", "/lint"):
+            # Shell commands print straight to the terminal: no spinner over them.
+            SPIN.stop()
+        if text:
+            coder = run_turn(coder, text)
+            load_memory(coder)  # picks up OPENPHALANX.md right after /init
+        SPIN.stop()
+        print()
+    out(f"[{MUTED}]Bye. Your changes are in the working tree; review them with git diff.[/]")
+    return 0
+
+
+def main() -> int:
+    try:
+        return run(sys.argv[1:])
+    except (KeyboardInterrupt, EOFError):
+        return 130
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 0
+    except Exception as e:  # noqa: BLE001 - last-resort, user-facing
+        import traceback
+
+        crash = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "oppx" / "last-crash.txt"
+        try:
+            crash.parent.mkdir(parents=True, exist_ok=True)
+            crash.write_text(traceback.format_exc())
+        except OSError:
+            pass
+        out(f"\n[{RED}]error:[/] the OpenPhalanx chat stopped unexpectedly: {escape(type(e).__name__)}: {escape(str(e))}")
+        out(f"  [{MUTED}]Details: {escape(str(crash))}[/]")
+        out(f"  [{MUTED}]You can keep working with the classic interface: oppx --classic[/]")
+        return 1
