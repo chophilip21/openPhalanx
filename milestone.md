@@ -1,672 +1,150 @@
-## Phase 1: Environment & Tooling Audit
-
-* \[x\] **Step 1.1: Verify Server Hardware & Docker Environment**
-
-  * Query primary host (Desktop) GPU specs using `nvidia-smi`.
-
-  * Verify Docker Desktop / Docker Engine is installed and running on the primary server.
-
-  * Verify `nvidia-container-toolkit` is installed so Docker containers can access local GPUs via `--gpus all`.
-
-  * ✅ Verified: RTX 3090 (24 GB, driver 580.159.03), Docker 29.5.3 with `nvidia` runtime, NVIDIA Container Toolkit 1.19.1, `lmsysorg/sglang:latest` pulled (SGLang 0.5.21) and sees the GPU via `--gpus all`.
-
-* \[x\] **Step 1.2: Check Client Dependencies**
-
-  * Verify runtime environments on the client node (`Go` or `Rust` for compiling the `oppx` thin client).
-
-  * ✅ Verified: Rust 1.99.0 / Cargo 1.99.0 installed via rustup (`~/.cargo/bin`). Go is not installed, so Rust is the toolchain for `oppx`.
-
-## 2.3 Check Aider can edit existing code
-
-- [x] Edit an existing file `README.md`
-- [x] Add a new section "2.3 Check Aider can edit existing code"
-
-## Phase 2: Unified Backend Container Setup (SGLang + Aider)
-
-* \[x\] **Step 2.1: Create Container Configurations**
-
-  * Create a `docker/Dockerfile.server` derived from `lmsysorg/sglang:latest` that installs `aider-chat` and `supervisor`.
-
-  * Create `supervisord.conf` to manage process lifecycle on the server:
-
-    * **Process 1 (SGLang):** Starts model inference engine at `http://127.0.0.1:8080/v1`.
-
-    * **Process 2 (Aider):** Starts headless agent server bound to `0.0.0.0:9090`, pointing directly to the internal SGLang instance.
-
-  * ✅ Implemented:
-
-    * `docker/Dockerfile.server`: adds `supervisor` (apt) and installs `aider-chat` in a separate venv (`/opt/aider`) so its pinned deps don't clash with SGLang's environment.
-
-    * `docker/server/start-sglang.sh`: SGLang bound to `127.0.0.1:8080` only, served as `openphalanx-coder`. Configurable via `MODEL_PATH` (default `Qwen/Qwen2.5-Coder-14B-Instruct-AWQ`, which fits on a 24 GB card), `MEM_FRACTION_STATIC`, `CONTEXT_LENGTH` and `SGLANG_EXTRA_ARGS`.
-
-    * `docker/server/supervisord.conf`: runs both processes and sends their logs to the container's stdout so `docker logs` works.
-
-    * `docker/server/agent_server.py`: Aider has no built-in server mode, so a FastAPI wrapper on `0.0.0.0:9090` provides one:
-
-      * `GET /health`: reports agent and SGLang status.
-
-      * `POST /v1/run` `{prompt, files: {path: content}}`: runs Aider on a throwaway git repo and returns `{exit_code, output, diff}`. The client then applies the diff locally. *This was the first prototype of server-side execution. It has been superseded by the client-side agent design (see "Architecture decision") and is kept only as an optional one-shot mode.*
-
-    * `docker/server/aider-local.sh` (installed as `aider-local`): interactive Aider connected to the in-container SGLang server, for manual testing.
-
-      ```bash
-      # The repo root (this repo) is mounted at /workspace, so Aider edits it directly.
-      # Running as your own uid keeps the files Aider writes owned by you.
-      docker exec -it -u $(id -u):$(id -g) -e HOME=/tmp -w /workspace openphalanx-backend aider-local
-      ```
-
-      *Removed in 0.2.0 together with Aider (see the note below).* `aider-local` ran with `--yes-always`, so it doesn't ask for confirmation, and with `--no-auto-commits --no-dirty-commits`, so it never commits. Review its changes with `git diff` and commit them yourself. Any extra arguments are files to put in the chat at startup. For example, append `$(git ls-files)` to load every tracked file (about 7.5k of the 32k-token context for this repo).
-
-      Aider only sees *committed* files in its repo map. Use `/add <file>` to give the model a file's contents, `/ask` for questions, and `/run <cmd>` for shell commands. Plain chat text goes only to the LLM.
-
-* \[x\] **Step 2.2: Build and Test Unified Image**
-
-  * Build the unified container image on the server node:
-
-    ```bash
-    docker build -f docker/Dockerfile.server -t openphalanx-backend:latest docker/
-    ```
-
-  * Launch the unified backend container using NVIDIA runtime pass-through:
-
-    ```bash
-    # Manual/dev run. The Phase 3 GUI normally launches the container (see below).
-    docker run -d --name openphalanx-backend --gpus all \
-      --shm-size 32g \
-      -p 9090:9090 \
-      -v ~/.cache/huggingface:/root/.cache/huggingface \
-      -v "$PWD":/workspace \
-      --ipc=host \
-      openphalanx-backend:latest
-    ```
-
-  * Verify that port `9090` accepts incoming connections from the client network and internal communication to SGLang functions seamlessly.
-
-  * ✅ Verified on the 3090 node (`192.168.1.77`):
-
-    * The image builds with Aider 0.86.2. Startup takes about 3.5 min with the model already cached (weight load plus CUDA graph capture).
-
-    * Qwen2.5-Coder-14B-AWQ runs with a 32k context and about 51.6k tokens of KV cache, using roughly 22.9 GB of 24 GB VRAM.
-
-    * `GET http://192.168.1.77:9090/health` → `{"agent":"ok","sglang":"ready",...}`.
-
-    * `POST /v1/run` edit task: about 8 s end to end, and the diff applies cleanly with `git apply`.
-
-    * `POST /v1/run` new-file task: returns a proper `new file` diff. After applying it, the generated pytest suite passes.
-
-  * **0.2.0 change: Aider removed from the server image.** Once the agent moved to the client (see "Design decision" in the README), Aider in the image was dead weight. It was 589 MB, and `/v1/run` and `aider-local` depended on it.
-
-    * `agent_server.py` is now `gateway.py`, running in a 37 MB venv (`fastapi`, `uvicorn`, `httpx`).
-
-    * `/v1/run` is replaced by `/v1/whoami`, a token-protected check that `oppx status` will use.
-
-    * The image is 52.6 GB, down from 53.3 GB. Aider becomes a client-side dependency (Step 4.4).
-
-## Phase 3: Tauri Orchestrator Integration
-
-- The server side will be created with Tauri, distributed only for Linux for now. We will build for other OS once we are sure linux version is stable. 
-- Frontend, make it simple and modern, using Svelte and Vite. Can you get your inspiration from popular VPN providers, like ExpressVPN or NordVPN. 
-- We do not distribute the weights. But we must display trustable catalog of weights and there VRAM Requirement as tables (e.g qwen2.5 that we are using) and download button. User should be able to specify the path themselves as well (either local path, or url that we can attempt to download for the user)
-- We never want to crash the users with OOM, so be careful not to crash. Raise warning early, and if available VRAM is less than the model requirement, do not even allow the user to start the server. 
-- Use github container registry as you have suggested. 
-- Upon clicking start, it should display some kind of pairing code for client to connect to. This could be random everytime, or the same. But think about security and the best practice. 
-
-* \[x\] **Step 3.1: Implement Docker Engine Manager in Tauri**
-
-  * Add container lifecycle controls to the Tauri app's Rust backend using the Docker API or `std::process::Command`.
-
-  * Implement pre-flight checks: verify Docker daemon availability, pull/build image if missing, and monitor container runtime health.
-
-  * ✅ Implemented in `crates/openphalanx-core` (plain Rust, no Tauri, so it is unit-tested with `cargo test -p openphalanx-core`). The checks run on this machine with `cargo run -p openphalanx-core --example preflight`.
-
-    * **Docker** (`docker.rs`): drives the `docker` CLI to check the daemon (with fix-it hints for permission and not-running errors), check for the nvidia runtime, and handle pull, build fallback, run, stop, inspect and logs. Containers are labelled `io.openphalanx.managed`, so the GUI reattaches to a running backend after it restarts.
-
-    * **Crash handling:** if SGLang dies, `start-sglang.sh` stops the whole container instead of letting supervisord restart it in a loop. The GUI then sees the exit and diagnoses it from the logs (CUDA OOM, missing files, port in use).
-
-    * **Model mounts:** the folder is mounted read-only, together with every directory its symlinks pass through, at identical paths. This is needed because the Hugging Face cache links snapshots into per-repo and hub-wide blob stores. `HF_HUB_OFFLINE=1` stops SGLang from ever downloading on its own.
-
-  * **OOM protection** (`vram.rs`):
-
-    * The requirement is a **conservative** estimate, revised after measuring real usage (Qwen2.5-Coder-14B-AWQ on the 3090: weights 9.43 GiB in VRAM for a 9.29 GiB download, CUDA graphs 1.27 GiB, CUDA context and allocator 1.08 GiB, plus activation peaks). It is the sum of:
-
-      * **Weights:** download size × 1.05 for repacking and padding. FP8 weights count at **2×** on GPUs without native FP8 (compute capability below 8.9, e.g. the 3090).
-
-      * **KV cache:** 1.25 × one full context window, so a full-length request can coexist with a cached prefix or a second request. The KV formula matches SGLang's own allocation within 1%.
-
-      * **Runtime:** 2 GiB + 15% of the weights, because CUDA graphs and activations grow with the model. This replaces the earlier flat 3 GiB.
-
-    * Effect on a 24 GB card: 14B-AWQ at 32k needs 20.7 GiB (fits, 1.8 GiB spare). 32B-AWQ at 8k needs 26.2 GiB and is blocked; the old estimate called it "tight" at 23.0 GiB and would have let it try. `cargo run -p openphalanx-core --example catalog -- <context>` prints the table for the local GPU.
-
-    * The Models page shows the breakdown (weights + KV + runtime) next to the total, and labels the file size "Download" so it isn't mistaken for VRAM. "Best fit for this GPU" is computed: the catalog model with the most parameters that fits with headroom at the selected context. The catalog's static flag is now just "Tested".
-
-    * Starting is **refused** when free VRAM is below the requirement, and flagged as **tight** with less than 1.5 GiB spare. Both are checked before the image pull and again right before launch.
-
-    * `--mem-fraction-static` is computed from the VRAM actually free at launch, not a fixed 0.85, so SGLang never claims memory another process holds.
-
-  * **Model catalog** (`catalog.json`):
-
-    * Official Qwen coder repos only, each pinned to a commit. Weight sizes and attention shapes come from the repo's file listing and `config.json`.
-
-    * Downloads go to `~/.local/share/openphalanx/models`, resume after interruption, and verify every weight file against Hugging Face's published SHA-256.
-
-    * Copies already in `~/.cache/huggingface` are reused.
-
-    * Custom models can be a local folder, or a Hugging Face URL or repo id. Those are resolved to a commit, and the VRAM need is shown before anything downloads.
-
-  * **Registry:** the image is `ghcr.io/chophilip21/openphalanx-backend:<app version>`, and its base image is pinned by digest. Publish with `scripts/publish-image.sh`. `0.1.0` is published (`sha256:e586aefb…`, still contains Aider). `0.2.0` is built and passes the lifecycle test, but is not pushed yet. Package visibility must be **public** for the GUI to pull it without credentials. When the pull fails in a source checkout, the GUI builds from `docker/` instead.
-
-* \[ \] **Step 3.2: Configure GUI Controls & Status Dashboard**
-
-  * Expose container logs, GPU VRAM status, and agent connection metrics in the Tauri frontend UI.
-
-  * 🚧 Compiles (clippy clean) and launches with `npx tauri dev`; the UI is awaiting its first visual review.
-
-  * `npx tauri build --bundles deb` produces `target/release/bundle/deb/Openphalanx_<version>_amd64.deb` (5.9 MiB).
-
-  * ✅ Fixed: the GUI's 2 s status poll was filling SGLang's log with `GET /v1/models` and `GET /metrics` access lines. `start-sglang.sh` now passes `--uvicorn-access-log-exclude-prefixes /metrics /v1/models /health`. A full start → pair → revoke run now produces a 65-line log with no poll lines. Code is in `app/` (Tauri 2 + Svelte 5 + Vite, Linux `.deb`/AppImage).
-
-    * **Server:** a VPN-style power button, the pairing code with its countdown, the selected model with a VRAM bar, and the pre-flight checklist. While running it also shows prefix-cache hit rate, tokens/s, tasks and paired devices.
-
-    * **Models:** the catalog table with a "Fits / Tight / Won't fit" badge per context length, plus download, use and delete actions and custom models.
-
-    * **Devices:** paired devices, with revoke.
-
-    * **Logs:** live container output.
-
-  * Building the native app needs the WebKitGTK system libraries:
-
-    ```bash
-    sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
-    cd app && npm install && npx tauri dev     # or: npx tauri build
-    ```
-
-### Pairing & security model
-
-* **Public API** (`:9090`): TLS only, using a self-signed certificate generated on first start and kept in `~/.local/share/openphalanx/backend-state`. It accepts only `/health` and `/v1/pair`. Everything else (`/v1/whoami`, and the OpenAI-compatible inference endpoints added in Phase 4) requires a device token.
-
-* **Pairing codes:** pressing Start shows an 8-character code from a 30-letter alphabet with no lookalike characters (about 39 bits). Each code is single-use, expires after 10 minutes, and is burned after 5 wrong attempts. Every failed attempt also waits 1 s.
-
-* **Device tokens:** a client trades the code for a random 256-bit **device token**. The server stores only its SHA-256 hash. Devices stay paired across restarts and can be revoked from the Devices page. A new code is needed only to add a device.
-
-* **Certificate fingerprint:** the GUI shows the TLS fingerprint. `oppx pair` shows it too, for the user to compare, and then pins it (trust on first use), so later connections can't be intercepted even though the certificate is self-signed.
-
-* **Code handling:** prompts (which contain code) pass through the gateway to SGLang and are never written to disk on the server. The server never runs a command on a client's behalf.
-
-* **Admin API** (`:9091`): published on `127.0.0.1` only, and requires a random per-launch admin token passed through the container's environment. The GUI uses it for status, pairing and devices.
-
-## Phase 4: Client-Side Agent & `oppx` CLI
-
-* \[x\] **Step 4.1: Authenticated Inference Gateway (server)**
-
-  * In `docker/server/gateway.py`, add OpenAI-compatible `POST /v1/chat/completions` and `GET /v1/models` on the public TLS port. They proxy to SGLang on `127.0.0.1:8080`, streaming included, and require a device token.
-
-  * Pin `model` to the served model so clients can't address anything else. Enforce a request-size limit, and count requests and tokens per device for the Devices page.
-
-  * Keep prompts out of logs. Only metadata is recorded (device, token counts, latency).
-
-  * ✅ Implemented in `docker/server/gateway.py`:
-
-    * `GET /v1/models` and `POST /v1/chat/completions` require a device token and proxy to SGLang. Streaming is relayed event by event, and a client disconnect closes the upstream stream, which makes SGLang abort the generation.
-
-    * `model` is overwritten with the served model; SGLang alone would accept any name.
-
-    * Bodies over 4 MiB (`MAX_REQUEST_BYTES`) get `413`. Errors use OpenAI's `{"error": {...}}` shape, and the API answers `503` while the model is still loading.
-
-    * **Per-device token counts:** streaming clients such as Aider don't ask for usage, so the gateway asks SGLang for it (`stream_options.include_usage`). It records the final usage event, and strips that event when the client didn't ask for it. The Devices page shows requests and tokens in and out.
-
-  * ✅ Verified with the lifecycle example (`cargo run -p openphalanx-core --example lifecycle`):
-
-    * 401 without a token or with a bad one, model pinned (a request for "gpt-4" is served by `openphalanx-coder`), streaming ends with `[DONE]`, and a 5 MiB body gets 413.
-
-    * Usage is counted for both streaming and non-streaming calls, and a client that didn't ask for usage receives no usage events.
-
-    * A marker string in a prompt appears 0 times in the container log.
-
-  * ✅ Verified with **real Aider 0.86** on the client side: `OPENAI_API_BASE=https://<server>:9090/v1`, the device token as API key, and `--no-verify-ssl` for this test only (Step 4.4's proxy replaces that with certificate pinning). The edit was applied to the local working tree, uncommitted. The device was credited 761 prompt and 31 completion tokens, against Aider's own estimate of 753/30.
-
-* \[x\] **Step 4.2: Scaffold `oppx` (Rust, single binary)**
-
-  * Initialize `client/oppx` as a member of the Cargo workspace.
-
-  * Config in `~/.config/oppx/config.json` (mode `0600`): server URL, device id, device token and the pinned certificate fingerprint. Support several named servers, with one default.
-
-  * ✅ Implemented in `client/oppx`, split into a library (`config.rs`, unit-tested) and a thin `clap` binary. It has no dependency on the server crates.
-
-    * **Location:** the OS config dir (`~/.config/oppx/` on Linux, `~/Library/Application Support/oppx/` on macOS). `--config` or `OPPX_CONFIG` overrides it.
-
-    * **Format:** `{"default": name, "servers": {name: {url, device_id, device_name, token, fingerprint, paired_at}}}`. The first server added becomes the default, and removing the default promotes another.
-
-    * **Protection:** written atomically as `0600` inside a `0700` directory (the directory is tightened if it already exists). Loading warns, like `ssh`, if the file is readable by others.
-
-    * **Validation:**
-
-      * URLs are normalized to `https://host:port` (port 9090 if omitted, bracketed IPv6 allowed). Plain `http://`, paths and credentials are refused.
-
-      * Fingerprints are normalized to `AB:CD:…` (64 hex digits; colons, case and a `sha256:` prefix are all accepted).
-
-      * Server names are limited to 1–32 characters from `[A-Za-z0-9_-]`.
-
-    * **Commands so far:** `oppx servers` (never prints tokens) and `oppx use <name>`.
-
-    * **Name:** the client was first called `openbase`. Its command is now `oppx` (short for OpenPhalanx), to avoid clashing with common CLIs such as 1Password's `op`/`opx`. The crate, folder (`client/oppx`), config dir (`~/.config/oppx/`) and variable (`OPPX_CONFIG`) follow the same name.
-
-    * **Tests:** 6 unit tests cover the round trip with permissions, default handling, and URL, name and fingerprint validation. A CLI smoke test checked the warning on a `644` file, that saving tightens it to `600`/`700`, and that tokens are absent from the output.
-
-    * **Not yet:** tokens are stored in a protected file, like `gh` or `docker` do. Moving them to the OS keyring is a possible later hardening step.
-
-* \[x\] **Step 4.3: Pairing**
-
-  * `oppx pair https://<SERVER_IP>:9090 <CODE> [--name <device name>]`:
-
-    1. Connects, reads the server certificate, and shows its SHA-256 fingerprint for comparison with the GUI.
-
-    2. Calls `/v1/pair`, then stores the device token and the pinned fingerprint.
-
-  * `oppx status`: server reachability, model, and whether SGLang is ready.
-
-  * `oppx unpair`: forgets the server locally. Revocation happens in the GUI.
-
-  * ✅ Implemented (`client/oppx/src/{tls,api,main}.rs`, plus `POST /v1/unpair` in the gateway):
-
-    * **Certificate pinning** (`tls.rs`): a custom `rustls` verifier in front of `reqwest`. Trust is the SHA-256 of the server's self-signed certificate; hostnames and issuers are ignored, but TLS 1.2/1.3 handshake signatures are still verified against the certificate's key.
-
-    * **`oppx pair <server> <code>`:**
-
-      1. Probes the server and prints the certificate fingerprint, both as the app shows it (first 8 bytes) and in full.
-
-      2. Requires confirmation: an interactive `[y/N]`, or `--fingerprint <FP>` (full, or the app's 8-byte prefix), or an explicit `--yes`. With no terminal and neither flag, it refuses.
-
-      3. Redeems the code over a client already pinned to the approved certificate, so neither the code nor the returned token can reach another server.
-
-      Options: `--device-name` (default: hostname), `--as <name>` (default: derived from the address, e.g. `192-168-1-77`), and `--force` to replace an existing pairing.
-
-    * **`oppx status [name]`:** checks over the pinned connection that the certificate matches, the token is accepted (via `/v1/whoami`), and the model is ready, with its context length from `/v1/models`. Exits non-zero on a certificate change, which is reported as a warning naming both possible causes, or on a revoked token, with the exact re-pair command.
-
-    * **`oppx unpair [name]`:** goes further than planned. The device revokes its own token on the server (new `POST /v1/unpair`), then forgets it locally. `--local-only` skips the server, and if the server is unreachable it warns you to revoke the device in the app.
-
-  * ✅ Verified against the live backend: 10 unit tests plus end-to-end scenarios.
-
-    * **A wrong `--fingerprint`** aborts before the code is sent; the code stays valid.
-
-    * **The refusal paths** work: no terminal without a flag is refused, answering "n" cancels, and a wrong code gets a clear message.
-
-    * **Pairing with the app's 8-byte prefix** succeeds, and `status` shows all three checks. The config is `600`, and the token never appears in output.
-
-    * **An impostor TLS server** (a different certificate on another port) triggers the certificate-changed warning, and the impostor receives **no HTTP request**: the handshake is aborted, so the token is never sent.
-
-    * **After revoking in the app,** `status` reports the rejected token.
-
-    * **`pair --force`** re-pairs, and **`unpair`** removes the device on the server, confirmed through the admin API.
-
-* \[x\] **Step 4.4: Local proxy and agent launcher**
-
-  * `oppx proxy`: listens on `127.0.0.1:<random port>`, forwards to the server over TLS pinned to the stored fingerprint, and adds the device token. The agent talks plain HTTP to loopback, so it never needs to trust a self-signed certificate or see the token.
-
-  * `oppx aider [aider args…]`: starts the proxy, then runs the user's local Aider with `OPENAI_API_BASE` pointing at it, `--model openai/openphalanx-coder`, the model's context window, and `--no-auto-commits --no-dirty-commits` (agents never commit directly). It stops the proxy when Aider exits.
-
-  * Check that Aider is installed and print an install hint (`pipx install aider-chat` / `uv tool install aider-chat`). A built-in Rust agent loop, which would remove the Python dependency, is a later option.
-
-  * ✅ Implemented (`client/oppx/src/{proxy,agent,main}.rs`):
-
-    * **`oppx proxy [name] [--port N]`:** an `axum` server on `127.0.0.1` that forwards only `GET /v1/models` and `POST /v1/chat/completions` through the pinned `reqwest` client, adding the device token. Responses stream through as they arrive, and dropping the client closes the upstream request. Local clients must send a **random per-run key** (`oppx-local-…`), so other processes and users on the laptop can't use the device's identity, and the real token never leaves `oppx`. On a certificate change it refuses and returns 502. Useful on its own for other OpenAI-compatible tools.
-
-    * **`oppx aider [--server name] [-- aider args]`:**
-
-      1. Checks the certificate, token and model readiness first, failing with clear messages.
-
-      2. Writes a private model-metadata file with the real context length, so Aider doesn't warn about an unknown model.
-
-      3. Starts the proxy on a free port and runs the user's `aider` with only the local key and base URL. `OPENAI_BASE_URL` and `OPENAI_API_TYPE` are removed from Aider's environment.
-
-      4. Arguments are ordered as defaults (`--edit-format diff`, etc.), then the user's (which override them), then `--no-auto-commits --no-dirty-commits` (which nothing overrides). `--auto-commits` and `--dirty-commits` are rejected outright.
-
-      5. Ctrl-C goes to Aider while `oppx` keeps the proxy alive, and Aider's exit code is passed through. A missing `aider` gets install hints.
-
-  * ✅ Verified against the live backend (13 client unit tests plus end-to-end runs):
-
-    * **With a stand-in `aider`:** the exact argument order and the user's override were confirmed. The device token appears 0 times in the agent's environment, and the exit code (7) passed through.
-
-    * **The proxy on its own:** a missing or wrong key gets 401, other paths 404, and it listens on loopback only. Non-streaming works, and streaming arrives incrementally. **Disconnecting mid-generation leaves 0 running requests on SGLang.**
-
-    * **Real Aider 0.86.2 via `oppx aider`,** with no certificate flags: the edit was applied to a repo that had an uncommitted change, nothing was committed, and the device was credited 2,610/203 tokens.
-
-    * **Ctrl-C:** the agent received the interrupt, kept running, and its next request through the proxy returned 200.
-
-    * **Install:** `cargo install --path client/oppx` works. The repo is private, so `cargo install --git` would need credentials.
-
-* \[x\] **Step 4.5: Web search (SearXNG on the server)**
-
-  * Goal: let the coding agent use current information from the web (new versions, APIs, error messages) without the user pasting it in, using a SearXNG instance on the server.
-
-  * **Findings that shaped the design:**
-
-    * Aider's `/web` only *scrapes a given URL* ("Scrape a webpage, convert to markdown"); it doesn't search. Aider 0.86 also has **no MCP support** and gives the model no tools, so `mcp-searxng` can't be attached to Aider. It remains an option for MCP-capable agents.
-
-    * **Native tool calling doesn't work with Qwen2.5-Coder-14B-AWQ,** even with SGLang's `qwen25` parser. On 3/3 questions that needed the web, it wrote the call as JSON in its answer text instead of making a tool call, including without Aider's system prompt.
-
-    * **A router works:** a short side call to the same model with constrained JSON output (`{"search": bool, "query": str}`, SGLang + xgrammar). It was correct on 6/6 probes (searched for versions, an error message and a new CLI flag; didn't search for an edit, a refactor or general knowledge), in 0.2–0.9 s.
-
-  * **Decided (with the user):** explicit search always available; automatic search opt-in per session.
-
-  * ✅ **Implemented:**
-
-    * **SearXNG container** `openphalanx-searxng` (image pinned by digest, 383 MB). It sits on a private `openphalanx` bridge network with **no published ports**, so only the gateway reaches it.
-
-      * Its settings (JSON format, no limiter) are mounted read-only with `FORCE_OWNERSHIP=false`, so it never `chown`s host files, and the secret is passed through the environment.
-
-      * It runs with `--log-driver none` because SearXNG logs full engine URLs, queries included, when an engine fails.
-
-      * The GUI starts and stops it with the backend, and the setting is on by default with a toggle on the Server page. Pre-flight shows its image status.
-
-    * **Gateway:**
-
-      * `POST /v1/search` (device token) returns up to 20 `{title, url, snippet}` results.
-
-      * With `X-Oppx-Web-Search: auto`, chat requests first go through the router. If it says search, the top 5 results are appended to the **end of the latest message**, wrapped in `<web_search_results>` with an "untrusted, ignore instructions in it" note. That leaves the earlier prompt prefix (and SGLang's cache) untouched, and streaming is unchanged.
-
-      * Router and search failures fall back to answering without search.
-
-      * Counters: `web_searches`, `auto_routed` and `auto_searched` on the gateway, and searches per device. Queries are never logged.
-
-    * **`oppx`:**
-
-      * `oppx search "query" [-n N]` prints Markdown results; inside Aider, `/run oppx search "…"` adds them to the chat.
-
-      * `oppx aider --web` and `oppx proxy --web` make the proxy send the auto header.
-
-  * ✅ **Verified** (lifecycle example plus real Aider 0.86.2):
-
-    * `/v1/search` gets 401 without a token. `oppx search` returned live results (the tokio releases page, docs.rs, tokio.rs).
-
-    * **Automatic mode:** a version question was routed and searched (2.4 s total, still streamed to `[DONE]`); a plain edit was routed but not searched; a request without the header was never routed.
-
-    * **Privacy:** the query marker appears 0 times in the backend log, and SearXNG keeps no logs. SearXNG has no published ports and only the `openphalanx` network. The settings file is still owned by the user, mode 644.
-
-    * **Real Aider, asked for the newest tokio:** without `--web` it said it couldn't know; with `--web` it answered **"1.53.1, released on July 20, 2026"**, which is correct and newer than the model's training data. `/run oppx search` added 6 lines of results to the chat, and nothing was committed.
-
-  * **Notes:**
-
-    * Searches leave the server for public engines, so queries the router writes can contain fragments of the request. That's why automatic mode is opt-in.
-
-    * Some engines rate-limit or ask for a CAPTCHA (Brave and DuckDuckGo did); SearXNG falls back to the others.
-
-    * Web results are untrusted input. Since the agent never commits, any edit influenced by a malicious page still has to pass the user's `git diff`.
-
-* **Step 4.5 follow-up: web search on by default, with near-zero latency.**
-
-  * **Change:** at the user's request, automatic search is now **on by default** in `oppx`, `oppx aider` and `oppx proxy`; `--no-web` opts out. The user's requirement was "no noticeable drop of performance".
-
-  * **The cost of default-on:** the JSON router added **202 ms** to time-to-first-token on every turn (a cached Aider-sized edit: 34 ms without, 236 ms with). It's decode-bound, at about 12 JSON tokens.
-
-  * **Fixes:**
-
-    1. **Speculative routing:** the answer starts alongside the router, held unread until the router decides, and is aborted and resent if a search is needed. On its own this didn't help, because the router (200 ms) was slower than the cached first token (34 ms).
-
-    2. **A two-step router:** first a one-token, regex-constrained `yes`/`no` decision (about 40–50 ms), then a query call only on `yes`.
-
-    3. **Routing on the whole user turn:** real Aider follows the question with an empty message and "Reply in English.", and the router had been judging only that last line. Found by logging Aider's request with `--llm-history-file`.
-
-    4. **Few-shot examples** in the cached decide prompt: the bare yes/no prompt said "no" to "newest released version… reply with just the number". With the examples it scores 16/16 on mixed phrasings, including Aider's reminder (48 ms median).
-
-  * ✅ **Result:**
-
-    * Time-to-first-token goes from **39 ms** with `--no-web` to **66 ms** with the default: **+27 ms**.
-
-    * Searching requests take 1.7–2.3 s end to end, down from 2.4 s.
-
-    * Real Aider with defaults answers "newest tokio" as **1.53.1 (July 20, 2026)**, and with `--no-web` says it can't know.
-
-    * A real edit made 0 searches. The lifecycle routing checks still pass.
-
-* \[x\] **Step 4.6: CLI experience**
-
-  * Requested by the user after the first second-machine test.
-
-  * **Plain `oppx` starts Aider** in the current directory (same as `oppx aider`; `oppx --web` adds automatic search). With no server paired, it shows the banner and the three commands needed to get started.
-
-  * **Terminal graphics** (`client/oppx/src/ui.rs`, using `console` and `indicatif`):
-
-    * An **OPENPHALANX** banner in large block letters with a green-to-blue gradient, switching to a compact 2-row version on terminals narrower than 95 columns. It shows on `oppx`, before Aider starts, and after pairing.
-
-    * Spinners while connecting, checking, pairing and searching. Rounded panels for the certificate, pairing result, `status`, `servers` and `proxy`. Colored ✓ / ! / ✗ marks, and red `error:` and yellow `warning:` prefixes.
-
-    * Output is plain when not a terminal or when `NO_COLOR` is set. Piped `oppx search` output, as used by Aider's `/run`, has 0 escape codes.
-
-  * Also in this round: Aider must be installed with Python 3.12 or older. With 3.13 it crashes on a missing `audioop` module; this was found on the second desktop. The README, the `oppx` install hint and the troubleshooting table now say so.
-
-  * Previewed in a pty at 120 and 80 columns: the large and compact banners, the welcome screen, launching via plain `oppx`, and every panel line the same width. ✅ The user checked it on a real terminal.
-
-* \[x\] **Step 4.7: OpenPhalanx chat frontend (Claude-style, Aider hidden)**
-
-  * Requested by the user, with a performance requirement of no noticeable slowdown. A Python frontend on Aider's engine was chosen over a Rust agent (which would mean rebuilding the editing engine and risking edit quality) and over rewriting Aider's output in a pty (fragile).
-
-  * `oppx` now opens the OpenPhalanx chat by default, and `--classic` (or `oppx aider`) runs Aider's own UI. It's implemented as `client/oppx/frontend/oppx_chat.py`, embedded in `oppx` and run with Aider's interpreter, so there's no extra install. See `CLAUDE.md` for how it hooks into Aider.
-
-  * **Looks:** an OPENPHALANX banner, a "✻ Welcome to OpenPhalanx" box, separators around the input, a bottom status bar (server, model, context, web search, files in chat), a `✻ Thinking… (Ns · ctrl-c to interrupt)` spinner, `⏺` answers, and `⏺ Update(file)` diffs. It has its own `/help` and `/search`, and no Aider branding (none was found in the captured sessions).
-
-  * ✅ **Verified** in a pty session rendered with a terminal emulator:
-
-    * The welcome screen, `/help` and a question answered.
-
-    * An edit (including a model retry, collapsed to one line) shown as a diff, with the file modified and no commit.
-
-    * Web search on by default: "newest tokio" answered 1.53.1.
-
-    * Ctrl-C during a long answer returns to the prompt, and SGLang shows 0 running requests afterwards.
-
-    * `--classic` still launches Aider's UI. The repo's git config was untouched and there were no repo traces.
-
-  * **Aider pinned:** installs use `aider-chat==0.86.2` (Python 3.12), because the frontend relies on Aider internals.
-
-  * ✅ The user checked it on a real terminal ("the Python frontend looks amazing, and web search works perfectly fine too").
-
-* \[x\] **Step 4.8: Claude Code parity, sessions and `oppx --update`**
-
-  * Requested after the first real-terminal test, where the user reported that Ctrl-C couldn't close the session. The old prompt loop deliberately ignored Ctrl-C at the prompt.
-
-  * **Keys and commands like Claude Code:** see `CLAUDE.md` for the full list. `/resume` and launch flags `oppx "prompt"`, `-p`, `-c` and `-r` were added.
-
-  * **Sessions:** the user asked whether Aider already had session management. It has only `--restore-chat-history` over a single history file, and no separate sessions or picker. We now keep one file per conversation, with `-c` (latest), `-r` (picker) and `--resume <id>`.
-
-  * **Fixes found while testing in a pty:**
-
-    * Keys typed during a turn were swallowed by the Esc reader. They're now queued, or pre-filled at the next prompt.
-
-    * An Esc interrupt printed the partial answer twice. "Interrupted" is now printed after the live view closes, and mid-stream interrupts and `/ask` turns are both detected.
-
-    * **A plain question made a destructive edit:** "what does mul return?" deleted `mul`. Added the one-token ask/edit classifier (14/14, about 40 ms). The gateway now skips its search router for these utility calls, so the image was rebuilt.
-
-  * ✅ **Verified in pty sessions** (status bar rendered by answering CPR):
-
-    * Ctrl-C clears the line, and twice exits. Esc interrupts.
-
-    * `/status`, `!echo`, type-ahead `# memory`, Shift+Tab plan mode (no edit), an `@calc.py` question (no edit), `/cost`, `/mcp` (not available) and `/export` all behave.
-
-    * `-p` works when piped. The `-r` picker resumed a session with its history restored, and `-c` works. `--resume nope` gives a clear error, and an initial prompt is sent on start.
-
-  * ✅ **`oppx --update`, verified in an isolated clone with a local remote:**
-
-    * With local changes, it refuses with a clear message.
-
-    * Otherwise it pulled `53e6ac1 → 7a91fd2`, rebuilt, and the installed binary reports `7a91fd2`. It installed `aider 0.86.2`.
-
-    * Run again, it reports "Up to date".
-
-  * ✅ The user checked it on a real terminal.
-
-* \[x\] **Step 4.9: Smart context management and server safety bars**
-
-  * **Problem:** on a real repo, "explain the project" built a **46k-token** request for a 32k model. With no files in the chat, Aider lets the repo map grow to about 28k tokens. The frontend then auto-accepted every file the model asked for, and Aider offered to "proceed anyway" with "providers won't charge", which is meaningless for a local server.
-
-  * **Context manager** (frontend; details in `CLAUDE.md`): a budget based on the window, an answer reserve and the tokenizer margin, rather than a fixed percentage.
-
-    * **Priorities:** your message and memory first, then files edited or added by you, then files the model asked for, then the repo map, then old conversation.
-
-    * **Making room, cheapest first:** summarize the conversation (auto-compact), set aside the least recently used model-requested files (still visible in the repo map), then shrink the repo map.
-
-    * **Limits:** files too big to fit are refused with a reason, and nothing is ever sent over the limit. `/context` and the status bar show usage.
-
-  * **Server safety bars** (gateway): `n=1`, a `max_tokens` clamp, an early `413` for impossible inputs, per-device and global concurrency limits with a bounded queue (`503` "busy" with `retry-after`), a per-device rate limit (`429`), and disconnect-safe slot release.
-
-  * ✅ **Verified:**
-
-    * **SGLang under abuse:** 60k-token input and `max_tokens=100000` got clean 400s; 12 concurrent 20k-token requests all completed and the server stayed healthy.
-
-    * **Gateway:** `n=3` returns 1 choice; `max_tokens=100000` is clamped and returns 200; 300k characters gets a 413 with an explanation.
-
-    * **Concurrency and rate:** 12 concurrent requests from one device ran at most 4 at once, and all finished. 130 rapid requests gave 106 × 200 and 24 × 429, exactly the 120-per-minute limit. Active requests went back to 0, so no slot leaked.
-
-    * **Real repo (this one):** "explain this repo", then `/add` of three large files (about 21k tokens), then an edit. Model-requested files were set aside and the edit applied. The final context was 25,500 tokens against a 26,065 budget, with no overflow warnings.
-
-  * **Editing fixes after the user's real-terminal test.** Asked to edit `README.md`, the model printed the whole README instead of an edit, so nothing was applied. Aider then **offered to run the README's `bash` blocks**, and `sudo apt install …` ran and asked for a password.
-
-    * **Shell suggestions off:** `--no-suggest-shell-commands`. Commands run only from `!cmd` or `/run`.
-
-    * **Root cause:** the README contains ```` ``` ```` fences, so Aider switches its edit fence to four backticks, which models tend to ignore (Aider's own source notes this). Fix: a model-agnostic **whole-file retry**. When a change request yields no edit and the chat files are small, it retries once in `whole` format, shows only the diff, then switches back; if that also fails, it says "No changes were made".
-
-    * **Accurate diffs:** the content before an edit is captured in `OppxIO.write_text`, the path all edit formats write through. A file that joined the chat mid-turn now shows its real diff, not "Create … 84 additions".
-
-    * **No CPR warning:** y/N confirmations use plain `input()`, not prompt_toolkit.
-
-    * ✅ **Verified:** the user's exact request on the repo copy produced a 1-line README diff with 0 shell prompts. Called directly against the server, the whole-file retry inserted 2 lines into the fence-heavy README.
-
-  * **"Frozen" CLI fix** (user report: no thinking status, then the answer appeared all at once):
-
-    * **Cause:** Aider's `show_pretty()` turns off streaming *and* its spinner when the edit fence isn't plain triple backticks, which happens whenever a Markdown file with code blocks is in the chat. The steps before the first token (classification, repo map, context fitting) also had no indicator.
-
-    * **Fix:** one spinner for the whole turn; streaming always on; edit-block hiding for every fence style. The picker's age column is aligned too.
-
-    * ✅ **Verified** with `README.md` and `CLAUDE.md` in the chat, which forces a different fence: 73 spinner frames over the 8 s before the first token, a streamed answer (6 progressive redraws), and an edit applied with a correct 1-line diff and 0 raw edit markers on screen.
-
-  * ✅ The user checked it on a real terminal.
-
-* \[x\] **Step 4.10: Model-agnostic follow-ups** (principle in `CLAUDE.md`, from the user: everything must work across SGLang models)
-
-  * **Per-model data lives in the catalog, not in code.** `catalog.json` entries can set `edit_format` (default `diff`; e.g. `whole` for small models) and `reasoning_parser` (SGLang's `--reasoning-parser`, for models that think in `<think>` tags). The GUI passes them to the backend as `MODEL_ID`, `EDIT_FORMAT` and `SGLANG_EXTRA_ARGS`.
-
-  * **The server describes its model:** new `GET /v1/info` (device token) returns the served name, the real model id, context length, edit format, web search and readiness. A model started by hand shows its Hugging Face id even when `MODEL_PATH` is a cache snapshot path.
-
-  * **`oppx` uses it:**
-
-    * The startup line, `oppx status`, `oppx proxy` and the chat's welcome box, status bar and `/status` show the real model (e.g. `Qwen/Qwen2.5-Coder-14B-Instruct-AWQ`). This also answers the user's request for a way to see which model the server runs.
-
-    * Aider gets a `--model-settings-file` with the server's edit format and `use_repo_map: true`. Aider would otherwise fall back to `whole` and no repo map for our unknown model name. `--edit-format` still overrides it.
-
-    * Older servers without `/v1/info` still work, with the previous defaults.
-
-  * **Reasoning output is hidden:** `<think>…</think>` spans, a stray closing `</think>` (when the chat template opens the tag), and Aider's "► THINKING … ► ANSWER" markers are removed from the display. The spinner keeps running while the model reasons.
-
-  * **Exact token counts:** new `POST /v1/tokenize` (gateway, through the `oppx` proxy) counts with the loaded model's own tokenizer. After each answer the frontend measures the request it just sent, in the background, and keeps a running ratio of real tokens to Aider's estimate. The safety factor drops from a fixed 1.10 to that ratio × 1.03.
-
-  * **Probe harness:** `scripts/probe_routing.py` scores the web-search router (16 probes) and the ask/edit check (14 probes) against any OpenAI-compatible endpoint. It reads the prompts from the shipped files and exits non-zero below 90%.
-
-  * ✅ **Verified** after rebuilding the image and restarting through the lifecycle example (SGLang ready in 201 s, all lifecycle checks pass):
-
-    * `/v1/info` reports `Qwen/Qwen2.5-Coder-14B-Instruct-AWQ`, `diff`, 32k. `oppx status`, `oppx proxy` and a `-p` session show it.
-
-    * `/v1/tokenize` through the proxy: 13,972 tokens for `oppx_chat.py` in 32 ms.
-
-    * Aider's estimate is within 0.5–1.4% of the real count on four repo files. Calibration measured a ratio of 1.011, so the context budget went from 26,065 to 27,541 tokens.
-
-    * Probe harness on Qwen2.5-Coder-14B-AWQ: router 16/16 (median 45 ms), intent check 14/14 (median 41 ms).
-
-    * Reasoning hiding was checked on complete, unfinished and template-opened think blocks, and on Aider's markers; plain answers are untouched. It hasn't been tried on a real reasoning model yet (Step 5.3).
-
-## Phase 5: Validation, Model Matrix & Distribution
-
-Phase 4 delivered the whole client experience, so the original 5.1/5.2 (`oppx aider --message` smoke tests) are out of date. Phase 5 now proves the system in real conditions, across models, and makes it installable by people who aren't us.
-
-* \[ \] **Step 5.1: End-to-end validation from a separate laptop**
-
-  * The user's laptop (`philip-Victus-…`) has been running real sessions against this server since Step 4.6. What's left is a written checklist run on a clean machine, with results recorded here:
-
-    * a fresh install with only the documented steps, then pairing, `oppx status`, and a first session in a real repo;
-
-    * a question, a multi-file edit, a test run with `!cmd`, `/undo`, Esc and Ctrl-C, `-c` and `-r`;
-
-    * web search on and off (`--no-web`);
-
-    * revoking the device in the GUI mid-session, then a clear error on the next request;
-
-    * a server restart mid-session, then recovery without re-pairing.
-
-  * Compare latency with the benchmark in `CLAUDE.md` ("Design decision: agent on the client").
-
-* \[ \] **Step 5.2: Multi-turn prefix-cache benchmark**
-
-  * Script a 10-turn Aider-sized session (questions and edits on this repo) and record, per turn: prompt tokens, cached tokens (`#cached-token` in the SGLang log, or the GUI's "Prefix cache hit"), time to first token, and tokens/s.
-
-  * **New since Step 4.9:** the context manager changes the prompt (summarizing, setting files aside, shrinking the repo map), and every change breaks the cached prefix from that point on. Measure how often that happens. If it costs much, make fitting more stable, e.g. shrink in larger steps less often, or keep the repo map size fixed for a session once it fits.
-
-* \[ \] **Step 5.3: Model matrix**
-
-  * For every catalog model that fits a 24 GB card at 32k (and a reasoning model, to exercise `reasoning_parser` and the think-block hiding):
-
-    * `scripts/probe_routing.py` (router and intent check; at least 90% each);
-
-    * a fixed edit task in `diff` and in `whole` format, to choose each model's `edit_format` for the catalog;
-
-    * tokenizer ratio (from the calibration), tokens/s and time to first token.
-
-  * Record the results in a table here. Fix weak spots with prompt changes that are re-checked on every model, never with a parser for one model.
-
-* \[ \] **Step 5.4: Server GUI review and hardening** (Step 3.2 is still open)
-
-  * The user's first visual review of every page: Server, Models, Devices and Logs.
-
-  * Show the new data: the real model id, per-device concurrency and rate-limit hits (`429`/`503` counts), and the web-search toggle state.
-
-  * Error paths: Docker stopped, GPU busy, a failed download, a port in use, a revoked device.
-
-* \[ \] **Step 5.5: Distribution and CI/CD pipeline**
-
-  * **Requirements, from the user:**
-
-    > We need to package this up and distribute both server and client. Refer to how others distribute packages via `curl` and etc. End-user should not have to install aider-chat, and other dependencies by himself.
-    > Build CI/CD pipeline via github actions, and bump version. Versions gets determined by scale (bug, feature, major level), and by PR header (e.g "[bug]Fix ABCD" 0.0.1-> 0.0.2, or "[FEATURE]ASDFF" which would change to 0.1.2)
-    > We need automatic documentation generator upon new releases.
-
-  * **Client install, one line** (like `rustup`, `uv` and Ollama):
-
-    ```bash
-    curl -fsSL https://<release host>/install.sh | sh
-    ```
-
-    * The script detects the OS and architecture (Linux x86-64/arm64, macOS arm64/x86-64; Windows via PowerShell `irm … | iex` later), downloads the prebuilt `oppx` from the GitHub release, checks its SHA-256, and installs it to `~/.local/bin`.
-
-    * **No manual Aider install:** on first run (and in the installer), `oppx` sets up its own engine with a bundled or downloaded `uv`: a private Python 3.12 environment with `aider-chat==0.86.2` in `~/.local/share/oppx/engine`. It uses that instead of a global `aider`, so the user's Python setup can't break it (the Python 3.13 `audioop` problem goes away).
-
-    * **`oppx --update`** switches from "git pull and rebuild" to "download the latest release binary, verify it, replace yourself, then sync the engine". The git mode stays for source checkouts.
-
-  * **Server install:**
-
-    * The GUI as `.deb` and AppImage attached to each release, plus an `install.sh` for the server that checks the NVIDIA driver, Docker and the Container Toolkit, and installs the `.deb`.
-
-    * The backend image pushed to GHCR (public) with the release version. The 0.2.0 image is built locally but not pushed yet.
-
-  * **CI (every PR, GitHub Actions):** `cargo test`, `cargo clippy -D warnings`, `npm run check`, Python syntax and lint for the gateway and frontend, and a check that the PR title has a valid prefix. The GPU lifecycle test stays manual, or runs on a self-hosted runner on the server node later.
-
-  * **Versioning (on merge to `main`):** the PR title prefix decides the bump, case-insensitive:
-
-    | Prefix | Bump | Example |
-    |---|---|---|
-    | `[bug]` / `[fix]` | patch | 0.2.0 → 0.2.1 |
-    | `[feature]` | minor | 0.2.1 → 0.3.0 |
-    | `[major]` / `[breaking]` | major | 0.3.0 → 1.0.0 |
-
-    * A minor bump resets the patch number (standard semver: `[FEATURE]` on 0.0.2 gives 0.1.0). Confirmed with the user.
-
-    * The workflow bumps `Cargo.toml`, `app/package.json` and `app/src-tauri/tauri.conf.json` together (the rule in `CLAUDE.md`), commits, tags `vX.Y.Z`, and starts the release.
-
-  * **Release workflow (on a tag):** build `oppx` for each target, the `.deb`/AppImage and the backend image; push the image to GHCR; create the GitHub release with binaries, checksums and the install scripts.
-
-  * **Docs generated on release:**
-
-    * Release notes and `CHANGELOG.md` from the merged PR titles, grouped by prefix.
-
-    * A CLI reference generated from `oppx --help` (clap), and the gateway API reference from FastAPI's OpenAPI schema.
-
-    * Published with the user docs to GitHub Pages (e.g. mdBook), so the site always matches the latest release.
+# Milestones
+
+Roadmap and progress. Completed work is summarized below; details are in `CLAUDE.md` and the git history.
+
+## Completed
+
+### Phase 1: Environment
+* Server: RTX 3090 (24 GB), driver 580, Docker 29.5 with the `nvidia` runtime, Container Toolkit 1.19, SGLang 0.5.21 sees the GPU.
+* Client toolchain: Rust (Go not installed), so `oppx` is written in Rust.
+
+### Phase 2: Backend container
+* `docker/Dockerfile.server` on a digest-pinned SGLang base, run under supervisord. SGLang listens on `127.0.0.1:8080` only, served as `openphalanx-coder`.
+* Configured with `MODEL_PATH`, `CONTEXT_LENGTH`, `MEM_FRACTION_STATIC` and `SGLANG_EXTRA_ARGS`.
+* Qwen2.5-Coder-14B-AWQ at 32k uses 22.9 of 24 GB and is ready in about 3.5 min.
+* The first prototype ran Aider in the image (`/v1/run`, `aider-local`). In 0.2.0 it was removed once the agent moved to the client: the gateway venv is 37 MB and the image went from 53.3 to 52.6 GB.
+
+### Phase 3: Server app (Tauri 2 + Svelte 5, Linux)
+* User requirements:
+  * Linux first, with a VPN-style UI.
+  * A trusted model catalog with VRAM tables; weights are never distributed.
+  * Never OOM: refuse to start below the requirement.
+  * Images on GHCR.
+  * A secure pairing code.
+* **3.1 Engine manager** (`crates/openphalanx-core`, unit-tested without Tauri):
+  * **Docker control** through the CLI: daemon checks with fix-it hints, pull with a build fallback, run, stop, logs, reattach via a label.
+  * **Crash handling:** if SGLang dies, the container stops instead of restart-looping, and the GUI diagnoses why (OOM, missing files, port in use).
+  * **Models** are mounted read-only along their symlink chains, with `HF_HUB_OFFLINE=1`.
+  * **VRAM estimate** (conservative, checked against measured usage): weights ×1.05 (FP8 ×2 without native FP8), plus KV for 1.25 × the context, plus 2 GiB and 15% of the weights.
+    * 14B-AWQ at 32k needs 20.7 GiB and is allowed; 32B-AWQ is blocked.
+    * Start is refused below the requirement and flagged "tight" with under 1.5 GiB spare.
+    * `--mem-fraction-static` comes from the VRAM free at launch.
+  * **Catalog:** official Qwen coder repos pinned to commits. Downloads resume and are verified against Hugging Face's SHA-256. The HF cache is reused, and custom folders or URLs are checked before downloading.
+  * **Registry:** `ghcr.io/chophilip21/openphalanx-backend:<version>`. 0.1.0 is published; 0.2.0 is built but not pushed.
+* **Pairing and security:**
+  * TLS on `:9090` with a self-signed certificate; clients pin its fingerprint.
+  * 8-character single-use codes: 10 minutes, burned after 5 misses, 1 s delay per miss.
+  * 256-bit device tokens, stored hashed and revocable.
+  * Admin API on `127.0.0.1:9091` with a per-launch token.
+  * Prompts are never logged.
+* **3.2 GUI:** the Server, Models, Devices and Logs pages build and run, and the `.deb` is 5.9 MiB. The status poll no longer spams the SGLang log. The visual review is still open (Step 5.4).
+
+### Phase 4: Client agent and `oppx`
+* **4.1 Inference gateway:**
+  * Token-protected OpenAI-compatible `/v1/models` and `/v1/chat/completions`, streaming, with the model pinned.
+  * `413` over 4 MiB, `503` while loading.
+  * Per-device token counts (usage is requested from SGLang and stripped when the client didn't ask).
+  * Verified: 401s, a prompt marker 0 times in the logs, real Aider credited 761/31 tokens.
+* **4.2 `oppx` scaffold:**
+  * Multiple named servers in a `0600` config with an ssh-style permission warning.
+  * Strict URL, fingerprint and name validation.
+  * Renamed from `openbase` to avoid clashing with 1Password's `op`/`opx`.
+* **4.3 Pairing:**
+  * A custom rustls verifier pins the certificate's SHA-256.
+  * `pair` asks for confirmation (`[y/N]`, `--fingerprint` or `--yes`) and redeems the code only over the pinned connection.
+  * `status` checks certificate, token and model; `unpair` self-revokes via `/v1/unpair`.
+  * Verified: an impostor certificate gets no HTTP request.
+* **4.4 Local proxy and launcher:**
+  * The `axum` loopback proxy adds the device token and requires a random per-run local key; the agent never sees the token.
+  * `oppx aider` passes the context metadata and always appends `--no-auto-commits --no-dirty-commits`.
+  * Verified: a mid-generation disconnect leaves 0 running requests, and real Aider edited without committing.
+* **4.5 Web search:**
+  * SearXNG on a private Docker network: no ports, no logs, image pinned by digest.
+  * `POST /v1/search` and `oppx search`.
+  * Native tool calls don't work on Qwen-14B, so a router decides instead. Results are appended to the end of the latest message as untrusted text, which keeps the cached prefix.
+  * **Follow-up (on by default, `--no-web` opts out):**
+    * A one-token `yes`/`no` decision (few-shot, cached; 16/16 correct) runs on the whole user turn.
+    * The answer starts speculatively alongside it.
+    * Cost: +27 ms time to first token (39 → 66 ms). Searches take 1.7–2.3 s, and "newest tokio" was answered correctly.
+* **4.6 CLI experience:**
+  * Plain `oppx` starts the chat.
+  * OPENPHALANX gradient banner (large and compact), spinners, rounded panels, ✓/!/✗ rows.
+  * Plain output when piped or with `NO_COLOR`.
+  * Aider must use Python ≤ 3.12 (3.13 lacks `audioop`).
+  * Checked by you on a real terminal.
+* **4.7 Chat frontend:**
+  * A Claude-style Python UI over Aider's engine, embedded in `oppx` and run with Aider's interpreter; `--classic` gives Aider's UI.
+  * Welcome box, status bar, `✻ Thinking…` spinner, `⏺` answers, `⏺ Update(file)` diffs, no Aider branding.
+  * Aider pinned to 0.86.2. Checked by you on a real terminal.
+* **4.8 Claude Code parity:**
+  * **Keys and commands:** Ctrl-C clears or exits, Esc interrupts, Shift+Tab plan mode, `!cmd`, `@file`, `# note`, `/clear /compact /context /resume …`.
+  * **Sessions:** one file per conversation, with `-c`, `-r` and `--resume <id>`.
+  * **Ask/edit classifier** (one constrained token, 14/14): questions can't edit files (one used to delete `mul`).
+  * **`oppx --update`:** fast-forward, rebuild, pin the engine.
+  * Type-ahead is kept during a turn.
+* **4.9 Context management and safety bars:**
+  * Fixed a real 46k-token request to a 32k model.
+  * **Budget:** (context − 4096) / tokenizer factor.
+  * **Making room, cheapest first:** summarize (auto-compact), set aside least-recently-used model-requested files, shrink the repo map (8k → 1k), set aside older files. Files too big to fit are refused, nothing is sent over the limit, and `/context` shows the breakdown.
+  * **Gateway safety bars:** `n=1`, a `max_tokens` clamp, an early `413`, 4 requests per device and 8 server-wide with a 120 s queue then `503`, 120 requests a minute (`429`), leak-proof slot release.
+  * Verified: SGLang survived abuse, the limits held exactly, and this repo fit at 25.5k of a 26.1k budget.
+  * **Editing fixes:**
+    * Shell suggestions off (the README's `sudo apt` was offered).
+    * One whole-file retry when the diff format fails.
+    * Accurate diffs from a `write_text` snapshot.
+    * Streaming and the spinner forced on (Aider turned both off for non-standard fences, which looked like a freeze).
+* **4.10 Model-agnostic follow-ups:**
+  * **Catalog data:** `edit_format` and `reasoning_parser` per model.
+  * **`/v1/info`:** reports the real model id (shown in `status`, `proxy` and the chat), and `oppx` passes Aider a model settings file with the edit format and the repo map on.
+  * **Reasoning:** `<think>` and Aider's THINKING/ANSWER markers are hidden.
+  * **`/v1/tokenize`** calibrates the context budget against the server's tokenizer: ratio 1.011, budget 26,065 → 27,541.
+  * **`scripts/probe_routing.py`:** router 16/16 and intent check 14/14 on Qwen-14B.
+
+### Phase 5 (completed steps)
+* **5.2 Prefix-cache benchmark** (`scripts/bench_session.py`, 10 real turns; `OPPX_DUMP_REQUESTS` shows where requests diverge):
+  * **Found:** only 3–7% cached. The repo map was re-ranked every turn, and ask mode used a different system prompt.
+  * **Fixed** (`oppx_chat/cache.py`): a whole-repo map cached per (file list, size) whose size only shrinks within a session; questions share the edit prompts plus a prose-only note; a fixed map heading.
+  * **Result:** 50% cached (77k of 156k), computed tokens 204k → 78k, time until the second answer starts 4.8 s → 0.6 s. Edit quality unchanged.
+* **5.6 Frontend split** (your request): `oppx_chat.py` (1,500 lines) is now the `oppx_chat/` package (`config`, `term`, `render`, `context`, `oppx_io`, `routing`, `cache`, `commands`, `app`) plus `run.py`, layered with no upward imports. A test checks every module is embedded; the pty regression passed.
+
+## Open
+
+* \[ \] **Step 5.1: End-to-end validation from a clean laptop.** A fresh install with only the documented steps (the release installer), pair, `status`, then a real session: a question, a multi-file edit, `!cmd` tests, `/undo`, Esc/Ctrl-C, `-c`/`-r`, web on and off. Revoke mid-session and expect a clear error; restart the server and recover without re-pairing. Compare latency with `CLAUDE.md`'s benchmark.
+
+* \[ \] **Step 5.3: Model matrix.** For every catalog model that fits 24 GB at 32k, plus one reasoning model:
+  * `probe_routing.py` (at least 90% each);
+  * a fixed edit task in `diff` and in `whole`, to set the catalog's `edit_format`;
+  * tokenizer ratio, tokens/s, time to first token.
+
+  Record a table here, and fix weak spots only with prompt changes that are re-checked on every model.
+
+* \[ \] **Step 5.4: Server GUI review and hardening** (includes Step 3.2):
+  * your visual review of Server, Models, Devices and Logs;
+  * show the model id, rate-limit and busy counts, and the web-search state;
+  * error paths: Docker stopped, GPU busy, a failed download, a port in use, a revoked device.
+
+* \[ \] **Step 5.5: Distribution and CI/CD.** Your requirements:
+
+  > We need to package this up and distribute both server and client. Refer to how others distribute packages via `curl` and etc. End-user should not have to install aider-chat, and other dependencies by himself.
+  > Build CI/CD pipeline via github actions, and bump version. Versions gets determined by scale (bug, feature, major level), and by PR header (e.g "[bug]Fix ABCD" 0.0.1-> 0.0.2, or "[FEATURE]ASDFF" which would change to 0.1.2)
+  > We need automatic documentation generator upon new releases.
+
+  * ✅ **Versioning:**
+    * `scripts/bump_version.py`: `[bug]`/`[fix]` patch, `[feature]` minor, `[major]` major. A minor bump resets the patch number (0.0.2 → 0.1.0), confirmed with you.
+    * Bumps all five version files, writes `CHANGELOG.md`, and fails PRs into `main` that have no prefix.
+  * ✅ **Workflows** (`actionlint` clean):
+    * `ci.yml`: app check, clippy `-D warnings`, tests, ruff, shell syntax, PR title.
+    * `release.yml`: bump, tag, `oppx` for Linux musl (x86-64/arm64) and macOS (arm64/x86-64), `.deb` and AppImage, `SHA256SUMS`, GitHub release, docs to Pages.
+    * The image is built only with a self-hosted `IMAGE_RUNNER`.
+    * The static x86-64 build was reproduced locally (8 MB).
+  * ✅ **Private engine** (`engine.rs`): uv, Python 3.12 and Aider 0.86.2 in `~/.local/share/oppx/engine`. A fresh machine with no Aider or uv was set up and answering in 7 s.
+  * ✅ **Updates and installers:**
+    * `oppx --update` release mode: checksum-verified self-replace (says so when no release exists yet).
+    * `install.sh` (client) and `install-server.sh` (prerequisite checks plus the `.deb`), both checksum-verified.
+  * ✅ **Docs:** `scripts/gen_docs.py` builds README, CLI and API references (every gateway route documented), CLAUDE.md, the roadmap and the changelog with mdBook.
+  * **Left for you:**
+    * One-time repository settings (Actions write, Pages source "GitHub Actions", public GHCR package).
+    * Then the first `[feature]` PR `dev` → `main` runs the pipeline end to end; check it with Step 5.1. macOS and arm64 builds run for the first time there.
 
 ## Future Improvement
 

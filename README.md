@@ -22,14 +22,13 @@ You need:
 * Linux x86-64 with an NVIDIA GPU (24 GB recommended) and a working `nvidia-smi`
 * Docker, with your user in the `docker` group
 * [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-* Rust, Node.js 20+, and the WebKitGTK build packages:
+Install the app (Ubuntu/Debian; the installer checks the items above first):
 
 ```bash
-sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
-  libayatana-appindicator3-dev librsvg2-dev libxdo-dev build-essential
+curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/install-server.sh | sh
 ```
 
-Build and start the app:
+Or build it from source (also needs Rust, Node.js 20+ and the WebKitGTK packages listed in [`CLAUDE.md`](CLAUDE.md)):
 
 ```bash
 git clone -b dev https://github.com/chophilip21/openPhalanx.git
@@ -48,13 +47,14 @@ Open port `9090/tcp` to your laptops' network.
 
 ## Connect a laptop
 
-On the laptop (needs [Rust](https://rustup.rs) and [uv](https://docs.astral.sh/uv/)):
+On the laptop (Linux or macOS), install `oppx`. It sets up its own coding engine, so there's nothing else to install:
 
 ```bash
-git clone -b dev https://github.com/chophilip21/openPhalanx.git
-cargo install --path openPhalanx/client/oppx
-oppx --update                     # installs the coding engine; run it any time to update everything
+curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/install.sh | sh
+oppx --update                     # run any time to update oppx and its engine
 ```
+
+Or from source, with [Rust](https://rustup.rs): `cargo install --path openPhalanx/client/oppx` in a clone of this repo. The installers need a published [release](https://github.com/chophilip21/openPhalanx/releases); until the first one, use the from-source steps.
 
 Pair once, with the address and code shown in the app. `oppx` prints the server's certificate fingerprint; check that it matches the one in the app, then confirm:
 

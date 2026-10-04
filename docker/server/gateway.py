@@ -345,11 +345,13 @@ class PairResponse(BaseModel):
 
 @app.get("/health")
 async def health() -> dict:
+    """Liveness and model readiness; no token needed."""
     return {"gateway": "ok", "sglang": "ready" if await sglang_ready() else "unavailable"}
 
 
 @app.post("/v1/pair", response_model=PairResponse)
 async def pair(req: PairRequest) -> PairResponse:
+    """Trades a one-time pairing code for a device token."""
     if not pairing.redeem(req.code):
         # Slow down guessing; codes also die after PAIRING_MAX_ATTEMPTS misses.
         await asyncio.sleep(1)
@@ -560,6 +562,7 @@ class SearchRequest(BaseModel):
 
 @app.post("/v1/search")
 async def search(req: SearchRequest, device: dict = Depends(require_device)) -> Response:
+    """Web search through the private SearXNG instance: `{query, max_results}` → `{results: [{title, url, snippet}]}`."""
     try:
         results = await web_search(req.query, req.max_results)
     except SearchUnavailable as e:
@@ -616,6 +619,7 @@ def _record_usage(device: dict, payload: bytes) -> None:
 
 @app.get("/v1/models")
 async def list_models(device: dict = Depends(require_device)) -> Response:
+    """OpenAI-compatible model list (the one served model)."""
     try:
         r = await upstream().get("/v1/models")
     except httpx.HTTPError:
@@ -722,6 +726,7 @@ def _sanitize(body: dict) -> str | None:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, device: dict = Depends(require_device)) -> Response:
+    """OpenAI-compatible chat completions (streaming supported), with safety limits and optional automatic web search (`X-Oppx-Web-Search: auto`)."""
     try:
         raw = await _read_body(request)
     except _TooLarge:
@@ -861,6 +866,7 @@ def require_admin(x_admin_token: str = Header(default="")) -> None:
 
 @admin.get("/admin/status", dependencies=[Depends(require_admin)])
 async def admin_status() -> dict:
+    """Backend, SGLang and gateway state for the server app."""
     ready = await sglang_ready()
     return {
         "sglang": "ready" if ready else "unavailable",
@@ -876,22 +882,26 @@ async def admin_status() -> dict:
 
 @admin.post("/admin/pairing", dependencies=[Depends(require_admin)])
 async def admin_new_pairing() -> dict:
+    """Issues a new pairing code (single use, 10 minutes)."""
     return pairing.new()
 
 
 @admin.delete("/admin/pairing", dependencies=[Depends(require_admin)])
 async def admin_clear_pairing() -> dict:
+    """Cancels the current pairing code."""
     pairing.clear()
     return pairing.describe()
 
 
 @admin.get("/admin/devices", dependencies=[Depends(require_admin)])
 async def admin_devices() -> list[dict]:
+    """Paired devices with their usage counts."""
     return devices.public()
 
 
 @admin.delete("/admin/devices/{device_id}", dependencies=[Depends(require_admin)])
 async def admin_revoke(device_id: str) -> dict:
+    """Revokes a device; its token stops working immediately."""
     if not devices.revoke(device_id):
         raise HTTPException(status_code=404, detail="unknown device")
     return {"revoked": device_id}

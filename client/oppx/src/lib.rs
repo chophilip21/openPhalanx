@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod api;
 pub mod config;
+pub mod engine;
 pub mod proxy;
 pub mod tls;
 pub mod ui;

@@ -11,9 +11,9 @@ Working notes for developing this repo: architecture, operations, commands and c
 * **Agents never commit directly:** any agent launcher or config (Aider, `oppx aider`, etc.) must use `--no-auto-commits --no-dirty-commits`. The user reviews with `git diff` and commits themselves.
 * **Commits:** never commit or push unless the user explicitly asks for that commit. Finish with an uncommitted diff and a summary.
 * **Model-agnostic:** everything that makes the experience seamless must work with any model SGLang serves. Use constrained decoding (regex or JSON schema) rather than per-model tool-call or reasoning parsers, put unavoidable per-model differences in catalog data, and check accuracy with probe sets against the loaded model rather than tuning prompts to one model.
-* **Branching:** work happens on `dev`; `main` holds the initial history only.
+* **Branching and releases:** work happens on `dev`. A PR from `dev` into `main` is a release: its title prefix sets the version bump (`[bug]`/`[fix]` patch, `[feature]` minor, `[major]` major; `[docs]`, `[ci]`, `[chore]`, `[test]`, `[refactor]` don't release). See "Releasing" below.
 * **Toolchain on the server node:** `cargo` is in `~/.cargo/bin` (not on the non-interactive `PATH`), so use `export PATH=$HOME/.cargo/bin:$PATH`. `uv`/`uvx` are in `~/.local/bin`.
-* **Versioning:** the backend image tag equals the workspace version in `Cargo.toml`. Bump `Cargo.toml`, `app/package.json` and `app/src-tauri/tauri.conf.json` together when `docker/` changes.
+* **Versioning:** the backend image tag equals the workspace version in `Cargo.toml`. The release workflow bumps `Cargo.toml`, `Cargo.lock`, `app/package.json`, `app/package-lock.json` and `app/src-tauri/tauri.conf.json` together (`scripts/bump_version.py`); don't bump by hand.
 * **Verify before claiming:** run `cargo test -p openphalanx-core`, `cargo clippy --workspace --all-targets`, `(cd app && npm run check)`, and for backend changes the lifecycle example (about 4 min, needs the GPU).
 
 ## Architecture
@@ -66,6 +66,7 @@ Openphalanx splits the work along a single line: **code and execution stay on th
 | Server GUI (`app/`, Linux) | Builds and runs; first UI review pending |
 | Pairing, TLS and device tokens | Working |
 | `oppx` client CLI | Working: `pair` (certificate pinning), `status`, `unpair`, `aider` (local Aider through a pinned loopback proxy), `proxy`, `servers`, `use` |
+| Distribution (CI, releases, installers, docs) | Written and linted locally; the first GitHub release hasn't run yet (milestone Step 5.5) |
 
 ## Requirements
 
@@ -153,7 +154,7 @@ oppx pair <server> <code> [--fingerprint FP | --yes] [--as NAME] [--device-name 
 oppx status [NAME]                            # certificate pinned ✓, token valid ✓, model ready + context
 oppx [PROMPT] [--no-web] [--classic]          # chat frontend (--classic: Aider's UI); unpaired: banner + how to pair
 oppx -c | -r [ID] | -p PROMPT                 # continue latest session · resume (picker or id) · print mode (one answer)
-oppx --update                                 # pull the source checkout, rebuild if changed, install pinned engine
+oppx --update                                 # update oppx (release download, or source pull + rebuild) and its engine
 oppx aider [--server NAME] [--no-web] [-- aider args]   # local Aider via pinned loopback proxy; never commits
 oppx proxy [NAME] [--port N] [--no-web]       # proxy only; prints OPENAI_API_BASE and a per-run local key
 oppx search "query" [-n N]                    # web search via the server's SearXNG (Markdown; use /run in Aider)
@@ -168,8 +169,9 @@ oppx servers | oppx use NAME
   * There's an OPENPHALANX banner: large 5-row block letters at 95 columns or more, a compact 2-row version below that, with a green-to-blue gradient. It also has spinners on stderr, rounded panels, and ✓ / ! / ✗ rows.
   * Output is plain when stdout or stderr isn't a terminal, or when `NO_COLOR` is set. This matters because `/run oppx search` output goes into Aider's chat. Keep it that way.
   * To preview in a pty, use `script -qec "stty rows 40 cols 120; oppx status" /dev/null`. The rows matter: a pty with 0 rows reports no size, so the compact banner is used.
-* **Chat frontend** (`client/oppx/frontend/oppx_chat.py`, embedded with `include_str!`):
-  * **How it runs:** `oppx` writes the file to `~/.cache/oppx/oppx_chat-<version>.py` and runs it with the Python from the `aider` launcher's shebang, so `aider`, `prompt_toolkit` and `rich` are importable.
+* **Chat frontend** (`client/oppx/frontend/`: the `oppx_chat` package plus `run.py`, embedded with `include_str!` via `agent::FRONTEND`):
+  * **Modules**, lowest layer first; each imports only from the ones above it (the map is in `oppx_chat/__init__.py`): `config` (environment from oppx), `term` (output, spinner, Esc), `render` (streamed answers, diffs), `context` (`ContextManager`), `oppx_io` (Aider's IO, prompt, keys), `routing` (ask/edit check), `cache` (prefix-cache patches), `commands` (slash commands, memory), `app` (Aider patches, turn loop, `main`). A new module must also be listed in `agent::FRONTEND`; a unit test checks this.
+  * **How it runs:** `oppx` writes the package to `~/.cache/oppx/frontend-<version>-<hash>/` and runs `run.py` with the Python of the Aider venv (the `python` next to the real launcher, or its shebang), so `aider`, `prompt_toolkit` and `rich` are importable.
   * **How it hooks into Aider:** it sets `aider.main.InputOutput` to its own `OppxIO`, and `base_coder.WaitingSpinner` to its `Thinking` spinner. It calls `aider.main.main(argv, return_coder=True)`, then loops over `coder.run_one()` itself, handling `SwitchCoder` the way Aider's main loop does.
   * **What it changes on screen:**
     * It hides Aider's announcements, URLs and `Tokens:` lines.
@@ -184,7 +186,7 @@ oppx servers | oppx use NAME
   * **Esc interrupt:** `EscWatcher` holds the terminal in cbreak mode during a turn and turns a lone Esc into SIGINT. It pauses whenever a question needs an answer. Keystrokes typed during a turn are kept: finished lines are queued as the next messages, and a partial line is pre-filled.
   * **Interrupts:** Aider's `keyboard_interrupt` (which exits on a double press) is replaced. A mid-stream interrupt is detected from the "I see that you interrupted…" note Aider records; check the coder returned after `SwitchCoder` too.
   * **Ask/edit routing:** each normal message goes through a one-token `ask`/`edit` classification by the server's model through the proxy (about 40 ms, 14/14 on probes). Questions run as `/ask`, so they can't edit. Without it, Qwen-14B in diff mode deleted `mul` when asked "what does mul return?". The gateway skips the web-search router for requests that carry `regex` or `response_format`.
-  * **Context manager** (`ContextManager` in `oppx_chat.py`):
+  * **Context manager** (`oppx_chat/context.py`):
     * **Hooks:** it wraps `Coder.format_messages`, so every request Aider builds is fitted first.
     * **Budget:** `(context − 4096 reserved for the answer) / factor`. The factor covers the gap between Aider's generic token count and the model's real tokenizer: 1.10 until calibrated (26,065 tokens at 32k), then the measured ratio × 1.03. After each answer, `ContextManager.calibrate` counts the request it just sent with the server's tokenizer (`POST /v1/tokenize` via the proxy, in a background thread) and keeps a running average. On Qwen2.5-Coder the ratio is about 1.01, giving 27,541 tokens.
     * **Making room, cheapest loss first:**
@@ -206,12 +208,22 @@ oppx servers | oppx use NAME
   * **Model info:** `oppx` reads `GET /v1/info` at start-up and passes `OPPX_MODEL_ID` (shown in the welcome box, status bar and `/status`) and a `--model-settings-file` with the server's `edit_format` and `use_repo_map: true` (Aider otherwise assumes `whole` and no repo map for our model name). Reasoning output (`<think>` spans, a lone `</think>`, Aider's "► THINKING / ► ANSWER" markers) is hidden by `hide_reasoning`, and the spinner keeps going while the model reasons.
   * **Memory:** `OPENPHALANX.md` (and `AGENTS.md` if present) in the repo root is loaded read-only every turn. `/init` asks the model to write it.
   * **Sessions:** one file per conversation in `~/.local/state/oppx/history/<repo>-<id>/<YYYYmmdd-HHMMSS>.md`, with a shared `input.history`. The old single per-repo file is migrated as session `00000000-000000`. `-c` and `-r` pass `--restore-chat-history`.
+  * **Prefix-cache friendliness** (`oppx_chat/cache.py`; measured with `scripts/bench_session.py`, milestone Step 5.2). SGLang only reuses an unchanged prompt prefix, and two things used to change near the start of every request, giving 3–7% cache hits over 10 turns:
+    * **Repo map:** Aider re-ranked it around the chat files and the names each message mentions. It's now ranked once for the whole repo and cached per (file list, map size). The context manager's map size only shrinks within a session (reset by `/clear`).
+    * **System prompt:** questions ran in Aider's ask mode, which has its own prompts. `AskCoder` now gets the editing coder's prompts, and the question carries `ASK_NOTE`; ask mode never applies edits. The map heading's `{other}` word is fixed too.
+
+    Result: 50% of prompt tokens served from cache over the same 10 turns, and follow-up questions start answering in 0.6 s instead of 4.8 s. The rest is inherent: new or edited files, files moving into the history after the first edit, and compaction. `OPPX_DUMP_REQUESTS=<file>` writes every request as JSON lines to find where consecutive requests diverge.
   * **Testing:** drive it in a pty (Python `pty.fork`, 120×40 via `TIOCSWINSZ`). The driver must **answer cursor-position requests** (`ESC[6n` → `ESC[30;1R`), or prompt_toolkit never draws the status bar. Render the raw bytes with `pyte` to see the real screen.
-* **`--update`** (`client/oppx/src/update.rs`):
-  * It works on the checkout `oppx` was built from (`CARGO_MANIFEST_DIR/../..`), and refuses if that checkout has local changes.
-  * It fetches and fast-forwards. It rebuilds with `cargo install --locked --path client/oppx` when it pulled anything, or when the commit embedded at build time (`build.rs`, shown in `oppx --version`) differs from the checkout's HEAD.
-  * It makes sure `aider-chat==agent::AIDER_VERSION` is installed, preferring `uv tool install --python 3.12`, then `pipx`.
-  * To test it in isolation, use a scratch clone with a local bare remote, plus `CARGO_INSTALL_ROOT`, `UV_TOOL_DIR` and `UV_TOOL_BIN_DIR` set to scratch directories.
+* **Coding engine** (`client/oppx/src/engine.rs`): users never install Aider.
+  * `oppx` keeps a private engine in `~/.local/share/oppx/engine/` (`OPPX_ENGINE_DIR` overrides): `bin/uv`, a uv-managed Python 3.12 (`UV_PYTHON_PREFERENCE=only-managed`, so a system 3.13 can't break it), and `aider-chat==agent::AIDER_VERSION` installed with `uv tool install` into `tools/`. About 740 MB.
+  * **Lookup order:** the private engine at the pinned version, then an `aider` on `PATH` at exactly the pinned version (handy on dev machines), otherwise install the private one (`engine::ensure`). Versions are read from the venv's `aider_chat-X.Y.Z.dist-info` folder, not by importing Aider (2 s).
+  * uv is reused when present (the private copy, `PATH`, `~/.local/bin`, `~/.cargo/bin`); otherwise Astral's installer runs with `UV_UNMANAGED_INSTALL` into `engine/bin`, with no shell-profile changes.
+  * The frontend runs on the venv's `python` next to the real launcher. uv writes a `#!/bin/sh` trampoline instead of a Python shebang when the path is long, so the shebang alone isn't reliable.
+  * To test a first install, run with `HOME` pointing to an empty folder and `PATH=/usr/bin:/bin` (verified: about 7 s on this network, uv download included).
+* **`--update`** (`client/oppx/src/update.rs`) has two modes:
+  * **Release builds** (`OPPX_RELEASE_TARGET` set at build time by the release workflow): read GitHub's latest release, download `oppx-<target>.tar.gz`, check it against `SHA256SUMS`, unpack next to the current binary and rename over it. A 404 means no release yet.
+  * **Source builds:** work on the checkout `oppx` was built from (`CARGO_MANIFEST_DIR/../..`), and refuse if it has local changes. Fetch and fast-forward, then rebuild with `cargo install --locked --path client/oppx` when anything was pulled, or when the commit embedded at build time (`build.rs`, shown in `oppx --version`) differs from HEAD. To test in isolation, use a scratch clone with a local bare remote and `CARGO_INSTALL_ROOT` set to a scratch folder.
+  * Both modes then install or refresh the private engine.
 * **Stand-in agents:** a fake `aider` script on `PATH` (printing its args and env) is a quick way to test `oppx aider` without the real agent.
 
 ## Web search
@@ -283,10 +295,24 @@ cargo run -p openphalanx-core --example download -- <repo> <dir>  # verified, re
 
 docker build -f docker/Dockerfile.server -t ghcr.io/chophilip21/openphalanx-backend:0.2.0 docker/
 scripts/publish-image.sh                                        # build and push to GHCR (needs write:packages)
+scripts/bench_session.py --oppx target/debug/oppx               # prefix-cache benchmark (in a scratch copy of a repo)
+scripts/gen_docs.py --oppx target/debug/oppx --out target/docs  # docs sources; then: mdbook build target/docs
 OPENAI_API_BASE=… OPENAI_API_KEY=… scripts/probe_routing.py     # via `oppx proxy --no-web`; run after any model change
 ```
 
 The backend image tag follows the version in the root `Cargo.toml`, so bump both together when changing `docker/`. The base SGLang image is pinned by digest in `docker/Dockerfile.server`.
+
+## Releasing
+
+* **CI** (`.github/workflows/ci.yml`, every PR and push to `dev`/`main`): app build and type check, `cargo clippy -D warnings`, `cargo test` for core and `oppx`, ruff (syntax and undefined names) for the gateway, frontend and scripts, shell syntax, and the PR title check for PRs into `main`. The GPU lifecycle test stays manual.
+* **Release** (`.github/workflows/release.yml`, a merged PR into `main` with a release prefix, or run by hand with a bump and a changelog line):
+  1. `scripts/bump_version.py` bumps every version file, adds the `CHANGELOG.md` entry, and the workflow commits "Release vX.Y.Z" to `main`, tags it, and fast-forwards `dev` when possible.
+  2. `oppx` is built for `x86_64`/`aarch64-unknown-linux-musl` (static) and `aarch64`/`x86_64-apple-darwin`, with `OPPX_RELEASE_TARGET` set. The app is built as `.deb` and AppImage.
+  3. A GitHub release gets the archives, `SHA256SUMS`, `install.sh`, `install-server.sh`, and notes from the changelog.
+  4. The docs (`scripts/gen_docs.py` + mdBook) go to GitHub Pages.
+  5. The backend image (about 50 GB, too big for GitHub's runners) is built and pushed only when the repository variable `IMAGE_RUNNER` names a self-hosted runner (e.g. `["self-hosted","gpu"]`). Otherwise run `scripts/publish-image.sh <version>` on the server node after the release.
+* **One-time repository settings:** Actions → workflow permissions "Read and write"; if `main` is protected, allow GitHub Actions to push to it; Pages → source "GitHub Actions"; make the GHCR package public.
+* Lint the workflows locally with `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest`.
 
 ## Troubleshooting
 
@@ -297,7 +323,7 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
 | "Port 9090 is already in use" | Another program, or an old backend container, holds the port: `docker ps`, then `docker rm -f openphalanx-backend` |
 | Start disabled with "Needs X but only Y of VRAM is free" | Close other GPU programs (`nvidia-smi` lists them), or choose a smaller model or context |
 | Image download fails with "denied" or "unauthorized" | The GHCR package is private: make it public, or `docker login ghcr.io`. From a source checkout, the GUI builds the image locally instead |
-| `oppx aider` crashes with `No module named 'audioop'` / `'pyaudioop'` | Aider was installed with Python 3.13, which removed `audioop` (needed by Aider's `pydub` dependency). Reinstall with `uv tool install --force --python 3.12 aider-chat` |
+| `oppx aider` crashes with `No module named 'audioop'` / `'pyaudioop'` | An `aider` on `PATH` was installed with Python 3.13, which removed `audioop`. `oppx` only uses a `PATH` Aider at the pinned version; otherwise it uses its private 3.12 engine. Run `oppx --update`, or remove the old Aider |
 | Backend stops during start-up | The GUI shows the reason; the full output is on **Logs** or in `docker logs openphalanx-backend` |
 
 ## Repository layout
@@ -312,9 +338,15 @@ crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight
 docker/                  backend image: SGLang + gateway under supervisord (no agent code)
   server/gateway.py      TLS gateway: pairing, device tokens, admin API
 client/oppx/             client CLI: config.rs (paired servers, 0600 file), tls.rs (fingerprint pinning),
-                         api.rs (gateway calls), main.rs (clap commands)
+                         api.rs (gateway calls), engine.rs (private Aider), update.rs, main.rs (clap commands)
+  frontend/              chat frontend: oppx_chat/ package + run.py (embedded in the binary)
+.github/workflows/       ci.yml (every PR/push), release.yml (merged PR into main -> release)
 scripts/publish-image.sh build and push the backend image to GHCR
 scripts/probe_routing.py score the search router and ask/edit check against the loaded model
+scripts/bench_session.py 10-turn prefix-cache benchmark through a real oppx session
+scripts/bump_version.py  version bump from a PR title, plus the CHANGELOG.md entry
+scripts/gen_docs.py      docs site sources (README, CLI and API reference, CLAUDE.md, roadmap)
+scripts/install*.sh      client and server installers (attached to each release)
 milestone.md             roadmap and progress
 ```
 

@@ -7,7 +7,7 @@ by a regex so any model can answer them:
 * the gateway's web-search router (DECIDE_PROMPT in docker/server/gateway.py):
   does this message need a web search? (yes|no)
 * the chat frontend's intent check (INTENT_PROMPT in
-  client/oppx/frontend/oppx_chat.py): does this message ask for a change? (ask|edit)
+  client/oppx/frontend/oppx_chat/routing.py): does this message ask for a change? (ask|edit)
 
 The prompts are read from those files, so this always tests what ships. Run
 it whenever the model changes; a model that scores badly needs a prompt fix
@@ -124,7 +124,7 @@ def main():
         p.error("set OPENAI_API_BASE or pass --base")
 
     decide = constant(ROOT / "docker/server/gateway.py", "DECIDE_PROMPT")
-    intent = constant(ROOT / "client/oppx/frontend/oppx_chat.py", "INTENT_PROMPT")
+    intent = constant(ROOT / "client/oppx/frontend/oppx_chat/routing.py", "INTENT_PROMPT")
     scores = [
         run_set("Web-search router (yes|no)", decide, "(yes|no)", SEARCH_CASES, args),
         run_set("Intent check (ask|edit)", intent, "(ask|edit)", INTENT_CASES, args),

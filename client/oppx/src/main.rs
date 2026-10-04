@@ -207,7 +207,7 @@ async fn run(cli: Cli) -> Result<()> {
     };
     if cli.update {
         ui::banner();
-        return oppx::update::run();
+        return oppx::update::run().await;
     }
     let mut cfg = Config::load(&path)?;
     // Plain `oppx` starts coding right away once a server is paired.
@@ -645,7 +645,7 @@ fn ago(t: std::time::SystemTime) -> String {
 async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args: &[OsString]) -> Result<i32> {
     let (web, classic) = (launch.web, launch.classic);
     agent::reject_commit_flags(user_args)?;
-    let aider = agent::find_aider()?;
+    let aider = oppx::engine::ensure().await?;
     let (name, s) = cfg.server(name)?;
     if !launch.print {
         ui::banner();

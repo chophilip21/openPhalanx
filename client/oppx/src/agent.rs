@@ -17,13 +17,35 @@ pub const NO_COMMIT_FLAGS: [&str; 2] = ["--no-auto-commits", "--no-dirty-commits
 /// The Aider release the chat frontend is built and tested against.
 pub const AIDER_VERSION: &str = "0.86.2";
 
-/// The OpenPhalanx chat frontend (Python), run with Aider's own interpreter.
-pub const FRONTEND: &str = include_str!("../frontend/oppx_chat.py");
+/// The OpenPhalanx chat frontend (a Python package plus its launcher), run
+/// with Aider's own interpreter. Paths are relative to the frontend folder.
+pub const FRONTEND: &[(&str, &str)] = &[
+    ("run.py", include_str!("../frontend/run.py")),
+    ("oppx_chat/__init__.py", include_str!("../frontend/oppx_chat/__init__.py")),
+    ("oppx_chat/config.py", include_str!("../frontend/oppx_chat/config.py")),
+    ("oppx_chat/term.py", include_str!("../frontend/oppx_chat/term.py")),
+    ("oppx_chat/render.py", include_str!("../frontend/oppx_chat/render.py")),
+    ("oppx_chat/context.py", include_str!("../frontend/oppx_chat/context.py")),
+    ("oppx_chat/oppx_io.py", include_str!("../frontend/oppx_chat/oppx_io.py")),
+    ("oppx_chat/routing.py", include_str!("../frontend/oppx_chat/routing.py")),
+    ("oppx_chat/cache.py", include_str!("../frontend/oppx_chat/cache.py")),
+    ("oppx_chat/commands.py", include_str!("../frontend/oppx_chat/commands.py")),
+    ("oppx_chat/app.py", include_str!("../frontend/oppx_chat/app.py")),
+];
 
 /// The Python interpreter Aider was installed with, from its launcher's
 /// shebang (`uv tool` and `pipx` write an absolute path there), so the
 /// frontend can import `aider`, `prompt_toolkit` and `rich`.
 pub fn aider_python(aider: &Path) -> Result<PathBuf> {
+    // uv and pipx install into a venv: use the `python` next to the real
+    // launcher. (With long paths uv writes a `#!/bin/sh` trampoline instead
+    // of a Python shebang, so the shebang alone isn't enough.)
+    if let Some(bin) = std::fs::canonicalize(aider).ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        let python = bin.join("python");
+        if is_executable(&python) && bin.parent().is_some_and(|v| v.join("pyvenv.cfg").is_file()) {
+            return Ok(python);
+        }
+    }
     let head = std::fs::read(aider).with_context(|| format!("cannot read {}", aider.display()))?;
     let first = String::from_utf8_lossy(&head[..head.len().min(512)]).lines().next().unwrap_or_default().to_string();
     let Some(shebang) = first.strip_prefix("#!") else {
@@ -51,15 +73,33 @@ pub fn aider_python(aider: &Path) -> Result<PathBuf> {
 /// Writes the frontend to `<cache dir>/oppx/oppx_chat-<version>.py` (only
 /// when missing or different) and returns its path.
 pub fn write_frontend() -> Result<PathBuf> {
-    let dir = dirs::cache_dir().context("cannot determine a cache directory")?.join("oppx");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("oppx_chat-{}.py", env!("CARGO_PKG_VERSION")));
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(FRONTEND) {
-        let tmp = path.with_extension("py.tmp");
-        std::fs::write(&tmp, FRONTEND)?;
-        std::fs::rename(&tmp, &path)?;
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for (path, text) in FRONTEND {
+        hash.update(path.as_bytes());
+        hash.update(text.as_bytes());
     }
-    Ok(path)
+    let id = format!("{:x}", hash.finalize());
+    // One folder per frontend build, so a running session is never changed underneath.
+    let root = dirs::cache_dir().context("cannot determine a cache directory")?.join("oppx");
+    let dir = root.join(format!("frontend-{}-{}", env!("CARGO_PKG_VERSION"), &id[..12]));
+    let launcher = dir.join("run.py");
+    if !launcher.is_file() {
+        let tmp = tempfile::tempdir_in({
+            std::fs::create_dir_all(&root)?;
+            &root
+        })?;
+        for (path, text) in FRONTEND {
+            let file = tmp.path().join(path);
+            std::fs::create_dir_all(file.parent().expect("relative path"))?;
+            std::fs::write(file, text)?;
+        }
+        // Another oppx may have written it meanwhile; either copy is identical.
+        if std::fs::rename(tmp.path(), &dir).is_err() && !launcher.is_file() {
+            bail!("cannot write the chat frontend to {}", dir.display());
+        }
+    }
+    Ok(launcher)
 }
 
 /// Finds `aider` on `PATH`.
@@ -68,11 +108,7 @@ pub fn find_aider() -> Result<PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join("aider"))
         .find(|p| is_executable(p))
-        .context(
-            "aider is not installed (or not on PATH). Install it with one of:\n  \
-             uv tool install --python 3.12 aider-chat==0.86.2\n  pipx install --python python3.12 aider-chat==0.86.2\n\
-             (or simply: oppx --update)",
-        )
+        .context("aider is not on PATH")
 }
 
 #[cfg(unix)]
@@ -437,7 +473,24 @@ mod tests {
 
     #[test]
     fn frontend_is_embedded() {
-        assert!(FRONTEND.contains("def run(argv)") && FRONTEND.contains("return_coder=True"));
+        let app = FRONTEND.iter().find(|(p, _)| *p == "oppx_chat/app.py").expect("app module").1;
+        assert!(app.contains("def run(argv)") && app.contains("return_coder=True"));
+        // Every module in the package must be embedded, or imports fail at runtime.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("frontend/oppx_chat");
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".py") {
+                let path = format!("oppx_chat/{name}");
+                assert!(FRONTEND.iter().any(|(p, _)| *p == path), "{path} is not in agent::FRONTEND");
+            }
+        }
+    }
+
+    #[test]
+    fn writes_the_frontend_package() {
+        let launcher = write_frontend().unwrap();
+        assert!(launcher.ends_with("run.py"));
+        assert!(launcher.parent().unwrap().join("oppx_chat/app.py").is_file());
     }
 
     #[test]
