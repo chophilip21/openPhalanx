@@ -1,4 +1,6 @@
 :root {
+  /* Dark theme (default). Every color the app uses is a token here, so the
+     light theme below only has to redefine tokens. */
   --bg: #0a0e16;
   --surface: #111725;
   --surface-2: #171f31;
@@ -8,21 +10,69 @@
   --muted: #8a95ab;
   --faint: #5b6680;
   --on: #34d399;
+  --on-strong: #5ee6b0;
+  --on-ink: #04130c;
   --on-glow: rgba(52, 211, 153, 0.35);
+  --on-soft: rgba(52, 211, 153, 0.12);
   --busy: #fbbf24;
   --busy-glow: rgba(251, 191, 36, 0.3);
+  --busy-soft: rgba(251, 191, 36, 0.12);
   --bad: #f87171;
   --bad-glow: rgba(248, 113, 113, 0.3);
+  --bad-soft: rgba(248, 113, 113, 0.12);
+  --bad-text: #fecaca;
+  --warn-text: #fde68a;
   --link: #60a5fa;
+  --violet: #a78bfa;
+  --slate: #64748b;
+  --nav-bg: linear-gradient(180deg, #0d1320, #0a0e16);
+  --log-bg: #070a10;
+  --log-text: #c4cce0;
+  --ring-soft: rgba(255, 255, 255, 0.02);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
   --radius: 14px;
   --font: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
   color-scheme: dark;
 }
 
+:root[data-theme="light"] {
+  --bg: #f4f6fa;
+  --surface: #ffffff;
+  --surface-2: #eef1f6;
+  --surface-3: #e2e7f0;
+  --border: #d9dfe9;
+  --text: #121826;
+  --muted: #5a6478;
+  --faint: #9aa3b5;
+  --on: #059669;
+  --on-strong: #047857;
+  --on-ink: #ffffff;
+  --on-glow: rgba(5, 150, 105, 0.28);
+  --on-soft: rgba(5, 150, 105, 0.1);
+  --busy: #d97706;
+  --busy-glow: rgba(217, 119, 6, 0.25);
+  --busy-soft: rgba(217, 119, 6, 0.1);
+  --bad: #dc2626;
+  --bad-glow: rgba(220, 38, 38, 0.22);
+  --bad-soft: rgba(220, 38, 38, 0.08);
+  --bad-text: #991b1b;
+  --warn-text: #92400e;
+  --link: #2563eb;
+  --violet: #7c3aed;
+  --slate: #94a3b8;
+  --nav-bg: linear-gradient(180deg, #ffffff, #f4f6fa);
+  --log-bg: #0f1420;
+  --log-text: #d6dcea;
+  --ring-soft: rgba(15, 23, 42, 0.03);
+  --shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+  color-scheme: light;
+}
+
 * { box-sizing: border-box; }
 
 html, body {
+  transition: background 0.2s, color 0.2s;
   margin: 0;
   height: 100%;
   background: var(--bg);
@@ -46,8 +96,8 @@ button {
 }
 button:hover:not(:disabled) { background: var(--surface-3); }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
-button.primary { background: var(--on); border-color: var(--on); color: #04130c; font-weight: 600; }
-button.primary:hover:not(:disabled) { background: #5ee6b0; }
+button.primary { background: var(--on); border-color: var(--on); color: var(--on-ink); font-weight: 600; }
+button.primary:hover:not(:disabled) { background: var(--on-strong); border-color: var(--on-strong); }
 button.danger { color: var(--bad); }
 button.ghost { background: transparent; border-color: transparent; color: var(--muted); }
 button.ghost:hover:not(:disabled) { color: var(--text); background: var(--surface-2); }
@@ -68,6 +118,7 @@ input:focus, select:focus { border-color: var(--link); }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 18px 20px;
+  box-shadow: var(--shadow);
 }
 
 .eyebrow {
@@ -92,9 +143,9 @@ input:focus, select:focus { border-color: var(--link); }
   border-radius: 999px;
   white-space: nowrap;
 }
-.badge.ok { color: var(--on); background: rgba(52, 211, 153, 0.12); }
-.badge.tight { color: var(--busy); background: rgba(251, 191, 36, 0.12); }
-.badge.insufficient { color: var(--bad); background: rgba(248, 113, 113, 0.12); }
+.badge.ok { color: var(--on); background: var(--on-soft); }
+.badge.tight { color: var(--busy); background: var(--busy-soft); }
+.badge.insufficient { color: var(--bad); background: var(--bad-soft); }
 .badge.neutral { color: var(--muted); background: var(--surface-2); }
 
 .page { padding: 28px 32px; height: 100%; overflow-y: auto; }
@@ -102,9 +153,9 @@ input:focus, select:focus { border-color: var(--link); }
 .page .sub { color: var(--muted); margin: 0 0 22px; }
 
 .error-banner {
-  border: 1px solid rgba(248, 113, 113, 0.4);
-  background: rgba(248, 113, 113, 0.08);
-  color: #fecaca;
+  border: 1px solid var(--bad-glow);
+  background: var(--bad-soft);
+  color: var(--bad-text);
   border-radius: 10px;
   padding: 10px 14px;
   display: flex;

@@ -122,6 +122,15 @@ Roadmap and progress. Completed work is summarized below; details are in `CLAUDE
   * your visual review of Server, Models, Devices and Logs;
   * show the model id, rate-limit and busy counts, and the web-search state;
   * error paths: Docker stopped, GPU busy, a failed download, a port in use, a revoked device.
+  * ✅ **First review round** (your feedback):
+    * The Server page is now one centred column: the power button, then a large pairing code under it, then a Grafana-style dashboard instead of side panels.
+    * The dashboard has cluster tiles, a nodes table (one row per node and GPU) and six live charts over the last 10 minutes. It's built on a node list (`lib/metrics.svelte.ts`) so a server cluster only adds rows.
+    * "Devices" is now "Client" in the nav, right below Server, and the page title is "Client Devices". The server fingerprint moved there from the pairing card.
+    * The pairing code has its own centred section (code, copyable `oppx pair` command, New code / Cancel), without fingerprint or web-search text.
+    * The nav logo is `assets/openphalanx-shield-green.svg` (copied to `app/src/assets/logo.svg`).
+    * Light and dark themes with a toggle in the nav. It follows the system until you choose, and every colour is a token in `app.css`.
+    * The nav collapses to icons below 760 px.
+    * Checked in headless Chrome with mock data: both themes, running and stopped, and 1400/1280/720 px widths.
 
 * \[ \] **Step 5.5: Distribution and CI/CD.** Your requirements:
 

@@ -278,7 +278,7 @@
     border-top: 1px solid var(--border);
   }
   .tr.th { border-top: none; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); font-weight: 600; padding: 8px 18px; }
-  .tr.selected { background: rgba(52, 211, 153, 0.04); box-shadow: inset 3px 0 0 var(--on); }
+  .tr.selected { background: var(--on-soft); box-shadow: inset 3px 0 0 var(--on); }
   .name { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
   .title { font-weight: 600; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .link { border: none; background: none; padding: 0; color: var(--link); font-size: 11.5px; text-align: left; display: inline-flex; gap: 4px; align-items: center; }
@@ -297,7 +297,7 @@
   .pbar { height: 6px; border-radius: 4px; background: var(--bg); overflow: hidden; }
   .pbar div { height: 100%; background: var(--on); transition: width 0.3s; }
   .small { font-size: 12px; }
-  .dl-error { grid-column: 1 / -1; display: flex; gap: 8px; align-items: center; color: #fecaca; font-size: 12.5px; }
+  .dl-error { grid-column: 1 / -1; display: flex; gap: 8px; align-items: center; color: var(--bad-text); font-size: 12.5px; }
   .custom { display: flex; flex-direction: column; gap: 10px; }
   .custom p { margin: 0; }
   .custom-row { display: flex; gap: 8px; }

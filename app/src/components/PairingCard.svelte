@@ -3,8 +3,7 @@
   import { api, errorText, type Pairing } from "../lib/api";
   import { countdown } from "../lib/format";
 
-  let { pairing, endpoint, fingerprint }: { pairing: Pairing | null; endpoint: string | null; fingerprint: string } =
-    $props();
+  let { pairing, endpoint }: { pairing: Pairing | null; endpoint: string | null } = $props();
 
   let now = $state(Date.now());
   let busy = $state(false);
@@ -38,7 +37,7 @@
   }
 </script>
 
-<div class="card pairing">
+<section class="pairing">
   <div class="head">
     <span class="eyebrow">Pair a client</span>
     {#if active}<span class="expires">expires in {countdown(pairing?.expires_at, now)}</span>{/if}
@@ -46,76 +45,76 @@
 
   {#if active && pairing?.code}
     <button class="code mono" onclick={() => copy(pairing!.code!, "code")} title="Copy code">
-      {pairing.code}
-      <span class="copy">{#if copied === "code"}<Icon name="check" size={16} />{:else}<Icon name="copy" size={16} />{/if}</span>
+      <span>{pairing.code}</span>
+      <span class="copy">{#if copied === "code"}<Icon name="check" size={20} />{:else}<Icon name="copy" size={20} />{/if}</span>
     </button>
-    <p class="muted hint">
-      Single-use, valid for 10 minutes, and burned after 5 wrong attempts. Run this on the client:
-    </p>
     <button class="cmd mono" onclick={() => copy(command, "cmd")} title="Copy command">
       <span>{command}</span>
       {#if copied === "cmd"}<Icon name="check" size={14} />{:else}<Icon name="copy" size={14} />{/if}
     </button>
   {:else}
-    <p class="muted hint">
-      No active pairing code. Already-paired devices keep working; generate a code only to add a new one.
-    </p>
+    <p class="muted hint">No active code. Paired clients keep working.</p>
   {/if}
 
-  <div class="foot">
+  <div class="actions">
     <button onclick={regenerate} disabled={busy}>
       <Icon name="refresh" size={14} />
       {active ? "New code" : "Generate code"}
     </button>
     {#if active}
-      <button class="ghost" onclick={() => api.clearPairingCode()}>Cancel code</button>
+      <button class="ghost" onclick={() => api.clearPairingCode()}>Cancel</button>
     {/if}
   </div>
-
-  <div class="fp">
-    <span class="eyebrow">Server fingerprint</span>
-    <span class="mono fpv" title="Clients verify this TLS certificate fingerprint when pairing">
-      {fingerprint ? fingerprint.split(":").slice(0, 8).join(":") + "…" : "–"}
-    </span>
-  </div>
   {#if error}<p class="err">{error}</p>{/if}
-</div>
+</section>
 
 <style>
-  .pairing { display: flex; flex-direction: column; gap: 10px; }
-  .head { display: flex; justify-content: space-between; align-items: center; }
-  .expires { font-size: 12px; color: var(--busy); font-variant-numeric: tabular-nums; }
-  .code {
-    font-size: 34px;
-    font-weight: 600;
-    letter-spacing: 0.12em;
-    padding: 12px 16px;
-    border-radius: 12px;
-    background: var(--bg);
-    border: 1px dashed var(--border);
+  .pairing {
+    width: 100%;
+    max-width: 560px;
+    margin: 0 auto;
     display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    padding: 22px clamp(16px, 4vw, 32px) 20px;
+    text-align: center;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    box-shadow: var(--shadow), 0 0 0 4px var(--on-soft);
+  }
+  .head { display: flex; gap: 12px; align-items: baseline; justify-content: center; flex-wrap: wrap; }
+  .expires { font-size: 12.5px; color: var(--busy); font-variant-numeric: tabular-nums; }
+  .code {
+    font-size: clamp(30px, 6vw, 54px);
+    font-weight: 650;
+    letter-spacing: 0.12em;
+    padding: 12px clamp(14px, 3vw, 26px);
+    border-radius: 14px;
+    background: var(--bg);
+    border: 1px dashed var(--on);
+    display: inline-flex;
     justify-content: center;
     align-items: center;
     gap: 14px;
     color: var(--on);
+    max-width: 100%;
   }
   .copy { color: var(--muted); display: inline-flex; }
-  .hint { margin: 0; font-size: 12.5px; }
+  .hint { margin: 0; font-size: 13px; }
   .cmd {
-    font-size: 12px;
-    display: flex;
+    font-size: 12.5px;
+    display: inline-flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    padding: 8px 10px;
+    gap: 10px;
+    padding: 7px 12px;
     background: var(--bg);
-    text-align: left;
     color: var(--muted);
+    max-width: 100%;
   }
   .cmd span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .foot { display: flex; gap: 8px; }
-  .foot button { display: inline-flex; align-items: center; gap: 6px; }
-  .fp { display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border); padding-top: 10px; }
-  .fpv { font-size: 11.5px; color: var(--muted); }
+  .actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; width: 100%; }
+  .actions button { display: inline-flex; align-items: center; gap: 6px; }
   .err { color: var(--bad); margin: 0; font-size: 12.5px; }
 </style>

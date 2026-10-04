@@ -42,11 +42,17 @@
 </script>
 
 <div class="page">
-  <h1>Devices</h1>
+  <h1>Client Devices</h1>
   <p class="sub">
     Clients that have paired with this server. Each holds its own token, stored here only as a hash. Revoking cuts
     a device off immediately.
   </p>
+  {#if app.snapshot?.admin?.tls_fingerprint}
+    <p class="fp" title="oppx pair shows this fingerprint; check that the two match before confirming">
+      <span class="muted">Server fingerprint</span>
+      <span class="mono selectable">{app.snapshot.admin.tls_fingerprint}</span>
+    </p>
+  {/if}
 
   {#if !available}
     <div class="card empty muted">
@@ -91,4 +97,6 @@
   .name { display: flex; flex-direction: column; }
   .title { font-weight: 600; }
   .small { font-size: 12.5px; }
+  .fp { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; margin: -12px 0 20px; }
+  .fp .mono { word-break: break-all; }
 </style>

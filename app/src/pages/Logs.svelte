@@ -58,7 +58,7 @@
     flex: 1;
     min-height: 0;
     overflow: auto;
-    background: #070a10;
+    background: var(--log-bg);
     border: 1px solid var(--border);
     border-radius: 12px;
     padding: 12px 14px;
@@ -66,7 +66,7 @@
     line-height: 1.55;
     white-space: pre-wrap;
     word-break: break-all;
-    color: #c4cce0;
+    color: var(--log-text);
   }
   .err { color: var(--bad); }
   .warn { color: var(--busy); }

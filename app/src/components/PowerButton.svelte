@@ -49,7 +49,7 @@
     border: 2px solid var(--c);
     color: var(--c);
     background: radial-gradient(circle at 50% 35%, var(--surface-3), var(--surface));
-    box-shadow: 0 0 0 8px rgba(255, 255, 255, 0.02), 0 0 48px var(--g);
+    box-shadow: 0 0 0 8px var(--ring-soft), 0 0 48px var(--g);
     display: grid;
     place-items: center;
     transition: transform 0.15s, box-shadow 0.3s, color 0.3s, border-color 0.3s;

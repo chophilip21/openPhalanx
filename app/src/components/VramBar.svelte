@@ -43,9 +43,9 @@
   }
   .seg { height: 100%; }
   .seg:first-child { border-radius: 5px 0 0 5px; }
-  .weights { background: #60a5fa; }
-  .kv { background: #a78bfa; }
-  .overhead { background: #64748b; border-radius: 0 5px 5px 0; }
+  .weights { background: var(--link); }
+  .kv { background: var(--violet); }
+  .overhead { background: var(--slate); border-radius: 0 5px 5px 0; }
   .overhead.insufficient { background: var(--bad); }
   .avail {
     position: absolute;
