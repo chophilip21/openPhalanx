@@ -48,7 +48,7 @@ def _stable_map_heading(coder):
 # 2. The system prompt, which differed between questions (Aider's ask mode)
 #    and edits. Questions now use the edit prompts too, plus a note in the
 #    message; ask mode never applies edits, so a stray edit block is harmless.
-ASK_NOTE = "(This is a question: answer it in prose. Don't write edit blocks or file listings; no files will be changed.)"
+ASK_NOTE = "(This is not a change request: just reply in plain text, as in a normal chat. Don't use SEARCH/REPLACE blocks; no files will be changed.)"
 
 
 class _EditPrompts:
@@ -63,6 +63,14 @@ def _ask_init(self, *args, **kwargs):
     if _EditPrompts.prompts is not None:
         self.gpt_prompts = _EditPrompts.prompts
     _stable_map_heading(self)
+
+
+def _ask_file_mentions(self, content):
+    """A question's answer that names a file adds it to the chat (for the next
+    question) but doesn't trigger Aider's "I added these files" follow-up
+    request, which made the model answer a second time with filler."""
+    super(AskCoder, self).check_for_file_mentions(content)
+    return None
 
 
 _orig_coder_init = base_coder.Coder.__init__

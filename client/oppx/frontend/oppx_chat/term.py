@@ -21,6 +21,8 @@ class UiState:
     plan_mode = False  # shift+tab: discuss only, no edits (Aider's ask mode)
     quiet = False  # suppress the model's text (whole-file retries show only the diff)
     before: dict = {}  # abs path -> content before this turn's first write
+    originals: dict = {}  # same, None for a file the turn created (for /undo)
+    undo: dict = {}  # originals of the last turn that edited files
     interrupted = False
     queued: list = []  # whole lines typed while the model was working
     prefill = ""  # a partly typed line, put back at the next prompt

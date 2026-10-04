@@ -142,8 +142,10 @@ class OppxIO(InputOutput):
         if key not in UI.before:
             try:
                 UI.before[key] = Path(filename).read_text(encoding=self.encoding)
+                UI.originals[key] = UI.before[key]
             except (OSError, UnicodeDecodeError):
                 UI.before[key] = ""
+                UI.originals[key] = None if not Path(filename).exists() else ""
         return super().write_text(filename, content, *args, **kwargs)
 
     def get_assistant_mdstream(self):

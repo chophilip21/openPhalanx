@@ -10,7 +10,7 @@ from .config import MODEL_LABEL
 INTENT_PROMPT = """Classify the programmer's message to a coding assistant.
 
 Answer "edit" when the message asks to change the code or files in any way: add, write, create, implement, fix, refactor, rename, remove, delete, update, optimize, or "make it ..." — including polite questions such as "can you add tests?".
-Answer "ask" when the message only wants information: a question, an explanation, a review, an opinion, or a plan, without asking for any change to be made.
+Answer "ask" when the message only wants information or text in the reply: a question, an explanation, a review, an opinion, a plan, an essay, a joke, a translation, or a general-knowledge request, without asking for any file or code to be changed.
 
 Examples:
 Message: What does the parse function return? -> ask
@@ -18,6 +18,8 @@ Message: Explain how the cache works in this repo. -> ask
 Message: Why does this test fail? -> ask
 Message: Is this function thread safe? -> ask
 Message: Review my changes. -> ask
+Message: Write a short essay about the history of computing. -> ask
+Message: Tell me a joke. -> ask
 Message: Add a function sub(a, b) to calc.py. -> edit
 Message: Can you add unit tests for config.rs? -> edit
 Message: Fix the failing test. -> edit

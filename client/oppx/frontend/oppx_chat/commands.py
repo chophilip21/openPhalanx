@@ -206,6 +206,29 @@ def git_diff(root: str) -> str:
         return ""
 
 
+def undo_edits() -> None:
+    """Restores the files the last editing turn changed (nothing is committed,
+    so this is a file restore, not a git revert). Works once per turn."""
+    if not UI.undo:
+        step("Nothing to undo: no edits were made in this session yet.", YELLOW)
+        return
+    names = []
+    for path, content in UI.undo.items():
+        p = Path(path)
+        try:
+            if content is None:
+                p.unlink(missing_ok=True)
+            else:
+                p.write_text(content, encoding="utf-8")
+        except OSError as e:
+            step(f"Couldn't restore {escape(p.name)}: {escape(str(e))}", YELLOW)
+            continue
+        names.append(p.name)
+    UI.undo = {}
+    if names:
+        step(f"Undid the last edit: restored {escape(', '.join(names))}", GREEN)
+
+
 def translate(coder, text: str):
     """Maps Claude-style input to what Aider understands. Returns the text to
     run, or None when the input was fully handled here."""
@@ -275,8 +298,10 @@ def translate(coder, text: str):
         return f"/run {shlex.quote(OPPX_BIN)} search {shlex.quote(arg)}"
     elif name == "/resume":
         step("Exit (/exit), then run oppx -r to pick a past conversation, or oppx -c for the latest.")
-    elif name in ("/undo", "/commit", "/git"):
-        step("OpenPhalanx never commits. Use git yourself: git diff, git checkout -- <file>.", YELLOW)
+    elif name == "/undo":
+        undo_edits()
+    elif name in ("/commit", "/git"):
+        step("OpenPhalanx never commits. Use git yourself: git diff, git commit.", YELLOW)
     elif name in NOT_AVAILABLE:
         step(f"{name} isn't available in OpenPhalanx. /help lists what is.", YELLOW)
     else:

@@ -18,7 +18,7 @@ from .term import EscWatcher, SESSION, SPIN, Thinking, UI, out, step
 from .render import show_edits, snapshot
 from .context import CONTEXT_MGR, PRI_EDITED, _check_tokens, _fitted_format_messages
 from .oppx_io import OppxIO
-from .cache import _ask_init, _coder_init, _dump_requests, _stable_ranked_map
+from .cache import _ask_file_mentions, _ask_init, _coder_init, _dump_requests, _stable_ranked_map
 from .commands import load_memory, translate
 
 
@@ -44,6 +44,7 @@ def build_coder(argv):
     RepoMap.get_ranked_tags_map = _stable_ranked_map
     base_coder.Coder.__init__ = _coder_init
     AskCoder.__init__ = _ask_init
+    AskCoder.check_for_file_mentions = _ask_file_mentions
     if os.environ.get("OPPX_DUMP_REQUESTS"):
         _dump_requests(os.environ["OPPX_DUMP_REQUESTS"])
     coder = aider_main.main(argv, return_coder=True)
@@ -127,6 +128,7 @@ def run_turn(coder, text: str):
     coder.io._retry_shown = False
     UI.interrupted = False
     UI.before = {}
+    UI.originals = {}
     SESSION.coder = coder
     CONTEXT_MGR.start_turn(coder, text)
     before = snapshot(coder)
@@ -156,6 +158,8 @@ def run_turn(coder, text: str):
         if not edited and not UI.interrupted:
             step("No changes were made. Name the exact place to change, or @-mention the file, and try again.", YELLOW)
     show_edits(coder, before, edited=edited)
+    if edited and UI.originals:
+        UI.undo = dict(UI.originals)
     for rel in edited:
         CONTEXT_MGR.note(coder.abs_root_path(rel), PRI_EDITED)
     CONTEXT_MGR.end_turn(result)

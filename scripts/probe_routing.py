@@ -65,6 +65,8 @@ INTENT_CASES = [
     ("Can you add error handling to the download function?", "edit"),
     ("Delete the unused imports in main.rs", "edit"),
     ("Make the banner blue", "edit"),
+    ("Write a short essay about the history of computing", "ask"),
+    ("Tell me a joke about programmers", "ask"),
     ("The spinner flickers, please fix it", "edit"),
 ]
 
