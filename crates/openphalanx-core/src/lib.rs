@@ -3,6 +3,7 @@
 
 pub mod admin;
 pub mod catalog;
+pub mod cluster;
 pub mod docker;
 pub mod download;
 pub mod gpu;

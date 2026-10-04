@@ -1,0 +1,13 @@
+[package]
+name = "pinned-tls"
+description = "TLS to a self-signed OpenPhalanx endpoint, trusted by a pinned SHA-256 certificate fingerprint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["net", "time"] }

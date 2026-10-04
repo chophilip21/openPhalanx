@@ -1,0 +1,22 @@
+[package]
+name = "openphalanx-server"
+description = "Headless Openphalanx server: cluster discovery, membership and reporting, controlled from the command line"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openphalanx-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+openphalanx-core = { path = "../openphalanx-core" }
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openphalanx_core::admin::{self, AdminClient};
+use openphalanx_core::cluster::{self, Cluster, ClusterView, Role, Strategy};
 use openphalanx_core::server::{self, CheckStatus, StartProgress};
 use openphalanx_core::settings::{CustomModel, Settings};
 use openphalanx_core::vram::{self, FitCheck, Requirement};
@@ -36,6 +37,10 @@ enum Phase {
     },
     Stopping,
     Failed {
+        message: String,
+    },
+    /// Stopped on purpose by the cluster (e.g. a server of a split model dropped out).
+    Paused {
         message: String,
     },
 }
@@ -72,6 +77,11 @@ struct Inner {
 pub struct AppState {
     settings: Mutex<Settings>,
     inner: Mutex<Inner>,
+    /// This machine as a cluster head (nodes join it on CLUSTER_PORT); None
+    /// if its state couldn't be opened.
+    cluster: Option<Arc<Cluster>>,
+    /// Why the cluster service isn't available, if it isn't.
+    cluster_error: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -86,6 +96,10 @@ impl AppState {
         Ok(s.clone())
     }
 }
+
+/// A split-model cluster pauses when a member hasn't reported for this long
+/// (or said goodbye). Reports come every 5 s, so this is two missed reports.
+const SPLIT_DROP_SECS: u64 = 12;
 
 // --------------------------------------------------------------------------
 // Snapshot
@@ -108,6 +122,15 @@ struct Snapshot {
     downloads: Vec<DownloadView>,
     settings: Settings,
     warnings: Vec<String>,
+    cluster: Option<ClusterSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterSnapshot {
+    #[serde(flatten)]
+    view: ClusterView,
+    /// Why the cluster service isn't running, if it isn't.
+    error: Option<String>,
 }
 
 async fn admin_client() -> Option<AdminClient> {
@@ -171,10 +194,36 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
         inner.phase = Phase::Failed { message };
     }
 
+    if let Some(c) = st.cluster.as_ref().filter(|c| !c.is_member()) {
+        // Split model: every server holds part of it, so one dropping out
+        // breaks inference. Pause instead of failing requests.
+        let serving_here = running && managed && matches!(inner.phase, Phase::Idle);
+        if serving_here && c.role() == Role::Host && c.strategy() == Strategy::Split {
+            let dropped = c.dropped_members(SPLIT_DROP_SECS);
+            if !dropped.is_empty() {
+                let names = dropped.join(", ");
+                inner.phase = Phase::Paused {
+                    message: format!(
+                        "Paused: {names} dropped out of the cluster. With the split strategy every server holds part of \
+                         the model, so serving stopped instead of failing requests. Start again once {names} is back, \
+                         or remove it from the cluster."
+                    ),
+                };
+                inner.expect_running = false;
+                inner.stop_epoch += 1;
+                tauri::async_runtime::spawn(async { let _ = docker::stop().await; });
+            }
+        }
+        // Members see whether the host is serving (and can't start meanwhile).
+        let serving = matches!(inner.phase, Phase::Starting { .. }) || (running && managed && matches!(inner.phase, Phase::Idle));
+        c.set_serving(serving);
+    }
+
     let (state, detail) = match &inner.phase {
         Phase::Starting { detail } => ("starting", Some(detail.clone())),
         Phase::Stopping => ("stopping", None),
         Phase::Failed { message } => ("error", Some(message.clone())),
+        Phase::Paused { message } => ("paused", Some(message.clone())),
         Phase::Idle if running && !managed => (
             "external",
             Some("A backend container was started outside this app. Stop it to manage it from here.".into()),
@@ -222,6 +271,7 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
         downloads,
         settings,
         warnings,
+        cluster: st.cluster.as_ref().map(|c| ClusterSnapshot { view: c.view(), error: st.cluster_error.lock().unwrap().clone() }),
     }
 }
 
@@ -299,9 +349,26 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
             return Err("The backend is already starting or stopping.".into());
         }
     }
+    // One controller per cluster: claim it (a member takes the host role
+    // over first; the host refuses while its own server runs). Shown as
+    // starting meanwhile, so the monitor keeps the claim.
+    state.inner.lock().unwrap().phase = Phase::Starting { detail: "Checking the cluster…".into() };
+    let release = |state: &AppState| {
+        state.inner.lock().unwrap().phase = Phase::Idle;
+        if let Some(c) = &state.cluster {
+            c.set_serving(false);
+        }
+    };
+    if let Some(c) = state.cluster.clone() {
+        if let Err(e) = c.claim_start().await {
+            release(&state);
+            return Err(format!("{e:#}"));
+        }
+    }
     let settings = state.settings();
     let pf = server::preflight(&settings).await;
     if !pf.can_start {
+        release(&state);
         return Err(pf
             .checks
             .iter()
@@ -310,6 +377,22 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
             .unwrap_or_else(|| "The backend is already running.".into()));
     }
     state.inner.lock().unwrap().phase = Phase::Starting { detail: "Preparing…".into() };
+
+    // A host asks its members to have the same model on disk (they download
+    // it from the same pinned commit if they don't). Local-folder models
+    // can't be fetched by members, so they aren't asked for.
+    if let Some(c) = state.cluster.as_ref().filter(|c| !c.is_member()) {
+        let spec = settings.selected_model.as_deref().and_then(|k| server::resolve(&settings, k)).and_then(|m| {
+            Some(cluster::ModelSpec {
+                key: m.key.clone(),
+                label: format!("{}{}", m.label, m.quant.as_deref().map(|q| format!(" · {q}")).unwrap_or_default()),
+                repo: m.repo.clone()?,
+                revision: m.revision.clone()?,
+                weight_bytes: m.weight_bytes,
+            })
+        });
+        let _ = c.set_desired_model(spec);
+    }
 
     tauri::async_runtime::spawn(async move {
         let progress_app = app.clone();
@@ -330,9 +413,15 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
             Ok(()) => {
                 inner.phase = Phase::Idle;
                 inner.expect_running = true;
-                inner.want_pairing = true;
+                // Clients pair with the cluster's host only.
+                inner.want_pairing = !st.cluster.as_ref().is_some_and(|c| c.is_member());
             }
-            Err(e) => inner.phase = Phase::Failed { message: err(e) },
+            Err(e) => {
+                inner.phase = Phase::Failed { message: err(e) };
+                if let Some(c) = &st.cluster {
+                    c.set_serving(false);
+                }
+            }
         }
     });
     Ok(())
@@ -361,7 +450,7 @@ async fn stop_server(state: State<'_, AppState>) -> CmdResult<()> {
 #[tauri::command]
 fn dismiss_error(state: State<'_, AppState>) {
     let mut inner = state.inner.lock().unwrap();
-    if matches!(inner.phase, Phase::Failed { .. }) {
+    if matches!(inner.phase, Phase::Failed { .. } | Phase::Paused { .. }) {
         inner.phase = Phase::Idle;
     }
 }
@@ -380,7 +469,11 @@ async fn require_admin() -> CmdResult<AdminClient> {
 }
 
 #[tauri::command]
-async fn new_pairing_code() -> CmdResult<admin::Pairing> {
+async fn new_pairing_code(state: State<'_, AppState>) -> CmdResult<admin::Pairing> {
+    // Clients pair with the cluster's host only.
+    if let Some(Role::Member { host, .. }) = state.cluster.as_ref().map(|c| c.role()) {
+        return Err(format!("This server is a member of {}'s cluster. Pair clients with the host ({}).", host.name, host.url));
+    }
     require_admin().await?.new_pairing().await.map_err(err)
 }
 
@@ -772,17 +865,113 @@ async fn remove_custom(state: State<'_, AppState>, key: String) -> CmdResult<Set
     })
 }
 
+// --------------------------------------------------------------------------
+// Cluster: servers on this network, and the cluster this machine is in
+// --------------------------------------------------------------------------
+
+/// Runs the cluster service (API, discovery, reports) for as long as the app runs.
+async fn serve_cluster(app: AppHandle) {
+    let st = app.state::<AppState>();
+    let Some(c) = st.cluster.clone() else { return };
+    if let Err(e) = c.run().await {
+        *st.cluster_error.lock().unwrap() = Some(format!(
+            "The cluster service couldn't start ({e:#}). Is openphalanx-server or another Openphalanx app running on this machine?"
+        ));
+    }
+}
+
+fn require_cluster(state: &AppState) -> CmdResult<Arc<Cluster>> {
+    state.cluster.clone().ok_or_else(|| "The cluster service isn't available.".to_string())
+}
+
+/// Invites a server on this network into this machine's cluster.
+#[tauri::command]
+async fn cluster_invite(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    require_cluster(&state)?.invite(&id).await.map_err(err)
+}
+
+/// Asks a server (on the network, or a member) to host this machine's cluster.
+#[tauri::command]
+async fn cluster_make_host(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    require_cluster(&state)?.request_host(&id).await.map_err(err)
+}
+
+#[tauri::command]
+async fn cluster_approve_invite(state: State<'_, AppState>, host_id: String) -> CmdResult<()> {
+    require_cluster(&state)?.approve_invite(&host_id).await.map_err(err)
+}
+
+/// Becomes host for a request; returns servers that couldn't be invited.
+#[tauri::command]
+async fn cluster_approve_host(state: State<'_, AppState>, from_id: String) -> CmdResult<Vec<String>> {
+    require_cluster(&state)?.approve_host_request(&from_id).await.map_err(err)
+}
+
+#[tauri::command]
+fn cluster_decline(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    let c = require_cluster(&state)?;
+    c.decline_invite(&id);
+    c.decline_host_request(&id);
+    Ok(())
+}
+
+/// Removes a member; its token stops working at once.
+#[tauri::command]
+fn cluster_remove(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    match require_cluster(&state)?.remove_member(&id).map_err(err)? {
+        true => Ok(()),
+        false => Err("That server is no longer in the cluster.".into()),
+    }
+}
+
+#[tauri::command]
+async fn cluster_leave(state: State<'_, AppState>) -> CmdResult<()> {
+    require_cluster(&state)?.leave().await.map_err(err)
+}
+
+#[tauri::command]
+fn cluster_dissolve(state: State<'_, AppState>) -> CmdResult<()> {
+    require_cluster(&state)?.dissolve().map_err(err)
+}
+
+/// How the cluster uses its GPUs ("split" or "replicas"); the host decides.
+#[tauri::command]
+fn cluster_set_strategy(state: State<'_, AppState>, strategy: Strategy) -> CmdResult<()> {
+    require_cluster(&state)?.set_strategy(strategy).map_err(err)
+}
+
+/// A member's recent log lines (its backend and cluster events), as host.
+#[tauri::command]
+fn cluster_member_logs(state: State<'_, AppState>, id: String) -> CmdResult<Vec<String>> {
+    Ok(require_cluster(&state)?.member_logs(&id))
+}
+
+/// Renames this server (as other servers and the app show it).
+#[tauri::command]
+fn cluster_rename(state: State<'_, AppState>, name: String) -> CmdResult<()> {
+    require_cluster(&state)?.set_name(&name).map_err(err)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState {
-            settings: Mutex::new(Settings::load()),
-            inner: Mutex::new(Inner::default()),
+        .manage({
+            let (cluster, cluster_error) = match Cluster::open(&paths::cluster_dir()) {
+                Ok(c) => (Some(c), None),
+                Err(e) => (None, Some(format!("cluster state unavailable: {e:#}"))),
+            };
+            AppState {
+                settings: Mutex::new(Settings::load()),
+                inner: Mutex::new(Inner::default()),
+                cluster,
+                cluster_error: Mutex::new(cluster_error),
+            }
         })
         .setup(|app| {
             tauri::async_runtime::spawn(monitor(app.handle().clone()));
+            tauri::async_runtime::spawn(serve_cluster(app.handle().clone()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -808,7 +997,27 @@ pub fn run() {
             inspect_custom,
             add_custom,
             remove_custom,
+            cluster_invite,
+            cluster_make_host,
+            cluster_approve_invite,
+            cluster_approve_host,
+            cluster_decline,
+            cluster_remove,
+            cluster_leave,
+            cluster_dissolve,
+            cluster_rename,
+            cluster_set_strategy,
+            cluster_member_logs,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Openphalanx");
+        .build(tauri::generate_context!())
+        .expect("error while building Openphalanx")
+        .run(|app, event| {
+            // Tell the host this member is going away, so a split model pauses
+            // at once instead of after a timeout.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(c) = app.state::<AppState>().cluster.clone() {
+                    tauri::async_runtime::block_on(c.goodbye());
+                }
+            }
+        });
 }

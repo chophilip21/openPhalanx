@@ -49,7 +49,7 @@ export type AdminStatus = {
   web_search: boolean;
 };
 
-export type ServerState = "stopped" | "starting" | "running" | "stopping" | "error" | "external";
+export type ServerState = "stopped" | "starting" | "running" | "stopping" | "error" | "paused" | "external";
 
 export type DownloadView = {
   key: string;
@@ -70,6 +70,92 @@ export type Settings = {
   web_search: boolean;
 };
 
+/** A server's hardware, as it reports it. */
+export type NodeInventory = {
+  hostname: string;
+  os: string;
+  arch: string;
+  cpus: number;
+  memory_bytes: number;
+  gpus: GpuInfo[];
+  docker_version: string | null;
+  docker_error: string | null;
+  nvidia_runtime: boolean;
+  version: string;
+};
+
+/** What a member serves (its backend's stats). */
+export type Serving = {
+  model: string;
+  sglang: string;
+  gateway: AdminStatus["gateway"];
+  inference: AdminStatus["inference"];
+};
+
+export type Peer = { id: string; name: string; url: string; fingerprint: string };
+
+/** The model a host serves, which its members keep on disk too. */
+export type ModelSpec = { key: string; label: string; repo: string; revision: string; weight_bytes: number };
+
+/** A member's copy of the host's model. */
+export type ModelSync = {
+  label: string;
+  repo: string;
+  revision: string;
+  state: "checking" | "downloading" | "ready" | "error";
+  done_bytes: number;
+  total_bytes: number;
+  bytes_per_sec: number;
+  error: string | null;
+};
+
+export type ClusterRole = { role: "standalone" } | { role: "host" } | { role: "member"; host: Peer };
+
+export type ClusterMember = {
+  id: string;
+  name: string;
+  url: string;
+  fingerprint: string;
+  joined_at: number;
+  last_seen: number | null;
+  online: boolean;
+  report: { inventory: NodeInventory; serving: Serving | null; model_sync: ModelSync | null } | null;
+};
+
+export type ClusterCandidate = {
+  id: string;
+  name: string;
+  url: string;
+  fingerprint: string;
+  role: string;
+  busy: boolean;
+  version: string;
+};
+
+/** How a cluster uses its GPUs (the host decides). */
+export type ClusterStrategy = "split" | "replicas";
+
+export type ClusterState = {
+  id: string;
+  name: string;
+  url: string | null;
+  fingerprint: string;
+  port: number;
+  role: ClusterRole;
+  strategy: ClusterStrategy;
+  members: ClusterMember[];
+  candidates: ClusterCandidate[];
+  invites: { host: Peer; invite_id: string; received_at: number }[];
+  host_requests: { from: Peer; members: Peer[]; received_at: number }[];
+  host_link: { connected: boolean; last_ok: number | null; error: string | null } | null;
+  discovery_error: string | null;
+  desired_model: ModelSpec | null;
+  model_sync: ModelSync | null;
+  /** This machine is a member and the host is serving: it can't start a server. */
+  locked_by_host: boolean;
+  error: string | null;
+};
+
 export type Snapshot = {
   server: { state: ServerState; detail: string | null; model_key: string | null };
   gpus: GpuInfo[];
@@ -78,6 +164,7 @@ export type Snapshot = {
   downloads: DownloadView[];
   settings: Settings;
   warnings: string[];
+  cluster: ClusterState | null;
 };
 
 export type Requirement = {
@@ -201,6 +288,17 @@ export const api = {
   inspectCustom: (input: string) => invoke<CustomInspect>("inspect_custom", { input }),
   addCustom: (input: string) => invoke<string>("add_custom", { input }),
   removeCustom: (key: string) => invoke<Settings>("remove_custom", { key }),
+  clusterInvite: (id: string) => invoke<void>("cluster_invite", { id }),
+  clusterMakeHost: (id: string) => invoke<void>("cluster_make_host", { id }),
+  clusterApproveInvite: (hostId: string) => invoke<void>("cluster_approve_invite", { hostId }),
+  clusterApproveHost: (fromId: string) => invoke<string[]>("cluster_approve_host", { fromId }),
+  clusterDecline: (id: string) => invoke<void>("cluster_decline", { id }),
+  clusterRemove: (id: string) => invoke<void>("cluster_remove", { id }),
+  clusterLeave: () => invoke<void>("cluster_leave"),
+  clusterDissolve: () => invoke<void>("cluster_dissolve"),
+  clusterRename: (name: string) => invoke<void>("cluster_rename", { name }),
+  clusterMemberLogs: (id: string) => invoke<string[]>("cluster_member_logs", { id }),
+  clusterSetStrategy: (strategy: ClusterStrategy) => invoke<void>("cluster_set_strategy", { strategy }),
 };
 
 export const events = {

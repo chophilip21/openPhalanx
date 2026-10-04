@@ -2,18 +2,30 @@
   import Icon from "./Icon.svelte";
   import type { ServerState } from "../lib/api";
 
-  let { state, disabled = false, onclick }: { state: ServerState; disabled?: boolean; onclick: () => void } =
-    $props();
+  let {
+    state,
+    disabled = false,
+    locked = false,
+    onclick,
+  }: { state: ServerState; disabled?: boolean; locked?: boolean; onclick: () => void } = $props();
   const tone = $derived(
-    state === "running" ? "on" : state === "starting" || state === "stopping" ? "busy" : state === "error" ? "bad" : "off",
+    locked
+      ? "locked"
+      : state === "running"
+        ? "on"
+        : state === "starting" || state === "stopping"
+          ? "busy"
+          : state === "error" || state === "paused"
+            ? "bad"
+            : "off",
   );
 </script>
 
 <div class="wrap {tone}">
   <div class="ring r1"></div>
   <div class="ring r2"></div>
-  <button class="power" {disabled} {onclick} aria-label={state === "running" ? "Stop server" : "Start server"}>
-    <Icon name="power" size={56} stroke={2.2} />
+  <button class="power" {disabled} {onclick} aria-label={locked ? "Another machine controls the cluster" : state === "running" ? "Stop server" : "Start server"}>
+    <Icon name={locked ? "lock" : "power"} size={56} stroke={2.2} />
   </button>
 </div>
 
@@ -30,6 +42,10 @@
   .wrap.on { --c: var(--on); --g: var(--on-glow); }
   .wrap.busy { --c: var(--busy); --g: var(--busy-glow); }
   .wrap.bad { --c: var(--bad); --g: var(--bad-glow); }
+  /* A cluster member while its host serves: it can't start one too. */
+  .wrap.locked { --c: var(--violet); --g: color-mix(in srgb, var(--violet) 35%, transparent); }
+  .locked .ring { box-shadow: 0 0 40px var(--g); opacity: 0.35; }
+  .locked .power:disabled { opacity: 1; cursor: not-allowed; }
   .ring {
     position: absolute;
     inset: 0;

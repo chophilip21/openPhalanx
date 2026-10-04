@@ -230,6 +230,51 @@ oppx servers | oppx use NAME
   * Both modes then install or refresh the private engine.
 * **Stand-in agents:** a fake `aider` script on `PATH` (printing its args and env) is a quick way to test `oppx aider` without the real agent.
 
+## Cluster
+
+Servers on one network form a cluster: one **host** and its **members**. They don't share inference yet (see `milestone.md`, "Next version"). The service is `cluster::Cluster` in core. It runs inside the app, or headless as `openphalanx-server run` (`crates/openphalanx-server`); both use `~/.local/share/openphalanx/cluster/`, so run one per machine.
+
+* **Discovery:** every server broadcasts a beacon (id, name, role, certificate fingerprint) on UDP `9093` every 3 s. A server is listed under **Servers on this network** only when its beacon is under 10 s old *and* a TLS health check, pinned to the fingerprint it announced, succeeds. Stopped or unreachable servers drop off within about 10 s. Broadcast only crosses one LAN segment, not Tailscale.
+  * **Fast join:** a server that starts (app opened, or `openphalanx-server run`) sends a query beacon twice; the others answer by unicast at once and check it immediately, so it is listed in about 0.3 s (measured on the 4090) instead of waiting for the next 3 s round.
+* **Roles** (`state.json`): standalone, host or member. A host with no members is standalone again.
+  * **Clients pair with the host only:** members hide the pairing section, refuse `new_pairing_code`, and skip the start-up pairing code.
+* **Joining needs consent on both sides:**
+  1. **Add to cluster:** the host sends an invitation (a single-use secret bound to that server, valid for 10 minutes).
+  2. **Approve on the invited server:** in its app, or with `openphalanx-server approve`, after checking the host's fingerprint. It then joins over a connection pinned to that certificate and gets a 256-bit member token; the host stores only its hash.
+  3. **Trusted hosts:** a server remembers the hosts it approved, and accepts their invitations without asking next time.
+* **Make host (hand-over):**
+  * The current host asks a server (on the network, or one of its members) to take over. That server approves ("Become host") and invites everyone in the request.
+  * The old host and its members accept automatically: the old host asked for it, and members learn the new host's fingerprint from the old host in their report replies.
+  * Clients must pair with the new host.
+* **Strategy** (`cluster::Strategy`, the host decides; members show the host's choice from report replies):
+  * **Split model** (default): one model across the servers. Bigger models, about single-GPU speed, needs every server up and a wired network.
+  * **Replicas:** a full copy per server. More concurrent users and resilience, no bigger models.
+
+  It's colour-coded in the cluster panel (violet / blue) with an ⓘ tooltip; `openphalanx-server strategy split|replicas` does the same. It's recorded for the next step; members don't serve models yet.
+* **Model sync:**
+  * When the host starts its server, the app sets the cluster's model (`set_desired_model`; repo plus pinned commit; local-folder models are skipped). The host sends it to members in every report reply.
+  * A member that already has it (the app's models folder or the HF cache) reports "ready"; otherwise it downloads it with the verified, resumable downloader, and reports progress and errors (retried).
+  * The Machines table shows each member's status; headless, use `openphalanx-server model <catalog-id>|none`.
+  * Verified: the 4090 downloaded Qwen2.5-Coder-7B-AWQ (5.2 GB, about 92 MB/s, verified, marker written), and reported "already on this machine" after a restart.
+* **Member logs:** members queue log lines (their backend's `docker logs` since the last report, plus cluster events such as joins and downloads) and send up to 400 per report. The host keeps 3,000 per member. The Logs page has a machine dropdown; headless, use `openphalanx-server logs <member>`.
+* **One controller (start guard):** whoever presses Start first becomes the controller; the other side can't start too.
+  * `Cluster::claim_start` runs before pre-flight. A standalone server or host just marks itself serving (refused while it is handing control to someone). A member first takes the host role over through `POST /cluster/v1/take-over`, which the host refuses with 409 while it is serving or already handing over. Both checks happen under one `Control` mutex on the host, so two simultaneous presses can't both win.
+  * The app's monitor keeps `set_serving` in step with the backend (starting or running). The host sends `host_serving` in report replies; a member then has `locked_by_host` in its view, and its power button turns violet with a lock and "<host> is running the cluster". All it can do is leave the cluster (or close the app).
+* **Split pause:** with the split strategy, a host that is serving stops its backend when a member has said goodbye or hasn't reported for 12 s (`dropped_members`), and the Server page shows "Paused: <member> dropped out of the cluster…" (state `paused`, red). Start again once it's back, or remove it. Members send `POST /cluster/v1/bye` when the app exits (`RunEvent::Exit`) or `openphalanx-server` gets Ctrl-C, so a clean exit pauses at once.
+* **Members report** to the host every 5 s (`/cluster/v1/report`): inventory (CPUs, RAM, GPUs with load and temperature, Docker/NVIDIA runtime) and, if their backend runs, what it serves (model, gateway and inference metrics). The host shows a member offline after 20 s without a report. A member that gets 401 (removed, or the cluster was dissolved) becomes standalone.
+* **App:**
+  * **Cluster panel** on the Server page: pending invitations and host requests (Approve/Decline, with the sender's fingerprint), this server's role with Rename/Leave/Dissolve, and the servers on the network (Add to cluster / Make host).
+  * **In this cluster** cards: the host has a red **Remove** on each member, a member has **Leave** on its own card. A removed server shows up under "Not in this cluster" again, and **Add to cluster** brings it back without asking there (it trusts the host it approved before).
+  * **Machines table:** every server, with Make host/Remove for members.
+  * **Charts** show **one machine at a time** (a dropdown); the tiles sum the cluster.
+* **Headless control:** `openphalanx-server status | servers | invite <name> | make-host <name> | approve [<name>] | decline <name> | remove <name> | leave | dissolve`. These talk to the running server on `127.0.0.1:9094` with a per-start token in `control.token` (0600). Use `run --name <name>` to set the display name; it's kept.
+* **Verified** between the 3090 (app and headless) and the 4090 laptop (headless), on the wired LAN:
+  * discovery in both directions; a non-server machine (the HP laptop) never listed;
+  * invite and approve; membership surviving restarts of both;
+  * reports with the 4090's GPU;
+  * hand-over (the 4090 became host, and the 3090 moved over by itself);
+  * dissolve; a stopped server gone from the list within 12 s.
+
 ## Web search
 
 * **SearXNG:** the `openphalanx-searxng` container is pinned by digest and runs on the private `openphalanx` Docker network with **no published ports**. Its settings live in `crates/openphalanx-core/searxng/settings.yml` and are written to `~/.local/share/openphalanx/searxng/settings.yml` (0644, read-only mount, `FORCE_OWNERSHIP=false`). The secret is passed as `SEARXNG_SECRET`, and `--log-driver none` keeps queries out of logs. The GUI starts it before the backend when `settings.web_search` is on (the default; toggle on the Server page). The backend gets `SEARXNG_URL=http://openphalanx-searxng:8080`.
@@ -259,13 +304,17 @@ oppx servers | oppx use NAME
 |---|---|
 | `9090/tcp` (all interfaces) | Public gateway API, TLS only. `/health` and `/v1/pair` are open. `/v1/whoami`, `/v1/unpair` (self-revoke), `/v1/info` (model id, context, edit format), `/v1/tokenize`, `/v1/search`, `/v1/models` and `/v1/chat/completions` (OpenAI-compatible, streaming) need a device token |
 | `9091/tcp` (`127.0.0.1` only) | Admin API for the GUI; needs the per-launch admin token |
+| `9092/tcp` (all interfaces, while the app or `openphalanx-server` runs) | Cluster API between servers (TLS, the server's own certificate). `health`, `invite`, `host-request` and `join` (needs an invitation secret) are open; `report` and `leave` need a member token |
+| `9093/udp` (all interfaces) | Discovery beacons (LAN broadcast) |
+| `9094/tcp` (`127.0.0.1` only) | `openphalanx-server` control API; needs `control.token` |
+| `~/.local/share/openphalanx/cluster/` | This server's certificate (`head.crt`, `head.key`, 0600), identity, role and trusted hosts (`state.json`), and members as host (`members.json`, hashed tokens). Deleting it resets the server's cluster identity |
 | `~/.config/openphalanx/settings.json` | Selected model, context length, GPU index, custom models |
 | `~/.local/share/openphalanx/models/` | Models downloaded by the GUI (verified, pinned to a commit) |
 | `~/.local/share/openphalanx/backend-state/` | Backend TLS certificate and paired devices (hashed tokens). Deleting it unpairs every client and changes the fingerprint |
 | `~/.local/share/openphalanx/searxng/settings.yml` | SearXNG settings (no secrets), mounted read-only |
 | `~/.cache/huggingface/hub/` | Existing Hugging Face cache; reused read-only when a model is already there |
 
-Open `9090/tcp` in your firewall for the clients' network. Never expose `9091`.
+Open `9090/tcp` in your firewall for the clients' network, and `9092/tcp` plus `9093/udp` between cluster servers. Never expose `9091` or `9094`.
 
 ## Security model
 
@@ -351,7 +400,9 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
 app/                     Tauri 2 + Svelte 5 server GUI (Linux)
   src/                   frontend: pages, components, typed command bindings
   src-tauri/             Rust shell: Tauri commands, 2 s status monitor, log streaming
-crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight (no Tauri, unit-tested)
+crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight, cluster head (no Tauri, unit-tested)
+crates/openphalanx-server/ openphalanx-server: headless server (cluster service + command-line control)
+crates/pinned-tls/       TLS pinned to a certificate fingerprint (shared by oppx and the cluster)
   catalog.json           curated models pinned to Hugging Face commits (built with scripts/catalog_entry.py); optional per-model
                          edit_format and reasoning_parser (passed as EDIT_FORMAT, --reasoning-parser)
 docker/                  backend image: SGLang + gateway under supervisord (no agent code)

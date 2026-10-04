@@ -26,6 +26,11 @@ pub fn backend_state_dir() -> PathBuf {
 }
 
 /// The Hugging Face hub cache, so models downloaded by other tools are reused.
+/// The head's cluster state: node registry and its TLS certificate.
+pub fn cluster_dir() -> PathBuf {
+    data_dir().join("cluster")
+}
+
 pub fn hf_hub_dir() -> PathBuf {
     if let Ok(cache) = std::env::var("HF_HUB_CACHE") {
         return PathBuf::from(cache);
