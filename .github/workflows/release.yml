@@ -4,13 +4,8 @@
 #
 # 1. version: bump Cargo.toml, Cargo.lock and the app's package files together,
 #    add a CHANGELOG.md entry, commit "Release vX.Y.Z" to main, tag vX.Y.Z.
-# 2. Build oppx for Linux and macOS, and the server app (.deb, AppImage).
-# 3. Publish a GitHub release with the binaries, SHA256SUMS and installers.
-# 4. Generate the docs and publish them to GitHub Pages.
-# 5. Backend image: GitHub's runners are too small for the ~50 GB image, so it
-#    is built on a self-hosted runner when the repository variable
-#    IMAGE_RUNNER is set (a JSON runner label list, e.g. ["self-hosted","gpu"]);
-#    otherwise run scripts/publish-image.sh on the server node after the release.
+# 2. Start publish.yml on main for the new tag: builds, the GitHub release,
+#    docs on GitHub Pages and (with a self-hosted runner) the backend image.
 #
 # Repository settings needed: Actions may write to contents (and push to main,
 # if main is protected), and Pages uses "GitHub Actions" as its source.
@@ -32,6 +27,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: release
@@ -67,161 +63,16 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "Release v$VERSION"
+          git add -A   # CHANGELOG.md is new on the first release
+          git commit -m "Release v$VERSION"
           git tag "v$VERSION"
           git push origin HEAD:main "v$VERSION"
           # Bring dev along when it hasn't moved since the merge.
           git push origin HEAD:dev || echo "::warning::dev has new commits; merge main into dev to pick up v$VERSION"
-
-  oppx:
-    needs: version
-    if: needs.version.outputs.version != ''
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04 }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04-arm }
-          - { target: aarch64-apple-darwin, os: macos-14 }
-          - { target: x86_64-apple-darwin, os: macos-14 }
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: v${{ needs.version.outputs.version }}
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: musl toolchain
-        if: contains(matrix.target, 'linux-musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Build
-        env:
-          # Makes `oppx --update` download releases for this target.
-          OPPX_RELEASE_TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked -p oppx --target ${{ matrix.target }}
-      - name: Package
-        run: tar -czf oppx-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release oppx
-      - uses: actions/upload-artifact@v4
-        with:
-          name: oppx-${{ matrix.target }}
-          path: oppx-${{ matrix.target }}.tar.gz
-
-  app:
-    needs: version
-    if: needs.version.outputs.version != ''
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: v${{ needs.version.outputs.version }}
-      - name: System libraries for the Tauri app
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
-            libayatana-appindicator3-dev librsvg2-dev libxdo-dev build-essential
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: app/package-lock.json
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build .deb and AppImage
-        working-directory: app
-        run: |
-          npm ci
-          npx tauri build --bundles deb,appimage
-      - uses: actions/upload-artifact@v4
-        with:
-          name: app
-          path: |
-            target/release/bundle/deb/*.deb
-            target/release/bundle/appimage/*.AppImage
-
-  release:
-    needs: [version, oppx, app]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: v${{ needs.version.outputs.version }}
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Checksums and installers
-        run: |
-          cp scripts/install.sh scripts/install-server.sh dist/
-          cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
-      - name: Release notes from CHANGELOG.md
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          awk -v v="## v$VERSION " 'index($0, v) == 1 {on=1; next} /^## v/ {on=0} on' CHANGELOG.md > notes.md
-          cat >> notes.md <<EOF
-
-          ### Install
-
-          Client (Linux, macOS):
-          \`\`\`bash
-          curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install.sh | OPPX_VERSION=$VERSION sh
-          \`\`\`
-
-          Server (Ubuntu/Debian, NVIDIA GPU):
-          \`\`\`bash
-          curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install-server.sh | OPPX_VERSION=$VERSION sh
-          \`\`\`
-
-          Backend image: \`ghcr.io/chophilip21/openphalanx-backend:$VERSION\`
-          EOF
-      - name: Publish
+      - name: Build and publish the release
+        if: steps.bump.outputs.version != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.version.outputs.version }}
-        run: gh release create "v$VERSION" dist/* --title "Openphalanx v$VERSION" --notes-file notes.md
-
-  docs:
-    needs: [version, oppx]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: v${{ needs.version.outputs.version }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: oppx-x86_64-unknown-linux-musl
-      - name: Generate the docs
-        run: |
-          tar -xzf oppx-x86_64-unknown-linux-musl.tar.gz
-          python3 scripts/gen_docs.py --oppx ./oppx --out site
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: mdbook
-      - run: mdbook build site
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site/book
-      - id: deploy
-        uses: actions/deploy-pages@v4
-
-  image:
-    needs: [version, release]
-    if: vars.IMAGE_RUNNER != ''
-    runs-on: ${{ fromJSON(vars.IMAGE_RUNNER) }}
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: v${{ needs.version.outputs.version }}
-      - run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - run: scripts/publish-image.sh "${{ needs.version.outputs.version }}"
+          VERSION: ${{ steps.bump.outputs.version }}
+        # A tag pushed with GITHUB_TOKEN starts no workflow, but a dispatch does.
+        run: gh workflow run publish.yml --repo "$GITHUB_REPOSITORY" --ref main -f tag="v$VERSION"

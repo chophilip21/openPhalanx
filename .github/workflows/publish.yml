@@ -1,0 +1,200 @@
+# Builds and publishes one release, given its tag (e.g. v0.3.0). Started by
+# release.yml after it bumps and tags, or by hand to redo a release:
+#   gh workflow run publish.yml --ref main -f tag=v0.3.0
+# It always runs on main (the github-pages environment only deploys from
+# main) and checks out the tag for everything it builds.
+#
+# 1. Build oppx for Linux (static musl, x86-64/arm64) and macOS (arm64/x86-64),
+#    and the server app (.deb, AppImage).
+# 2. Publish a GitHub release with the binaries, SHA256SUMS, installers and
+#    notes from CHANGELOG.md.
+# 3. Generate the docs and deploy them to GitHub Pages.
+# 4. Backend image: GitHub's runners are too small for the ~50 GB image, so it
+#    is built on a self-hosted runner when the repository variable
+#    IMAGE_RUNNER is set (e.g. ["self-hosted","gpu"]); otherwise run
+#    scripts/publish-image.sh on the server node after the release.
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and publish (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          case "$TAG" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "::error::tag must look like v1.2.3"; exit 1 ;; esac
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  oppx:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-14 }
+          - { target: x86_64-apple-darwin, os: macos-14 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: musl toolchain
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        env:
+          # Makes `oppx --update` download releases for this target.
+          OPPX_RELEASE_TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked -p oppx --target ${{ matrix.target }}
+      - name: Package
+        run: tar -czf oppx-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release oppx
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oppx-${{ matrix.target }}
+          path: oppx-${{ matrix.target }}.tar.gz
+
+  app:
+    needs: meta
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: System libraries for the Tauri app
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev build-essential
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build .deb and AppImage
+        working-directory: app
+        run: |
+          npm ci
+          npx tauri build --bundles deb,appimage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+
+  release:
+    needs: [meta, oppx, app]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and installers
+        run: |
+          # The app artifact unpacks into deb/ and appimage/ folders.
+          find dist -mindepth 2 -type f -exec mv -t dist/ {} +
+          find dist -mindepth 1 -type d -empty -delete
+          cp scripts/install.sh scripts/install-server.sh dist/
+          cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          git fetch -q origin main
+          git show origin/main:CHANGELOG.md > changelog.md 2>/dev/null || cp CHANGELOG.md changelog.md || touch changelog.md
+          awk -v v="## v$VERSION " 'index($0, v) == 1 {on=1; next} /^## v/ {on=0} on' changelog.md > notes.md
+          cat >> notes.md <<EOF
+
+          ### Install
+
+          Client (Linux, macOS):
+          \`\`\`bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install.sh | OPPX_VERSION=$VERSION sh
+          \`\`\`
+
+          Server (Ubuntu/Debian, NVIDIA GPU):
+          \`\`\`bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install-server.sh | OPPX_VERSION=$VERSION sh
+          \`\`\`
+
+          Backend image: \`ghcr.io/chophilip21/openphalanx-backend:$VERSION\`
+          EOF
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: gh release create "v$VERSION" dist/* --title "Openphalanx v$VERSION" --notes-file notes.md
+
+  docs:
+    needs: [meta, oppx]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: oppx-x86_64-unknown-linux-musl
+      - name: Generate the docs
+        run: |
+          tar -xzf oppx-x86_64-unknown-linux-musl.tar.gz
+          python3 scripts/gen_docs.py --oppx ./oppx --out site
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook
+      - run: mdbook build site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/book
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  image:
+    needs: [meta, release]
+    if: vars.IMAGE_RUNNER != ''
+    runs-on: ${{ fromJSON(vars.IMAGE_RUNNER) }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - run: scripts/publish-image.sh "${{ needs.meta.outputs.version }}"
