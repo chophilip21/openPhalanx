@@ -2636,7 +2636,7 @@ dependencies = [
 
 [[package]]
 name = "openphalanx"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "openphalanx-core",
@@ -2651,7 +2651,7 @@ dependencies = [
 
 [[package]]
 name = "openphalanx-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -2668,7 +2668,7 @@ dependencies = [
 
 [[package]]
 name = "oppx"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
