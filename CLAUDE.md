@@ -62,11 +62,11 @@ Openphalanx splits the work along a single line: **code and execution stay on th
 
 | Component | State |
 |---|---|
-| Backend image (SGLang + gateway) | Working, including the authenticated OpenAI-compatible inference API. `0.2.0` is built locally but not yet pushed to GHCR |
+| Backend image (SGLang + gateway) | Working, including the authenticated OpenAI-compatible inference API. `0.3.0` is built locally but not yet pushed to GHCR |
 | Server GUI (`app/`, Linux) | Builds and runs; first UI review pending |
 | Pairing, TLS and device tokens | Working |
 | `oppx` client CLI | Working: `pair` (certificate pinning), `status`, `unpair`, `aider` (local Aider through a pinned loopback proxy), `proxy`, `servers`, `use` |
-| Distribution (CI, releases, installers, docs) | Written and linted locally; the first GitHub release hasn't run yet (milestone Step 5.5) |
+| Distribution (CI, releases, installers, docs) | v0.3.0 released through GitHub Actions; backend image still published by hand |
 
 ## Requirements
 
@@ -101,7 +101,7 @@ Or build an installable package and install it:
 
 ```bash
 cd app && npm install && npx tauri build --bundles deb    # or: --bundles appimage
-sudo apt install ../target/release/bundle/deb/Openphalanx_0.2.0_amd64.deb
+sudo apt install ../target/release/bundle/deb/Openphalanx_0.3.0_amd64.deb
 ```
 
 ### 2. Choose a model
@@ -137,7 +137,7 @@ docker run -d --name openphalanx-backend --gpus all --ipc=host \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v ~/.local/share/openphalanx/backend-state:/state \
   -e ADMIN_TOKEN \
-  ghcr.io/chophilip21/openphalanx-backend:0.2.0
+  ghcr.io/chophilip21/openphalanx-backend:0.3.0
 
 # When the admin API answers, issue a pairing code:
 curl -s -X POST -H "x-admin-token: $ADMIN_TOKEN" http://127.0.0.1:9091/admin/pairing
@@ -298,7 +298,7 @@ cargo run -p openphalanx-core --example catalog -- 32768       # catalog VRAM es
 cargo run -p openphalanx-core --example lifecycle               # full start → pair → token check → revoke run
 cargo run -p openphalanx-core --example download -- <repo> <dir>  # verified, resumable HF download
 
-docker build -f docker/Dockerfile.server -t ghcr.io/chophilip21/openphalanx-backend:0.2.0 docker/
+docker build -f docker/Dockerfile.server -t ghcr.io/chophilip21/openphalanx-backend:0.3.0 docker/
 scripts/publish-image.sh                                        # build and push to GHCR (needs write:packages)
 scripts/bench_session.py --oppx target/debug/oppx               # prefix-cache benchmark (in a scratch copy of a repo)
 scripts/gen_docs.py --oppx target/debug/oppx --out target/docs  # docs sources; then: mdbook build target/docs
@@ -323,12 +323,13 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
 ## Releasing
 
 * **CI** (`.github/workflows/ci.yml`, every PR and push to `dev`/`main`): app build and type check, `cargo clippy -D warnings`, `cargo test` for core and `oppx`, ruff (syntax and undefined names) for the gateway, frontend and scripts, shell syntax, and the PR title check for PRs into `main`. The GPU lifecycle test stays manual.
-* **Release** (`.github/workflows/release.yml`, a merged PR into `main` with a release prefix, or run by hand with a bump and a changelog line):
-  1. `scripts/bump_version.py` bumps every version file, adds the `CHANGELOG.md` entry, and the workflow commits "Release vX.Y.Z" to `main`, tags it, and fast-forwards `dev` when possible.
-  2. `oppx` is built for `x86_64`/`aarch64-unknown-linux-musl` (static) and `aarch64`/`x86_64-apple-darwin`, with `OPPX_RELEASE_TARGET` set. The app is built as `.deb` and AppImage.
-  3. A GitHub release gets the archives, `SHA256SUMS`, `install.sh`, `install-server.sh`, and notes from the changelog.
-  4. The docs (`scripts/gen_docs.py` + mdBook) go to GitHub Pages.
-  5. The backend image (about 50 GB, too big for GitHub's runners) is built and pushed only when the repository variable `IMAGE_RUNNER` names a self-hosted runner (e.g. `["self-hosted","gpu"]`). Otherwise run `scripts/publish-image.sh <version>` on the server node after the release.
+* **Release** (`.github/workflows/release.yml`, a merged PR into `main` with a release prefix, or run by hand with a bump and a changelog line): `scripts/bump_version.py` bumps every version file and adds the `CHANGELOG.md` entry. The workflow commits "Release vX.Y.Z" to `main`, tags it, fast-forwards `dev` when possible, then starts **Publish** for the tag.
+* **Publish** (`.github/workflows/publish.yml`, `workflow_dispatch` with a tag; redo a release with `gh workflow run publish.yml --ref main -f tag=vX.Y.Z`). It always runs on `main` (the `github-pages` environment only deploys from `main`) and checks out the tag for everything it builds:
+  1. `oppx` for `x86_64`/`aarch64-unknown-linux-musl` (static) and `aarch64`/`x86_64-apple-darwin`, with `OPPX_RELEASE_TARGET` set; the app as `.deb` and AppImage.
+  2. A GitHub release with the archives, `SHA256SUMS`, `install.sh`, `install-server.sh`, and notes from `main`'s `CHANGELOG.md`.
+  3. The docs (`scripts/gen_docs.py` + mdBook) on GitHub Pages.
+  4. The backend image (about 50 GB, too big for GitHub's runners) only when the repository variable `IMAGE_RUNNER` names a self-hosted runner (e.g. `["self-hosted","gpu"]`). Otherwise run `scripts/publish-image.sh <version>` on the server node after the release.
+* **Why two workflows:** a tag pushed with `GITHUB_TOKEN` starts no workflow, but a dispatch does. A `pull_request` run can't deploy Pages, because its ref is the PR's merge ref, not `main`.
 * **One-time repository settings:** Actions → workflow permissions "Read and write"; if `main` is protected, allow GitHub Actions to push to it; Pages → source "GitHub Actions"; make the GHCR package public.
 * Lint the workflows locally with `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest`.
 
