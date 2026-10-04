@@ -114,10 +114,16 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
+      # Only the build artifacts (not the docs job's github-pages bundle).
       - uses: actions/download-artifact@v4
         with:
+          pattern: oppx-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: app
+          path: dist
       - name: Checksums and installers
         run: |
           # The app artifact unpacks into deb/ and appimage/ folders.
