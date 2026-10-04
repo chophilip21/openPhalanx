@@ -25,6 +25,7 @@ import argparse
 import ast
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -79,21 +80,28 @@ def constant(path: Path, name: str) -> str:
     raise SystemExit(f"{name} not found in {path}")
 
 
-def ask(base: str, key: str, model: str, system: str, text: str, regex: str) -> str:
+def ask(base: str, key: str, model: str, system: str, text: str, regex: str, reasoning: bool) -> str:
+    """The same call the gateway and the chat frontend make: one constrained
+    token, or for reasoning models a short free answer at low effort whose
+    first allowed word counts (SGLang constrains only after the reasoning)."""
     body = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
-        "regex": regex,
-        "max_tokens": 2,
         "temperature": 0,
     }
+    if reasoning:
+        body.update(max_tokens=400, chat_template_kwargs={"reasoning_effort": "low", "enable_thinking": False})
+    else:
+        body.update(regex=regex, max_tokens=2)
     req = urllib.request.Request(
         f"{base.rstrip('/')}/chat/completions",
         data=json.dumps(body).encode(),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)["choices"][0]["message"]["content"].strip()
+    with urllib.request.urlopen(req, timeout=60) as r:
+        answer = (json.load(r)["choices"][0]["message"]["content"] or "").lower()
+    m = re.search(r"\b(" + regex.strip("()") + r")\b", answer)
+    return m.group(1) if m else answer.strip()[:12]
 
 
 def run_set(title, system, regex, cases, args) -> float:
@@ -102,7 +110,7 @@ def run_set(title, system, regex, cases, args) -> float:
     for text, want in cases:
         t = time.perf_counter()
         try:
-            got = ask(args.base, args.key, args.model, system, text, regex)
+            got = ask(args.base, args.key, args.model, system, text, regex, args.reasoning)
         except Exception as e:  # noqa: BLE001 - report and keep going
             got = f"error: {e}"
         times.append((time.perf_counter() - t) * 1000)
@@ -121,6 +129,8 @@ def main():
     p.add_argument("--key", default=os.environ.get("OPENAI_API_KEY", ""))
     p.add_argument("--model", default="openphalanx-coder")
     p.add_argument("--min", type=float, default=0.9, help="minimum score per probe set")
+    p.add_argument("--reasoning", action="store_true",
+                   help="the model reasons before answering (catalog reasoning_parser; /v1/info says so)")
     args = p.parse_args()
     if not args.base:
         p.error("set OPENAI_API_BASE or pass --base")

@@ -127,6 +127,7 @@ def run_turn(coder, text: str):
     a mode switch such as /ask, which runs in its own temporary coder)."""
     coder.io._retry_shown = False
     UI.interrupted = False
+    UI.server_error = ""
     UI.before = {}
     UI.originals = {}
     SESSION.coder = coder
@@ -153,7 +154,7 @@ def run_turn(coder, text: str):
         step("Interrupted by user", YELLOW)
     edited = set(coder.aider_edited_files or ())
     wanted_edit = not text.startswith("/") and result is coder and result.edit_format not in ("ask", "whole")
-    if wanted_edit and not edited and not interrupted:
+    if wanted_edit and not edited and not interrupted and not UI.server_error:
         result, edited = _whole_file_retry(result, text, before)
         if not edited and not UI.interrupted:
             step("No changes were made. Name the exact place to change, or @-mention the file, and try again.", YELLOW)
@@ -203,6 +204,9 @@ def run(argv) -> int:
         except EOFError:
             SPIN.stop()
             break
+        if text and text.split(" ", 1)[0] in ("/run", "/test", "/lint"):
+            # Shell commands print straight to the terminal: no spinner over them.
+            SPIN.stop()
         if text:
             coder = run_turn(coder, text)
             load_memory(coder)  # picks up OPENPHALANX.md right after /init

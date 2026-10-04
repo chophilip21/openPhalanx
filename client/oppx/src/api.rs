@@ -133,6 +133,9 @@ pub struct ServerInfo {
     pub model_id: String,
     pub context_length: u64,
     pub edit_format: String,
+    /// The model reasons before answering (older servers don't say: false).
+    #[serde(default)]
+    pub reasoning: bool,
     pub web_search: bool,
     pub ready: bool,
 }

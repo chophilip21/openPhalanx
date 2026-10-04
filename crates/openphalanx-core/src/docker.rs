@@ -235,6 +235,9 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
     if let Some(parser) = &spec.reasoning_parser {
         a.push("-e".into());
         a.push(format!("SGLANG_EXTRA_ARGS=--reasoning-parser {parser}"));
+        // The gateway drives reasoning models differently (see gateway.classify).
+        a.push("-e".into());
+        a.push(format!("REASONING_PARSER={parser}"));
     }
     a.push(spec.image.clone());
     a

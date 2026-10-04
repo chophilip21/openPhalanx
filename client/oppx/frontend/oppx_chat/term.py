@@ -24,6 +24,7 @@ class UiState:
     originals: dict = {}  # same, None for a file the turn created (for /undo)
     undo: dict = {}  # originals of the last turn that edited files
     interrupted = False
+    server_error = ""  # this turn's request was refused by the server (see oppx_io.server_problem)
     queued: list = []  # whole lines typed while the model was working
     prefill = ""  # a partly typed line, put back at the next prompt
     last_ctrl_c = 0.0

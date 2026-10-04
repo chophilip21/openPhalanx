@@ -270,9 +270,13 @@ fn entry_modified(path: &Path) -> std::time::SystemTime {
 /// `edit_format: whole` and no repo map for model names it doesn't know (ours
 /// is `openphalanx-coder`), so state them explicitly. `reasoning_tag` strips
 /// `<think>` blocks before edits are parsed, for any model that emits them.
+/// `examples_as_sys_msg` keeps Aider's few-shot examples inside the system
+/// prompt: sent as fake user turns, gpt-oss took them for the real conversation
+/// ("your first question was: Change get_factorial()…").
 pub fn model_settings(edit_format: &str) -> Result<tempfile::NamedTempFile> {
     let yaml = format!(
-        "- name: {AIDER_MODEL}\n  edit_format: {edit_format}\n  use_repo_map: true\n  reasoning_tag: think\n"
+        "- name: {AIDER_MODEL}\n  edit_format: {edit_format}\n  use_repo_map: true\n  reasoning_tag: think\n  \
+         examples_as_sys_msg: true\n"
     );
     let mut f = tempfile::Builder::new().prefix("oppx-settings-").suffix(".yml").tempfile()?;
     f.write_all(yaml.as_bytes())?;
@@ -499,6 +503,7 @@ mod tests {
         let y = std::fs::read_to_string(f.path()).unwrap();
         assert!(y.contains("name: openai/openphalanx-coder") && y.contains("edit_format: whole"));
         assert!(y.contains("use_repo_map: true") && y.contains("reasoning_tag: think"));
+        assert!(y.contains("examples_as_sys_msg: true"));
     }
 
     #[test]

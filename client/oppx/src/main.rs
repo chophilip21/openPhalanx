@@ -90,7 +90,7 @@ enum Command {
         /// Accept the server's certificate without comparing fingerprints.
         #[arg(long, short)]
         yes: bool,
-        /// Name this device shows under in the app's Devices page.
+        /// Name this device shows under on the app's Client page.
         #[arg(long, value_name = "NAME")]
         device_name: Option<String>,
         /// Local name for the server (defaults to its address).
@@ -397,9 +397,9 @@ async fn pair(
         ],
     );
     if replaced {
-        ui::warning("the previous pairing was replaced; revoke the old device in the app's Devices page.");
+        ui::warning("the previous pairing was replaced; revoke the old device on the app's Client page.");
     }
-    println!("  Next: {}  then  {}", ui::accent("oppx status"), ui::accent("oppx aider"));
+    println!("  Next: {}  then  {} in a git repo", ui::accent("oppx status"), ui::accent("oppx"));
     Ok(())
 }
 
@@ -466,7 +466,7 @@ async fn unpair(cfg: &mut Config, name: Option<&str>, local_only: bool) -> Resul
             Ok(true) => ui::line(ui::ok("revoked", "the server revoked this device's token")),
             Ok(false) => ui::line(ui::ok("revoked", "already revoked on the server")),
             Err(e) => ui::warning(format!(
-                "could not reach the server to revoke this device ({e:#}). Revoke \"{}\" in the app's Devices page.",
+                "could not reach the server to revoke this device ({e:#}). Revoke \"{}\" on the app's Client page.",
                 s.device_name
             )),
         }
@@ -488,6 +488,7 @@ struct ModelInfo {
     ctx: u64,
     model_id: String,
     edit_format: String,
+    reasoning: bool,
 }
 
 async fn preflight(name: &str, s: &Server) -> Result<ModelInfo> {
@@ -516,11 +517,16 @@ async fn preflight_inner(name: &str, s: &Server) -> Result<ModelInfo> {
         bail!("the model on \"{name}\" is still loading; try again in a minute (`oppx status` shows progress)");
     }
     if let Some(i) = api::info(&client, &s.url, &s.token).await? {
-        return Ok(ModelInfo { ctx: i.context_length, model_id: i.model_id, edit_format: i.edit_format });
+        return Ok(ModelInfo {
+            ctx: i.context_length,
+            model_id: i.model_id,
+            edit_format: i.edit_format,
+            reasoning: i.reasoning,
+        });
     }
     // Older server without /v1/info.
     let ctx = api::context_len(&client, &s.url, &s.token).await?.unwrap_or(32_768);
-    Ok(ModelInfo { ctx, model_id: agent::AIDER_MODEL.trim_start_matches("openai/").into(), edit_format: "diff".into() })
+    Ok(ModelInfo { ctx, model_id: agent::AIDER_MODEL.trim_start_matches("openai/").into(), edit_format: "diff".into(), reasoning: false })
 }
 
 async fn run_search(cfg: &Config, name: Option<&str>, query: &str, max: u8) -> Result<()> {
@@ -688,6 +694,7 @@ async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args:
             .env("OPPX_SERVER", name)
             .env("OPPX_CONTEXT", ctx.to_string())
             .env("OPPX_MODEL_ID", &info.model_id)
+            .env("OPPX_REASONING", if info.reasoning { "1" } else { "0" })
             .env("OPPX_WEB", if web { "1" } else { "0" })
             .env("OPPX_VERSION", env!("CARGO_PKG_VERSION"))
             .env("OPPX_BIN", std::env::current_exe().unwrap_or_else(|_| "oppx".into()))

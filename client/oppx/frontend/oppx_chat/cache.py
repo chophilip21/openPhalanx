@@ -51,6 +51,36 @@ def _stable_map_heading(coder):
 ASK_NOTE = "(This is not a change request: just reply in plain text, as in a normal chat. Don't use SEARCH/REPLACE blocks; no files will be changed.)"
 
 
+# Models that rank the system prompt strictly above the user (gpt-oss) obey
+# the edit prompts' "ONLY EVER RETURN CODE IN A SEARCH/REPLACE BLOCK" over
+# ASK_NOTE, and answered a question with an edit block instead of prose. The
+# exception therefore lives in the system prompt itself. It is identical for
+# questions and edits, so the shared prefix (and the cache) is unchanged.
+QUESTION_RULE = (
+    "\n\nException: when the user's latest message ends with a note saying it is not a change "
+    "request, answer it in plain prose as in a normal chat. Don't write SEARCH/REPLACE blocks or "
+    "file listings for it; nothing will be applied. Every other message follows the rules above."
+)
+
+
+def _with_question_rule(prompts):
+    """The coder's prompts with QUESTION_RULE appended to the system prompt
+    and to the final reminder (which repeats the edit-block rule)."""
+    cls = type(prompts)
+    if getattr(cls, "_oppx_question_rule", False):
+        return prompts
+    sub = type(
+        "Oppx" + cls.__name__,
+        (cls,),
+        {
+            "main_system": (cls.main_system or "") + QUESTION_RULE,
+            "system_reminder": (cls.system_reminder or "") + QUESTION_RULE,
+            "_oppx_question_rule": True,
+        },
+    )
+    return sub()
+
+
 class _EditPrompts:
     prompts = None  # the latest editing coder's prompts
 
@@ -79,6 +109,7 @@ _orig_coder_init = base_coder.Coder.__init__
 def _coder_init(self, *args, **kwargs):
     _orig_coder_init(self, *args, **kwargs)
     if not isinstance(self, AskCoder) and getattr(self, "edit_format", None) != "ask":
+        self.gpt_prompts = _with_question_rule(self.gpt_prompts)
         _EditPrompts.prompts = self.gpt_prompts
         _stable_map_heading(self)
 

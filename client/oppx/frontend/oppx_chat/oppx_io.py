@@ -19,7 +19,7 @@ from rich.markup import escape
 
 from .config import ACCENT, BULLET, CONTEXT, GREEN, MODEL_NAME, MUTED, PRINT_MODE, RED, SERVER, WEB, YELLOW
 from .term import SESSION, SPIN, UI, console, out, step
-from .render import BulletStream
+from .render import BulletStream, hide_reasoning
 from .context import CONTEXT_MGR
 
 
@@ -33,6 +33,7 @@ SUPPRESS = [
         r"^Git repo:",
         r"^Repo-map:",
         r"^Tokens:",
+        r"^Retrying in [\d.]+ seconds",  # server busy or restarting: the spinner shows the wait
         r"^Cost:",
         r"aider\.chat",
         r"^Use /help",
@@ -66,9 +67,54 @@ SUPPRESS = [
 # ---------------------------------------------------------------------------
 
 
+# What the user should do when the server refuses a request. Keys are what
+# server_problem() returns; Aider's own follow-up hints map to "" (hidden).
+SERVER_PROBLEMS = {
+    "revoked": f"This device is no longer paired with {SERVER}: it was revoked on the server. "
+    "Pair again with a new code from the app: oppx pair <server> <code> --force",
+    "loading": f"{SERVER} is starting up or busy, so it can't answer yet. "
+    "Try again in a minute; `oppx status` shows when the model is ready.",
+    "unreachable": f"Can't reach {SERVER}. Check that the server is running and on the network; "
+    "`oppx status` checks the connection.",
+    "certificate": f"{SERVER}'s certificate changed, so nothing was sent. Run `oppx status` for details.",
+}
+_AIDER_HINTS = (
+    "The API provider is not able to authenticate you",
+    "Check your API key",
+    "The API provider's servers are down or overloaded",
+    "Retrying in ",
+    "There was a problem with the API provider",
+)
+
+
+def server_problem(message: str) -> str | None:
+    """Classifies an error Aider prints: a server problem kind, "" for one of
+    Aider's generic follow-up hints, or None for anything else."""
+    text = message or ""
+    if "certificate changed" in text:
+        return "certificate"
+    if "cannot reach the OpenPhalanx server" in text or "Connection refused" in text or "ConnectError" in text:
+        return "unreachable"
+    code = re.search(r"Error code: (\d{3})", text)
+    if "missing or invalid device token" in text or (code and code.group(1) == "401"):
+        return "revoked"
+    if (code and code.group(1) in ("502", "503")) or "ServiceUnavailableError" in text or "model is still loading" in text:
+        return "loading" if not (code and code.group(1) == "502") else "unreachable"
+    if any(h in text for h in _AIDER_HINTS):
+        return ""
+    return None
+
+
 class OppxIO(InputOutput):
     """Aider's output and prompts, restyled and filtered."""
 
+
+    def ai_output(self, content):
+        """Answers are saved to the session file without their reasoning:
+        Aider strips it only for the configured tag, and with SGLang's separate
+        reasoning_content it opens with its own <thinking-content-…> tag, so the
+        whole chain of thought was written to the file and resent on -c/-r."""
+        super().ai_output(hide_reasoning(content or ""))
     def __init__(self, *args, **kwargs):
         # Aider passes `pretty` as the first positional argument.
         if args:
@@ -119,6 +165,8 @@ class OppxIO(InputOutput):
     def tool_warning(self, message="", strip=True):
         if self._edit_retry(message):
             return
+        if self._server_problem(message):
+            return
         if message.strip():
             self.append_chat_history(message, linebreak=True, blockquote=True, strip=strip)
         self._route(message, YELLOW)
@@ -127,9 +175,23 @@ class OppxIO(InputOutput):
         self.num_error_outputs += 1
         if self._edit_retry(message):
             return
+        if self._server_problem(message):
+            return
         if message.strip():
             self.append_chat_history(message, linebreak=True, blockquote=True, strip=strip)
         self._route(message, RED)
+
+    def _server_problem(self, message: str) -> bool:
+        """Replaces litellm's errors and Aider's provider hints ("Check your API
+        key") with what actually happened on the OpenPhalanx server, once per
+        turn. Returns True when the message was handled."""
+        kind = server_problem(message)
+        if kind is None:
+            return False
+        if kind and not UI.server_error:
+            UI.server_error = kind
+            step(SERVER_PROBLEMS[kind], RED if kind == "revoked" else YELLOW)
+        return True
 
     def rule(self):
         pass  # the prompt draws its own separator

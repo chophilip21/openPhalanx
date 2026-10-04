@@ -30,8 +30,14 @@ class BulletStream(MarkdownStream):
 # Reasoning models think before answering. Aider rewrites the model's
 # reasoning tag (from the catalog, `think` by default) into these markers;
 # raw tags are handled too, in case a model's template opens the tag itself.
+# Opening: Aider's THINKING marker, a raw <think>/<thinking> tag, or Aider's
+# internal <thinking-content-…> tag (Aider 0.86 opens with that one but closes
+# with the configured tag, so the opening is never converted; seen with
+# gpt-oss, whose reasoning arrives as SGLang's separate reasoning_content).
+# Closing: the ANSWER marker, a raw closing tag, or nothing yet (streaming).
+_TAG = r"(?:think(?:ing)?|thinking-content-[0-9a-f]+)"
 _REASONING = re.compile(
-    r"(?s)(?:-+\n► \*\*THINKING\*\*.*?(?:-+\n► \*\*ANSWER\*\*\s*|$)|<think(?:ing)?>.*?(?:</think(?:ing)?>\s*|$))"
+    rf"(?s)(?:-+\n► \*\*THINKING\*\*|<{_TAG}>).*?(?:-+\n► \*\*ANSWER\*\*\s*|</{_TAG}>\s*|$)"
 )
 
 

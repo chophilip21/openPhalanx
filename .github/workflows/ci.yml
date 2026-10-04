@@ -66,7 +66,11 @@ jobs:
           pip install ruff
           ruff check --select F,E9 --target-version py312 docker/server client/oppx/frontend scripts
       - name: Shell syntax
-        run: for f in scripts/*.sh docker/server/*.sh; do [ -f "$f" ] && sh -n "$f"; done
+        # Each script with its own interpreter (bash scripts use arrays).
+        run: |
+          for f in scripts/*.sh docker/server/*.sh; do
+            case "$(head -1 "$f")" in *bash*) bash -n "$f" ;; *) sh -n "$f" ;; esac
+          done
       - name: Version bump rules
         run: |
           python3 scripts/bump_version.py --check --title "[bug] x"
