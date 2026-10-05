@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.4.1 (2026-10-05)
+
+### Fixes
+
+- Release build: version every workspace crate in Cargo.lock (#4)
+
 ## v0.4.0 (2026-10-05)
 
 ### Features
