@@ -26,6 +26,36 @@ pub struct WhoAmI {
     pub device_id: String,
     pub device_name: String,
     pub model: String,
+    /// When this device's pairing expires (unix seconds); `None`: never.
+    #[serde(default)]
+    pub expires_at: Option<f64>,
+}
+
+/// Why the server refused this device's token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejected {
+    /// Revoked in the server app (or unknown to it).
+    Revoked,
+    /// Its pairing ran out (the server app sets how long pairings last).
+    Expired,
+}
+
+impl Rejected {
+    fn from_detail(detail: &str) -> Self {
+        if detail.contains("expired") {
+            Rejected::Expired
+        } else {
+            Rejected::Revoked
+        }
+    }
+
+    /// "this device was revoked" / "this device's pairing expired".
+    pub fn what(self) -> &'static str {
+        match self {
+            Rejected::Revoked => "this device was revoked",
+            Rejected::Expired => "this device's pairing expired",
+        }
+    }
 }
 
 /// Error detail from a FastAPI (`{"detail": …}`) or OpenAI (`{"error": {"message": …}}`) body.
@@ -65,12 +95,12 @@ pub async fn health(client: &reqwest::Client, url: &str) -> Result<Health> {
     Ok(resp.json().await?)
 }
 
-/// `None` when the server no longer accepts this device's token.
-pub async fn whoami(client: &reqwest::Client, url: &str, token: &str) -> Result<Option<WhoAmI>> {
+/// `Err(Rejected)` when the server no longer accepts this device's token.
+pub async fn whoami(client: &reqwest::Client, url: &str, token: &str) -> Result<Result<WhoAmI, Rejected>> {
     let resp = client.get(format!("{url}/v1/whoami")).bearer_auth(token).timeout(TIMEOUT).send().await?;
     match resp.status() {
-        StatusCode::OK => Ok(Some(resp.json().await?)),
-        StatusCode::UNAUTHORIZED => Ok(None),
+        StatusCode::OK => Ok(Ok(resp.json().await?)),
+        StatusCode::UNAUTHORIZED => Ok(Err(Rejected::from_detail(&detail(resp).await))),
         _ => bail!("whoami failed: {}", detail(resp).await),
     }
 }
@@ -121,7 +151,7 @@ pub async fn search(client: &reqwest::Client, url: &str, token: &str, query: &st
             }
             Ok(resp.json::<Body>().await?.results)
         }
-        StatusCode::UNAUTHORIZED => bail!("this device was revoked; pair again"),
+        StatusCode::UNAUTHORIZED => bail!("{}; pair again", Rejected::from_detail(&detail(resp).await).what()),
         _ => bail!("search failed: {}", detail(resp).await),
     }
 }

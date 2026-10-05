@@ -33,6 +33,28 @@ Server on an RTX 3090, client validated end to end from a separate laptop over t
 
 ## Next version
 
+* \[ \] **Cluster** (`feature/multi-gpu`), in steps:
+  * ✅ **1. Membership:**
+    * Servers discover each other on the LAN and are listed only when running and reachable.
+    * The user picks members and the host, with approval on the joining side; clients pair with the host only.
+    * Members report hardware and serving stats.
+    * Per-machine charts via a dropdown.
+    * Headless `openphalanx-server`.
+    * Strategy switch (split by default, colour-coded with a tooltip).
+    * Members download the host's model when it starts (verified on the 4090).
+    * Per-machine logs on the Logs page.
+    * Remove and re-add members; servers listed about 0.3 s after they start.
+    * Start guard: one controller per cluster (a member's Start takes the host role over, refused while the host serves); members locked out show a violet button.
+    * Split strategy pauses serving when a member drops out (goodbye on exit, or 12 s without a report).
+    * Strategy locked while the server runs; Models page pools VRAM across a split cluster (donut per server).
+    * Verified between the 3090 and the 4090 laptop: invite, approve, hand-over, dissolve, and the drop-off of stopped servers.
+  * 2\. Members run backends: the host starts or stops a model on a member, a router on the host spreads requests, and clients see one server.
+  * 3\. One model split across servers (pipeline parallel), wired networks only. In progress:
+    * Done: layer plan by free VRAM (`split.rs`), rank 0 on the host network, member workers through report replies, split-aware pre-flight, pause/fail handling, per-model `dtype` in the catalog.
+    * Verified by hand on the 3090 + 4090: Qwen3-8B (about 100 tokens/s) and Qwen3.6-27B (42/22 layers, 32k context, a 16.8k-token prompt answered correctly).
+    * Full app run works (Start on the 3090 host, the 4090 as a member). Fixed after it: runtime memory per stage (the KV cache came out shorter than the context), the context the gateway reports, and the client's handling of over-long requests.
+    * To do: the backend image on GHCR so members can pull it.
+  * Setup on the 4090 still needs sudo: the GUI build libraries, Node.js and the NVIDIA runtime for Docker.
 * \[ \] **Model matrix** (was Step 5.3): run every catalog model that fits 24 GB on hardware. For each: `probe_routing.py`, an edit task in `diff` and `whole` to set its `edit_format`, tokenizer ratio, tokens/s and time to first token. Record a table here.
   * Known from Step 5.1: gpt-oss-20b once nested a new function inside another, and misread clear search results ("Rust 1.99.0" answered as "1.116").
 * \[ \] **GUI hardening** (was Steps 3.2/5.4):
@@ -46,8 +68,3 @@ Server on an RTX 3090, client validated end to end from a separate laptop over t
 ## Future Improvement
 
 1. Optimization work for speed and security. 
-2. ~~Implement sessions that can be resumed, and make sure we are doing context summarization, etc.~~ Done in Steps 4.8 (sessions, `-c`/`-r`) and 4.9 (auto-compaction and context fitting). 
-3. Another important feature that deserves its own section. right now, our codebase assumes there is one server, and N possible clients. But this is not only the case. There can be N servers that can distribute the workload, and load one large model in a distributed way. And we can also imagine multiple clients, that points at cluster of nodes. 
-
-Scaling from a single GPU workstation to a cluster of nodes handling multiple concurrent clients is the exact use case that frameworks like SGLang and vLLM were built to solve for enterprise deployments.To achieve this, the architecture splits into two distinct problems: distributing the model (across N servers) and distributing the traffic (routing N clients).Here is exactly how this is handled in modern LLM infrastructure.Part 1: Distributing One Large Model Across N ServersIf a model is too large to fit on a single machine (e.g., a 70B parameter model or massive Mixture-of-Experts like DeepSeek), you cluster multiple physical servers together. SGLang supports this natively using Ray and NCCL (NVIDIA Collective Communications Library).Tensor Parallelism (TP) & Pipeline Parallelism (PP):TP slices individual matrix math operations across multiple GPUs. If those GPUs are on different servers, SGLang uses Ray to coordinate them over the network.PP slices the model vertically. Server A handles layers 1–20, and Server B handles layers 21–40. Server A computes the first half and passes the intermediate tensors over the network to Server B to finish.   Prefill/Decode (PD) Disaggregation:This is a highly advanced SGLang feature for clusters. You designate some servers strictly as "Prefill nodes" (their only job is reading massive codebases/prompts) and other servers as "Decode nodes" (their only job is generating the output tokens). Once a Prefill node processes an Aider Repo Map, it transfers the KV cache over the network to the Decode node to stream the answer.   Note: Splitting a single model across multiple physical machines requires extremely fast networking (e.g., InfiniBand or 400GbE RoCE). Standard Gigabit Ethernet is too slow for Tensor Parallelism between physical servers.Part 2: Routing N Clients to N Servers (Load Balancing)If you simply want to increase your capacity to handle many developers (N clients) at once, you run identical copies of your model across multiple independent servers (Data Parallelism).To the clients, there should only ever be one API endpoint. You accomplish this using a router.The SGLang Model Gateway (Router):SGLang has a built-in router (sglang-router) that sits in front of all your GPU servers. You launch your GPU workers, and then launch the router on a head node.   Bashpython -m sglang_router.launch_server --host 0.0.0.0 --port 30000 --dp-size 4
-All of your Tauri/Aider clients simply point their OPENAI_API_BASE to this single router IP.Cache-Aware Routing (The Secret Weapon):If 10 developers are working simultaneously, their prompts are huge. SGLang's router uses RadixAttention cache-aware load balancing.When Developer A sends their codebase map, the router sends it to Server 1. When Developer A asks a follow-up question, the router remembers that Server 1 already has Developer A's codebase in its KV cache, and routes the request back to Server 1. If Developer B logs in, the router sends them to an idle node, like Server 2.   External API Gateways (LiteLLM):If you don't use the built-in SGLang router, the industry standard for this is LiteLLM. You run an NGINX-like container called LiteLLM Gateway that receives all API calls and load-balances them across your cluster of SGLang servers using round-robin or lowest-latency routing.

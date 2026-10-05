@@ -72,7 +72,7 @@ impl Source {
     }
 }
 
-fn validate_repo(repo: &str) -> Result<()> {
+pub(crate) fn validate_repo(repo: &str) -> Result<()> {
     let ok = repo.split('/').count() == 2
         && repo.split('/').all(|p| {
             !p.is_empty()

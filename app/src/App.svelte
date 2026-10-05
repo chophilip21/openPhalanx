@@ -88,7 +88,7 @@
   .pip { margin-left: auto; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
   .pip.running { background: var(--on); box-shadow: 0 0 8px var(--on); }
   .pip.starting, .pip.stopping, .pip.external { background: var(--busy); }
-  .pip.error { background: var(--bad); }
+  .pip.error, .pip.paused { background: var(--bad); }
   .spacer { flex: 1; }
   .version { font-size: 11.5px; padding: 6px 12px 0; }
   main { min-width: 0; height: 100%; overflow: hidden; }

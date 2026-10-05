@@ -29,6 +29,8 @@ pub struct ResolvedModel {
     pub model_id: String,
     pub edit_format: Option<String>,
     pub reasoning_parser: Option<String>,
+    /// SGLang `--dtype` override (catalog data).
+    pub dtype: Option<String>,
 }
 
 /// Edit format when the catalog doesn't name one.
@@ -74,6 +76,7 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
             model_id: e.id.clone(),
             edit_format: e.edit_format.clone(),
             reasoning_parser: e.reasoning_parser.clone(),
+            dtype: e.dtype.clone(),
         });
     }
     let c = settings.custom_models.iter().find(|c| c.key == key)?;
@@ -95,6 +98,7 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
         model_id: c.repo.clone().unwrap_or_else(|| c.label.clone()),
         edit_format: None,
         reasoning_parser: None,
+        dtype: None,
     })
 }
 
@@ -124,6 +128,8 @@ impl Check {
 pub struct Preflight {
     pub checks: Vec<Check>,
     pub can_start: bool,
+    /// The backend is already running (`can_start` is false for that alone).
+    pub running: bool,
     pub gpu: Option<GpuInfo>,
     pub gpus: Vec<GpuInfo>,
     pub model: Option<ResolvedModel>,
@@ -236,7 +242,7 @@ pub async fn preflight(settings: &Settings) -> Preflight {
     }
 
     let can_start = !running && checks.iter().all(|c| c.status != Fail);
-    Preflight { checks, can_start, gpu, gpus, model, requirement, fit, image_present }
+    Preflight { checks, can_start, running, gpu, gpus, model, requirement, fit, image_present }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -248,17 +254,34 @@ pub enum StartProgress {
     Launching,
 }
 
-pub async fn start(settings: &Settings, mut on_progress: impl FnMut(StartProgress)) -> Result<()> {
+/// This machine's part of a model split across servers: rank 0 (the host).
+#[derive(Debug, Clone)]
+pub struct SplitStart {
+    pub rank: docker::SplitRank,
+    pub stage: crate::split::Stage,
+}
+
+pub async fn start(
+    settings: &Settings,
+    split: Option<SplitStart>,
+    mut on_progress: impl FnMut(StartProgress),
+) -> Result<()> {
     on_progress(StartProgress::Checking);
     let pf = preflight(settings).await;
-    if !pf.can_start {
-        let reason = pf
-            .checks
-            .iter()
-            .find(|c| c.status == CheckStatus::Fail)
-            .map(|c| c.detail.clone())
-            .unwrap_or_else(|| "The backend is already running.".into());
-        bail!(reason);
+    // Split: this GPU only holds its stage, checked below instead of the
+    // whole model.
+    let blocking = pf
+        .checks
+        .iter()
+        .find(|c| c.status == CheckStatus::Fail && !(split.is_some() && c.id == "vram"));
+    if let Some(check) = blocking {
+        bail!(check.detail.clone());
+    }
+    if pf.running {
+        bail!("The backend is already running.");
+    }
+    if pf.model.as_ref().and_then(|m| m.installed_dir.as_ref()).is_none() {
+        bail!("No model is selected, or it isn't downloaded yet.");
     }
 
     if !pf.image_present {
@@ -284,7 +307,10 @@ pub async fn start(settings: &Settings, mut on_progress: impl FnMut(StartProgres
         .into_iter()
         .find(|g| g.index == settings.gpu_index)
         .ok_or_else(|| anyhow::anyhow!("GPU {} disappeared", settings.gpu_index))?;
-    let req = model.requirement(settings.context_len, gpu.compute_capability);
+    let req = match &split {
+        Some(s) => s.stage.requirement,
+        None => model.requirement(settings.context_len, gpu.compute_capability),
+    };
     let fit = vram::check(&req, gpu.free_bytes);
     if fit.fit == Fit::Insufficient {
         bail!(fit.message);
@@ -306,7 +332,7 @@ pub async fn start(settings: &Settings, mut on_progress: impl FnMut(StartProgres
             docker::pull(docker::SEARXNG_IMAGE, |line| on_progress(StartProgress::PullingImage { line })).await?;
         }
         let settings_file = write_searxng_settings()?;
-        docker::run_searxng(&settings_file, &admin::new_admin_token()).await?;
+        docker::run_searxng(&settings_file, &admin::new_admin_token(), split.is_some()).await?;
     }
     docker::run(&RunSpec {
         image: settings.image(),
@@ -322,6 +348,9 @@ pub async fn start(settings: &Settings, mut on_progress: impl FnMut(StartProgres
         model_id: model.model_id.clone(),
         edit_format: model.edit_format.clone().unwrap_or_else(|| DEFAULT_EDIT_FORMAT.to_string()),
         reasoning_parser: model.reasoning_parser.clone(),
+        dtype: model.dtype.clone(),
+        pairing_ttl_days: settings.pairing_ttl_days,
+        split: split.map(|s| s.rank),
     })
     .await
 }

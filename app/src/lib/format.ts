@@ -21,6 +21,16 @@ export function ago(unixSeconds: number | null | undefined): string {
   return `${Math.floor(s / 86400)} d ago`;
 }
 
+/** "in 5 d", "in 3 h", "expired": time left until a unix time. */
+export function until(unixSeconds: number | null | undefined): string {
+  if (!unixSeconds) return "never";
+  const s = unixSeconds - Date.now() / 1000;
+  if (s <= 0) return "expired";
+  if (s < 3600) return `in ${Math.max(1, Math.floor(s / 60))} min`;
+  if (s < 86400) return `in ${Math.floor(s / 3600)} h`;
+  return `in ${Math.floor(s / 86400)} d`;
+}
+
 export function countdown(unixSeconds: number | null | undefined, now: number): string {
   if (!unixSeconds) return "";
   const s = Math.max(0, Math.round(unixSeconds - now / 1000));

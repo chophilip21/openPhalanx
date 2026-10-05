@@ -38,7 +38,13 @@ pub struct Settings {
     pub custom_models: Vec<CustomModel>,
     /// Run a private SearXNG next to the backend for client web search.
     pub web_search: bool,
+    /// Days a client's pairing lasts before it must pair again; `None`:
+    /// never expires. Default one week.
+    pub pairing_ttl_days: Option<u32>,
 }
+
+/// The choices the app offers for `pairing_ttl_days`.
+pub const PAIRING_TTL_CHOICES: [Option<u32>; 5] = [Some(1), Some(7), Some(30), Some(365), None];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -50,6 +56,7 @@ impl Default for Settings {
             image: None,
             custom_models: Vec::new(),
             web_search: true,
+            pairing_ttl_days: Some(7),
         }
     }
 }

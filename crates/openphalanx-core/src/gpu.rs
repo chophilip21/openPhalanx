@@ -1,12 +1,12 @@
 //! GPU inventory via `nvidia-smi`.
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 const MIB: u64 = 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GpuInfo {
     pub index: u32,
     pub name: String,

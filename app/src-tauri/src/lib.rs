@@ -8,10 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openphalanx_core::admin::{self, AdminClient};
+use openphalanx_core::cluster::{self, Cluster, ClusterView, Role, Strategy};
 use openphalanx_core::server::{self, CheckStatus, StartProgress};
 use openphalanx_core::settings::{CustomModel, Settings};
 use openphalanx_core::vram::{self, FitCheck, Requirement};
-use openphalanx_core::{catalog, docker, download, gpu, model, net, paths};
+use openphalanx_core::{catalog, docker, download, gpu, model, net, paths, split};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -36,6 +37,10 @@ enum Phase {
     },
     Stopping,
     Failed {
+        message: String,
+    },
+    /// Stopped on purpose by the cluster (e.g. a server of a split model dropped out).
+    Paused {
         message: String,
     },
 }
@@ -67,11 +72,18 @@ struct Inner {
     downloads: HashMap<String, DownloadView>,
     cancels: HashMap<String, download::Cancel>,
     log_follower: bool,
+    /// The running model is split across the cluster (its plan, for display).
+    split: Option<String>,
 }
 
 pub struct AppState {
     settings: Mutex<Settings>,
     inner: Mutex<Inner>,
+    /// This machine as a cluster head (nodes join it on CLUSTER_PORT); None
+    /// if its state couldn't be opened.
+    cluster: Option<Arc<Cluster>>,
+    /// Why the cluster service isn't available, if it isn't.
+    cluster_error: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -87,6 +99,10 @@ impl AppState {
     }
 }
 
+/// A split-model cluster pauses when a member hasn't reported for this long
+/// (or said goodbye). Reports come every 5 s, so this is two missed reports.
+const SPLIT_DROP_SECS: u64 = 12;
+
 // --------------------------------------------------------------------------
 // Snapshot
 // --------------------------------------------------------------------------
@@ -97,6 +113,19 @@ struct ServerView {
     state: &'static str,
     detail: Option<String>,
     model_key: Option<String>,
+    /// What the backend is serving (or loading), for display; the model is
+    /// fixed until the server stops.
+    model: Option<RunningModel>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RunningModel {
+    key: String,
+    label: String,
+    quant: Option<String>,
+    context_len: Option<u32>,
+    /// Split across the cluster: each server's layers and memory.
+    split: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +137,15 @@ struct Snapshot {
     downloads: Vec<DownloadView>,
     settings: Settings,
     warnings: Vec<String>,
+    cluster: Option<ClusterSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterSnapshot {
+    #[serde(flatten)]
+    view: ClusterView,
+    /// Why the cluster service isn't running, if it isn't.
+    error: Option<String>,
 }
 
 async fn admin_client() -> Option<AdminClient> {
@@ -171,10 +209,51 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
         inner.phase = Phase::Failed { message };
     }
 
+    if let Some(c) = st.cluster.as_ref().filter(|c| !c.is_member()) {
+        // Split model: every server holds part of it, so one dropping out
+        // (or its worker failing) breaks inference. Stop instead of failing
+        // requests, and say why.
+        let serving_here = running && managed && matches!(inner.phase, Phase::Idle);
+        if serving_here && inner.split.is_some() {
+            let workers = c.worker_states();
+            let in_run: Vec<String> = workers.iter().map(|(name, _)| name.clone()).collect();
+            let dropped: Vec<String> = c.dropped_members(SPLIT_DROP_SECS).into_iter().filter(|n| in_run.contains(n)).collect();
+            let failed = workers.iter().find_map(|(name, w)| {
+                w.as_ref().filter(|w| w.state == "failed").map(|w| (name.clone(), w.message.clone().unwrap_or_default()))
+            });
+            let stop_with = if !dropped.is_empty() {
+                let names = dropped.join(", ");
+                Some(Phase::Paused {
+                    message: format!(
+                        "Paused: {names} dropped out of the cluster. The model is split across the servers, so serving \
+                         stopped instead of failing requests. Start again once {names} is back, or remove it from the \
+                         cluster."
+                    ),
+                })
+            } else {
+                failed.map(|(name, why)| Phase::Failed {
+                    message: format!("{name}'s share of the split model failed: {why}. See its log on the Logs page."),
+                })
+            };
+            if let Some(phase) = stop_with {
+                inner.phase = phase;
+                inner.split = None;
+                inner.expect_running = false;
+                inner.stop_epoch += 1;
+                c.set_workers(HashMap::new());
+                tauri::async_runtime::spawn(async { let _ = docker::stop().await; });
+            }
+        }
+        // Members see whether the host is serving (and can't start meanwhile).
+        let serving = matches!(inner.phase, Phase::Starting { .. }) || (running && managed && matches!(inner.phase, Phase::Idle));
+        c.set_serving(serving);
+    }
+
     let (state, detail) = match &inner.phase {
         Phase::Starting { detail } => ("starting", Some(detail.clone())),
         Phase::Stopping => ("stopping", None),
         Phase::Failed { message } => ("error", Some(message.clone())),
+        Phase::Paused { message } => ("paused", Some(message.clone())),
         Phase::Idle if running && !managed => (
             "external",
             Some("A backend container was started outside this app. Stop it to manage it from here.".into()),
@@ -205,6 +284,7 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
     if need_follower {
         inner.log_follower = true;
     }
+    let split_plan = inner.split.clone();
     drop(inner);
     if need_follower {
         spawn_log_follower(app.clone());
@@ -214,6 +294,17 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
         server: ServerView {
             state,
             detail,
+            model: container.as_ref().filter(|c| c.state.running).and_then(|c| {
+                let key = c.model_key.clone()?;
+                let m = server::resolve(&settings, &key);
+                Some(RunningModel {
+                    label: m.as_ref().map_or_else(|| key.trim_start_matches("catalog:").to_string(), |m| m.label.clone()),
+                    quant: m.and_then(|m| m.quant),
+                    context_len: c.context_len,
+                    split: split_plan.clone(),
+                    key,
+                })
+            }),
             model_key: container.and_then(|c| c.model_key),
         },
         gpus,
@@ -222,6 +313,7 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
         downloads,
         settings,
         warnings,
+        cluster: st.cluster.as_ref().map(|c| ClusterSnapshot { view: c.view(), error: st.cluster_error.lock().unwrap().clone() }),
     }
 }
 
@@ -288,7 +380,121 @@ async fn get_snapshot(app: AppHandle) -> Snapshot {
 
 #[tauri::command]
 async fn get_preflight(state: State<'_, AppState>) -> CmdResult<server::Preflight> {
-    Ok(server::preflight(&state.settings()).await)
+    let settings = state.settings();
+    follow_selection(&state, &settings);
+    let mut pf = server::preflight(&settings).await;
+    plan_split(&state, &settings, &mut pf);
+    Ok(pf)
+}
+
+/// A model split across this host and its members (cluster step 3).
+struct SplitPlan {
+    stages: Vec<split::Stage>,
+    model: cluster::ModelSpec,
+    dtype: Option<String>,
+}
+
+/// The model members are asked to keep on disk (repo and pinned commit).
+/// Local-folder models can't be fetched by members, so they have none.
+fn model_spec(settings: &Settings) -> Option<cluster::ModelSpec> {
+    let m = settings.selected_model.as_deref().and_then(|k| server::resolve(settings, k))?;
+    Some(cluster::ModelSpec {
+        key: m.key.clone(),
+        label: format!("{}{}", m.label, m.quant.as_deref().map(|q| format!(" · {q}")).unwrap_or_default()),
+        repo: m.repo.clone()?,
+        revision: m.revision.clone()?,
+        weight_bytes: m.weight_bytes,
+    })
+}
+
+/// As host: the model members are asked for is the one selected here (also
+/// after a restart, or a selection made before this machine was host).
+fn follow_selection(state: &AppState, settings: &Settings) {
+    if let Some(c) = state.cluster.as_ref().filter(|c| c.role() == Role::Host) {
+        let _ = c.set_desired_model(model_spec(settings));
+    }
+}
+
+/// Split strategy, as host with online members: a model that doesn't fit
+/// this GPU is split across the servers instead. A model that fits runs
+/// here alone (faster, and it keeps serving if a member drops out).
+/// Adjusts the VRAM check to match and returns the plan; `None` when this
+/// start doesn't split.
+fn plan_split(state: &AppState, settings: &Settings, pf: &mut server::Preflight) -> Option<SplitPlan> {
+    let (Some(req), Some(fit), Some(model)) = (pf.requirement, pf.fit.clone(), pf.model.clone()) else { return None };
+    if fit.fit != vram::Fit::Insufficient {
+        return None;
+    }
+    let c = state.cluster.as_ref()?;
+    let pool = cluster_pool(state, pf.gpu.as_ref(), Some(fit.free_bytes))?;
+    let names = pool.iter().filter(|n| !n.this).map(|n| n.name.clone()).collect::<Vec<_>>().join(", ");
+
+    let result = (|| -> Result<SplitPlan, String> {
+        let spec = model_spec(settings).ok_or_else(|| {
+            format!("{} is a local folder, which {names} can't fetch, so it can't be split across the cluster.", model.label)
+        })?;
+        let members = c.members();
+        for n in pool.iter().filter(|n| !n.this) {
+            let Some(r) = members.iter().find(|m| m.id == n.id).and_then(|m| m.report.as_ref()) else { continue };
+            if !r.inventory.nvidia_runtime {
+                return Err(format!(
+                    "{} can't run GPU containers yet: install the NVIDIA Container Toolkit there \
+                     (sudo nvidia-ctk runtime configure --runtime=docker, then restart Docker).",
+                    n.name
+                ));
+            }
+            match &r.model_sync {
+                Some(s) if s.repo == spec.repo && s.revision == spec.revision && s.state == "ready" => {}
+                Some(s) if s.repo == spec.repo && s.revision == spec.revision && s.state == "missing" => {
+                    return Err(format!(
+                        "{} doesn't have {} ({}). Download it there first; Start offers to.",
+                        n.name,
+                        spec.label,
+                        vram::fmt_gib(spec.weight_bytes)
+                    ));
+                }
+                Some(s) if s.repo == spec.repo && s.revision == spec.revision && s.state == "downloading" => {
+                    let pct = (s.done_bytes * 100).checked_div(s.total_bytes).unwrap_or(0);
+                    return Err(format!("{} is still downloading {} ({pct}%). Start again when it's done.", n.name, spec.label));
+                }
+                Some(s) if s.repo == spec.repo && s.state == "error" => {
+                    return Err(format!(
+                        "{} couldn't download {}: {}",
+                        n.name,
+                        spec.label,
+                        s.error.clone().unwrap_or_default()
+                    ));
+                }
+                _ => return Err(format!("checking whether {} has {}…", n.name, spec.label)),
+            }
+        }
+        let dir = model.installed_dir.as_deref().ok_or("The model isn't downloaded on this machine.")?;
+        let shape = split::ModelShape::read(dir).map_err(|e| format!("{e:#}"))?;
+        let caps: Vec<split::Capacity> = pool
+            .iter()
+            .map(|n| split::Capacity { id: n.id.clone(), name: n.name.clone(), free_bytes: n.available_bytes })
+            .collect();
+        let stages = split::plan(&req, &shape, &caps)?;
+        Ok(SplitPlan { stages, model: spec, dtype: model.dtype.clone() })
+    })();
+
+    let check = pf.checks.iter_mut().find(|c| c.id == "vram")?;
+    match result {
+        Ok(plan) => {
+            check.status = CheckStatus::Pass;
+            check.detail = format!(
+                "Doesn't fit this GPU alone ({} free), so it's split across the cluster: {}.",
+                vram::fmt_gib(fit.free_bytes),
+                split::describe(&plan.stages)
+            );
+            pf.can_start = !pf.running && pf.checks.iter().all(|c| c.status != CheckStatus::Fail);
+            Some(plan)
+        }
+        Err(reason) => {
+            check.detail = format!("Fits the cluster's pooled VRAM with {names}, but can't be split yet: {reason}");
+            None
+        }
+    }
 }
 
 #[tauri::command]
@@ -299,9 +505,49 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
             return Err("The backend is already starting or stopping.".into());
         }
     }
+    // One controller per cluster: claim it (a member takes the host role
+    // over first; the host refuses while its own server runs). Shown as
+    // starting meanwhile, so the monitor keeps the claim.
+    state.inner.lock().unwrap().phase = Phase::Starting { detail: "Checking the cluster…".into() };
+    let release = |state: &AppState| {
+        state.inner.lock().unwrap().phase = Phase::Idle;
+        if let Some(c) = &state.cluster {
+            c.set_serving(false);
+        }
+    };
+    if let Some(c) = state.cluster.clone() {
+        if let Err(e) = c.claim_start().await {
+            release(&state);
+            return Err(format!("{e:#}"));
+        }
+    }
     let settings = state.settings();
-    let pf = server::preflight(&settings).await;
+    // A host asks its members to have the same model on disk (they download
+    // it from the same pinned commit if they don't).
+    if let Some(c) = state.cluster.as_ref().filter(|c| !c.is_member()) {
+        follow_selection(&state, &settings);
+        let spec = model_spec(&settings);
+        // Members answer on their next report (every 5 s): wait for each
+        // online one to report on this model, so the split check below sees
+        // whether it's there instead of the previous model.
+        if let Some(spec) = spec.filter(|_| c.role() == Role::Host && c.strategy() == Strategy::Split) {
+            for _ in 0..16 {
+                let pending = c.members().iter().filter(|m| m.online).any(|m| {
+                    !m.report.as_ref().and_then(|r| r.model_sync.as_ref()).is_some_and(|s| {
+                        s.repo == spec.repo && s.revision == spec.revision && s.state != "checking"
+                    })
+                });
+                if !pending {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    let mut pf = server::preflight(&settings).await;
+    let plan = plan_split(&state, &settings, &mut pf);
     if !pf.can_start {
+        release(&state);
         return Err(pf
             .checks
             .iter()
@@ -311,9 +557,53 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
     }
     state.inner.lock().unwrap().phase = Phase::Starting { detail: "Preparing…".into() };
 
+    // Split: members get their orders in the next report reply (within 5 s)
+    // and start their workers; rank 0 waits for them to connect.
+    let split_start = match (&plan, &state.cluster) {
+        (Some(plan), Some(c)) => {
+            let Some(ip) = net::lan_ip() else {
+                release(&state);
+                return Err("This machine has no LAN address to split the model over.".into());
+            };
+            // Unique per start, so members replace any older worker.
+            let run_id = format!(
+                "{:x}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
+            );
+            let rank = |r: u32, interface: Option<String>| docker::SplitRank {
+                rank: r,
+                nnodes: plan.stages.len() as u32,
+                dist_init_addr: format!("{ip}:{}", split::DIST_PORT),
+                partition: split::partition(&plan.stages),
+                interface,
+            };
+            let orders = plan.stages[1..]
+                .iter()
+                .map(|stage| {
+                    (stage.id.clone(), cluster::WorkerOrder {
+                        run_id: run_id.clone(),
+                        model: plan.model.clone(),
+                        image: settings.image(),
+                        context_len: settings.context_len,
+                        dtype: plan.dtype.clone(),
+                        rank: rank(stage.rank, None),
+                        stage: stage.clone(),
+                    })
+                })
+                .collect();
+            c.set_workers(orders);
+            state.inner.lock().unwrap().split = Some(split::describe(&plan.stages));
+            Some(server::SplitStart { rank: rank(0, split::interface_for(ip)), stage: plan.stages[0].clone() })
+        }
+        _ => {
+            state.inner.lock().unwrap().split = None;
+            None
+        }
+    };
+
     tauri::async_runtime::spawn(async move {
         let progress_app = app.clone();
-        let result = server::start(&settings, move |p| {
+        let result = server::start(&settings, split_start, move |p| {
             let detail = match &p {
                 StartProgress::Checking => "Checking GPU memory…".to_string(),
                 StartProgress::PullingImage { line } => format!("Downloading backend image… {line}"),
@@ -330,9 +620,17 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
             Ok(()) => {
                 inner.phase = Phase::Idle;
                 inner.expect_running = true;
-                inner.want_pairing = true;
+                // Clients pair with the cluster's host only.
+                inner.want_pairing = !st.cluster.as_ref().is_some_and(|c| c.is_member());
             }
-            Err(e) => inner.phase = Phase::Failed { message: err(e) },
+            Err(e) => {
+                inner.phase = Phase::Failed { message: err(e) };
+                inner.split = None;
+                if let Some(c) = &st.cluster {
+                    c.set_serving(false);
+                    c.set_workers(HashMap::new());
+                }
+            }
         }
     });
     Ok(())
@@ -350,8 +648,12 @@ async fn stop_server(state: State<'_, AppState>) -> CmdResult<()> {
         inner.want_pairing = false;
         inner.stop_epoch += 1;
     }
+    if let Some(c) = &state.cluster {
+        c.set_workers(HashMap::new()); // members stop their shares too
+    }
     let result = docker::stop().await;
     let mut inner = state.inner.lock().unwrap();
+    inner.split = None;
     inner.phase = Phase::Idle;
     inner.expect_running = false;
     inner.stop_epoch += 1; // ticks that overlapped the stop are stale too
@@ -361,7 +663,7 @@ async fn stop_server(state: State<'_, AppState>) -> CmdResult<()> {
 #[tauri::command]
 fn dismiss_error(state: State<'_, AppState>) {
     let mut inner = state.inner.lock().unwrap();
-    if matches!(inner.phase, Phase::Failed { .. }) {
+    if matches!(inner.phase, Phase::Failed { .. } | Phase::Paused { .. }) {
         inner.phase = Phase::Idle;
     }
 }
@@ -380,7 +682,11 @@ async fn require_admin() -> CmdResult<AdminClient> {
 }
 
 #[tauri::command]
-async fn new_pairing_code() -> CmdResult<admin::Pairing> {
+async fn new_pairing_code(state: State<'_, AppState>) -> CmdResult<admin::Pairing> {
+    // Clients pair with the cluster's host only.
+    if let Some(Role::Member { host, .. }) = state.cluster.as_ref().map(|c| c.role()) {
+        return Err(format!("This server is a member of {}'s cluster. Pair clients with the host ({}).", host.name, host.url));
+    }
     require_admin().await?.new_pairing().await.map_err(err)
 }
 
@@ -392,6 +698,20 @@ async fn clear_pairing_code() -> CmdResult<admin::Pairing> {
 #[tauri::command]
 async fn list_devices() -> CmdResult<Vec<admin::Device>> {
     require_admin().await?.devices().await.map_err(err)
+}
+
+/// How long client pairings last (`None`: never). Saved, and applied at once
+/// when the backend runs (it also gets it at every start).
+#[tauri::command]
+async fn set_pairing_ttl(state: State<'_, AppState>, days: Option<u32>) -> CmdResult<Settings> {
+    if !openphalanx_core::settings::PAIRING_TTL_CHOICES.contains(&days) {
+        return Err("Choose 1 day, 1 week, 1 month, 1 year or never.".into());
+    }
+    let settings = state.update_settings(|s| s.pairing_ttl_days = days)?;
+    if let Some(admin) = admin_client().await {
+        admin.set_pairing_ttl(days).await.map_err(err)?;
+    }
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -445,10 +765,60 @@ struct ModelsView {
     /// VRAM the backend can count on; measured before start when running.
     available_bytes: Option<u64>,
     available_basis: &'static str,
+    /// Split cluster (host with online members): the VRAM each server adds.
+    /// `available_bytes` is then their sum, and needs include every server's
+    /// runtime memory (`vram::split_across`).
+    pool: Option<Vec<PoolNode>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PoolNode {
+    id: String,
+    name: String,
+    this: bool,
+    gpu: Option<String>,
+    available_bytes: u64,
+    total_bytes: u64,
 }
 
 fn is_app_managed(dir: &Path) -> bool {
     dir.starts_with(paths::models_dir())
+}
+
+/// Split strategy: the model is shared out across the host and its online
+/// members, so it can use their VRAM too (one GPU per machine, the one with
+/// the most free memory, as reported every 5 s). `None` unless this is a
+/// split cluster's host with an online member.
+fn cluster_pool(state: &AppState, gpu: Option<&gpu::GpuInfo>, available: Option<u64>) -> Option<Vec<PoolNode>> {
+    state
+        .cluster
+        .as_ref()
+        .filter(|c| c.role() == Role::Host && c.strategy() == Strategy::Split)
+        .map(|c| {
+            let mut nodes = vec![PoolNode {
+                id: c.id(),
+                name: c.name(),
+                this: true,
+                gpu: gpu.map(|g| g.name.clone()),
+                available_bytes: available.unwrap_or(0),
+                total_bytes: gpu.map_or(0, |g| g.total_bytes),
+            }];
+            for m in c.members().into_iter().filter(|m| m.online) {
+                let best = m.report.as_ref().and_then(|r| r.inventory.gpus.iter().max_by_key(|g| g.free_bytes).cloned());
+                if let Some(g) = best {
+                    nodes.push(PoolNode {
+                        id: m.id,
+                        name: m.name,
+                        this: false,
+                        gpu: Some(g.name),
+                        available_bytes: g.free_bytes,
+                        total_bytes: g.total_bytes,
+                    });
+                }
+            }
+            nodes
+        })
+        .filter(|nodes| nodes.len() > 1)
 }
 
 #[tauri::command]
@@ -466,6 +836,13 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
         None => (None, "no GPU detected"),
     };
 
+    let pool = cluster_pool(&state, gpu.as_ref(), available);
+    let servers = pool.as_ref().map_or(1, |p| p.len() as u32);
+    let (available, basis) = match &pool {
+        Some(p) => (Some(p.iter().map(|n| n.available_bytes).sum()), "pooled across the cluster (split)"),
+        None => (available, basis),
+    };
+
     let mut keys: Vec<String> = catalog::catalog().iter().map(|e| server::catalog_key(&e.id)).collect();
     keys.extend(settings.custom_models.iter().map(|c| c.key.clone()));
     let mut rows: Vec<ModelRow> = keys
@@ -473,10 +850,10 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
         .filter_map(|key| {
             let m = server::resolve(&settings, key)?;
             let entry = key.strip_prefix("catalog:").and_then(catalog::find);
-            let requirement = m.requirement(settings.context_len, gpu.as_ref().and_then(|g| g.compute_capability));
             let cc = gpu.as_ref().and_then(|g| g.compute_capability);
-            let max_fit_context =
-                available.and_then(|free| vram::max_fitting_context(m.max_context, free, |c| m.requirement(c, cc)));
+            let need = |c: u32| vram::split_across(&m.requirement(c, cc), servers);
+            let requirement = need(settings.context_len);
+            let max_fit_context = available.and_then(|free| vram::max_fitting_context(m.max_context, free, need));
             Some(ModelRow {
                 key: key.clone(),
                 name: m.label.clone(),
@@ -526,12 +903,18 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
         gpu,
         available_bytes: available,
         available_basis: basis,
+        pool,
     })
 }
 
 #[tauri::command]
 fn select_model(state: State<'_, AppState>, key: String) -> CmdResult<Settings> {
-    state.update_settings(|s| s.selected_model = Some(key))
+    let settings = state.update_settings(|s| s.selected_model = Some(key))?;
+    // As host: members start fetching it now, so a split start doesn't wait.
+    if let Some(c) = state.cluster.as_ref().filter(|c| c.role() == Role::Host) {
+        let _ = c.set_desired_model(model_spec(&settings));
+    }
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -772,17 +1155,119 @@ async fn remove_custom(state: State<'_, AppState>, key: String) -> CmdResult<Set
     })
 }
 
+// --------------------------------------------------------------------------
+// Cluster: servers on this network, and the cluster this machine is in
+// --------------------------------------------------------------------------
+
+/// Runs the cluster service (API, discovery, reports) for as long as the app runs.
+async fn serve_cluster(app: AppHandle) {
+    let st = app.state::<AppState>();
+    let Some(c) = st.cluster.clone() else { return };
+    if let Err(e) = c.run().await {
+        *st.cluster_error.lock().unwrap() = Some(format!(
+            "The cluster service couldn't start ({e:#}). Is openphalanx-server or another Openphalanx app running on this machine?"
+        ));
+    }
+}
+
+fn require_cluster(state: &AppState) -> CmdResult<Arc<Cluster>> {
+    state.cluster.clone().ok_or_else(|| "The cluster service isn't available.".to_string())
+}
+
+/// Invites a server on this network into this machine's cluster.
+#[tauri::command]
+async fn cluster_invite(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    require_cluster(&state)?.invite(&id).await.map_err(err)
+}
+
+/// Asks a server (on the network, or a member) to host this machine's cluster.
+#[tauri::command]
+async fn cluster_make_host(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    require_cluster(&state)?.request_host(&id).await.map_err(err)
+}
+
+#[tauri::command]
+async fn cluster_approve_invite(state: State<'_, AppState>, host_id: String) -> CmdResult<()> {
+    require_cluster(&state)?.approve_invite(&host_id).await.map_err(err)
+}
+
+/// Becomes host for a request; returns servers that couldn't be invited.
+#[tauri::command]
+async fn cluster_approve_host(state: State<'_, AppState>, from_id: String) -> CmdResult<Vec<String>> {
+    require_cluster(&state)?.approve_host_request(&from_id).await.map_err(err)
+}
+
+#[tauri::command]
+fn cluster_decline(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    let c = require_cluster(&state)?;
+    c.decline_invite(&id);
+    c.decline_host_request(&id);
+    Ok(())
+}
+
+/// Removes a member; its token stops working at once.
+#[tauri::command]
+fn cluster_remove(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    match require_cluster(&state)?.remove_member(&id).map_err(err)? {
+        true => Ok(()),
+        false => Err("That server is no longer in the cluster.".into()),
+    }
+}
+
+#[tauri::command]
+async fn cluster_leave(state: State<'_, AppState>) -> CmdResult<()> {
+    require_cluster(&state)?.leave().await.map_err(err)
+}
+
+#[tauri::command]
+fn cluster_dissolve(state: State<'_, AppState>) -> CmdResult<()> {
+    require_cluster(&state)?.dissolve().map_err(err)
+}
+
+/// How the cluster uses its GPUs ("split" or "replicas"); the host decides.
+#[tauri::command]
+fn cluster_set_strategy(state: State<'_, AppState>, strategy: Strategy) -> CmdResult<()> {
+    require_cluster(&state)?.set_strategy(strategy).map_err(err)
+}
+
+/// As host: members that lack the cluster's model may download it.
+#[tauri::command]
+fn cluster_approve_download(state: State<'_, AppState>) -> CmdResult<()> {
+    require_cluster(&state)?.approve_download().map_err(err)
+}
+
+/// A member's recent log lines (its backend and cluster events), as host.
+#[tauri::command]
+fn cluster_member_logs(state: State<'_, AppState>, id: String) -> CmdResult<Vec<String>> {
+    Ok(require_cluster(&state)?.member_logs(&id))
+}
+
+/// Renames this server (as other servers and the app show it).
+#[tauri::command]
+fn cluster_rename(state: State<'_, AppState>, name: String) -> CmdResult<()> {
+    require_cluster(&state)?.set_name(&name).map_err(err)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState {
-            settings: Mutex::new(Settings::load()),
-            inner: Mutex::new(Inner::default()),
+        .manage({
+            let (cluster, cluster_error) = match Cluster::open(&paths::cluster_dir()) {
+                Ok(c) => (Some(c), None),
+                Err(e) => (None, Some(format!("cluster state unavailable: {e:#}"))),
+            };
+            AppState {
+                settings: Mutex::new(Settings::load()),
+                inner: Mutex::new(Inner::default()),
+                cluster,
+                cluster_error: Mutex::new(cluster_error),
+            }
         })
         .setup(|app| {
             tauri::async_runtime::spawn(monitor(app.handle().clone()));
+            tauri::async_runtime::spawn(serve_cluster(app.handle().clone()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -795,6 +1280,7 @@ pub fn run() {
             new_pairing_code,
             clear_pairing_code,
             list_devices,
+            set_pairing_ttl,
             revoke_device,
             get_models,
             select_model,
@@ -808,7 +1294,28 @@ pub fn run() {
             inspect_custom,
             add_custom,
             remove_custom,
+            cluster_invite,
+            cluster_make_host,
+            cluster_approve_invite,
+            cluster_approve_host,
+            cluster_decline,
+            cluster_remove,
+            cluster_leave,
+            cluster_dissolve,
+            cluster_rename,
+            cluster_set_strategy,
+            cluster_approve_download,
+            cluster_member_logs,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Openphalanx");
+        .build(tauri::generate_context!())
+        .expect("error while building Openphalanx")
+        .run(|app, event| {
+            // Tell the host this member is going away, so a split model pauses
+            // at once instead of after a timeout.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(c) = app.state::<AppState>().cluster.clone() {
+                    tauri::async_runtime::block_on(c.goodbye());
+                }
+            }
+        });
 }

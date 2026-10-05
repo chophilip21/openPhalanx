@@ -4,6 +4,7 @@
   import Icon from "../components/Icon.svelte";
   import PairingCard from "../components/PairingCard.svelte";
   import PowerButton from "../components/PowerButton.svelte";
+  import RunningModel from "../components/RunningModel.svelte";
   import VramBar from "../components/VramBar.svelte";
   import { api, errorText, type Preflight } from "../lib/api";
   import { gib, tokens } from "../lib/format";
@@ -20,15 +21,44 @@
   const st = $derived(snap?.server.state ?? "stopped");
   const admin = $derived(snap?.admin ?? null);
   const gpu = $derived(snap?.gpus.find((g) => g.index === snap?.settings.gpu_index) ?? null);
-  const idle = $derived(st === "stopped" || st === "error");
+  const idle = $derived(st === "stopped" || st === "error" || st === "paused");
+  const cluster = $derived(snap?.cluster ?? null);
+  // A member whose host is serving: only the host starts the cluster's server.
+  const locked = $derived(idle && !!cluster?.locked_by_host);
+  // As host: members that report the cluster's model missing, or fetching it.
+  const wanted = $derived(cluster?.role.role === "host" ? cluster.desired_model : null);
+  const copies = $derived(
+    (cluster?.members ?? [])
+      .filter((m) => m.online)
+      .map((m) => ({ name: m.name, sync: m.report?.model_sync ?? null }))
+      .filter((m) => wanted && m.sync?.repo === wanted.repo && m.sync?.revision === wanted.revision),
+  );
+  const missing = $derived(copies.filter((m) => m.sync?.state === "missing"));
+  const fetching = $derived(copies.filter((m) => m.sync?.state === "downloading"));
+  let approving = $state(false);
+  async function approveDownload() {
+    approving = true;
+    actionError = "";
+    try {
+      await api.clusterApproveDownload();
+    } catch (e) {
+      actionError = errorText(e);
+    } finally {
+      approving = false;
+    }
+  }
+  const pct = (s: { done_bytes: number; total_bytes: number }) =>
+    s.total_bytes ? Math.floor((100 * s.done_bytes) / s.total_bytes) : 0;
+  const hostName = $derived(cluster?.role.role === "member" ? cluster.role.host.name : "");
 
   const headline = $derived(
-    {
+    locked ? `${hostName} is running the cluster` : {
       stopped: "Server is off",
       starting: "Starting…",
       running: "Server is running",
       stopping: "Stopping…",
       error: "Server stopped with an error",
+      paused: "Serving paused",
       external: "Running outside the app",
     }[st],
   );
@@ -68,7 +98,7 @@
     acting = true;
     try {
       if (idle) {
-        if (st === "error") await api.dismissError();
+        if (st === "error" || st === "paused") await api.dismissError();
         await api.start();
       } else {
         await api.stop();
@@ -81,7 +111,7 @@
   }
 
   const canToggle = $derived(
-    !acting && (idle ? !!preflight?.can_start : st === "running" || st === "starting" || st === "external"),
+    !acting && (idle ? !locked && !!preflight?.can_start : st === "running" || st === "starting" || st === "external"),
   );
   const blocking = $derived(preflight?.checks.find((c) => c.status === "fail") ?? null);
 </script>
@@ -110,13 +140,45 @@
         </div>
       {/if}
 
+      {#if idle && wanted && missing.length}
+        <div class="hint download-ask" role="status">
+          <Icon name="download" size={16} />
+          <span>
+            <strong>{missing.map((m) => m.name).join(", ")}</strong>
+            {missing.length === 1 ? "doesn't" : "don't"} have <strong>{wanted.label}</strong> ({gib(wanted.weight_bytes)}).
+            Download it there, so the model can be split across the cluster?
+          </span>
+          <button class="primary" disabled={approving} onclick={approveDownload}>
+            <Icon name="download" size={14} /> Download on {missing.length === 1 ? missing[0].name : "them"}
+          </button>
+        </div>
+      {:else if idle && fetching.length}
+        <div class="hint info" role="status">
+          <Icon name="download" size={16} />
+          <span>
+            {#each fetching as m, i}{i ? " · " : ""}<strong>{m.name}</strong> is downloading {wanted?.label}: {pct(m.sync!)}%{/each}.
+            Start when it's done.
+          </span>
+        </div>
+      {/if}
+
       <div class="power-wrap" class:beckon={showHint && canToggle}>
-        <PowerButton state={st} disabled={!canToggle} onclick={toggle} />
+        <PowerButton state={st} {locked} disabled={!canToggle} onclick={toggle} />
       </div>
 
       <h2 class="headline">{headline}</h2>
+      {#if snap?.server.model && !idle}
+        <div class="running-model"><RunningModel model={snap.server.model} loading={st === "starting"} /></div>
+      {/if}
       <p class="detail">
-        {#if snap?.server.detail}
+        {#if locked}
+          <span class="locked-note">
+            <Icon name="lock" size={14} /> {hostName} started the server and controls this cluster, so this machine can't
+            start one too. To run on your own, leave the cluster from the dashboard below.
+          </span>
+        {:else if st === "paused" && snap?.server.detail}
+          <span class="paused-note"><Icon name="alert" size={14} /> {snap.server.detail}</span>
+        {:else if snap?.server.detail}
           {snap.server.detail}
         {:else if idle && blocking}
           <span class="blocked"><Icon name="alert" size={14} /> {blocking.detail}</span>
@@ -143,7 +205,12 @@
         <div class="error-banner warn"><Icon name="alert" size={16} /><span>{w}</span></div>
       {/each}
 
-      {#if admin && (st === "running" || st === "starting")}
+      {#if snap?.cluster?.role.role === "member"}
+        <p class="member-note">
+          This server is a member of <strong>{snap.cluster.role.host.name}</strong>'s cluster. Clients pair with the host
+          ({snap.cluster.role.host.url.replace("https://", "").replace(":9092", "")}), not here.
+        </p>
+      {:else if admin && (st === "running" || st === "starting")}
         <PairingCard pairing={admin.pairing} endpoint={snap?.endpoint ?? null} />
       {/if}
     </section>
@@ -205,7 +272,12 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
   .dot.running { background: var(--on); box-shadow: 0 0 10px var(--on); }
   .dot.starting, .dot.stopping, .dot.external { background: var(--busy); }
-  .dot.error { background: var(--bad); }
+  .dot.error, .dot.paused { background: var(--bad); }
+  .download-ask { border-color: var(--on); background: var(--on-soft); }
+  .download-ask .primary { white-space: nowrap; display: inline-flex; gap: 6px; align-items: center; }
+  .running-model { display: flex; justify-content: center; margin: 2px 0 6px; }
+  .locked-note { color: var(--violet); display: inline-flex; gap: 6px; align-items: baseline; max-width: 560px; }
+  .paused-note { color: var(--bad); display: inline-flex; gap: 6px; align-items: baseline; max-width: 560px; font-weight: 500; }
   .headline { margin: 4px 0 0; font-size: 26px; font-weight: 650; }
   .detail { margin: 0; color: var(--muted); max-width: 460px; min-height: 20px; }
   .blocked { color: var(--bad-text); display: inline-flex; gap: 6px; align-items: flex-start; text-align: left; }
@@ -267,4 +339,5 @@
   .hint.info::after { bottom: auto; top: -7px; transform: translateX(-50%) rotate(225deg); border-color: var(--busy); background-image: none; }
   .hint.info :global(svg) { color: var(--busy); flex-shrink: 0; }
   .logs-btn { padding: 5px 12px; font-size: 12.5px; white-space: nowrap; }
+  .member-note { max-width: 560px; margin: 0; padding: 12px 16px; border-radius: 12px; background: var(--surface); border: 1px solid var(--border); font-size: 13.5px; }
 </style>

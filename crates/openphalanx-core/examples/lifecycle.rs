@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
     for c in &pf.checks {
         println!("[{:?}] {}: {}", c.status, c.label, c.detail);
     }
-    server::start(&settings, |p| println!("progress: {p:?}")).await?;
+    server::start(&settings, None, |p| println!("progress: {p:?}")).await?;
 
     let token = docker::inspect().await?.and_then(|c| c.admin_token).expect("admin token");
     let admin = AdminClient::new(token);

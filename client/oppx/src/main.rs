@@ -409,11 +409,11 @@ async fn status(cfg: &Config, name: Option<&str>) -> Result<()> {
     let sp = ui::spinner(format!("Checking {name}"));
     let health = api::health(&client, &s.url).await;
     let me = match &health {
-        Ok(_) => api::whoami(&client, &s.url, &s.token).await,
-        Err(_) => Ok(None),
+        Ok(_) => api::whoami(&client, &s.url, &s.token).await.map(Some),
+        Err(_) => Ok(None), // unreachable: reported below before `me` is used
     };
     let (ctx, info) = match (&health, &me) {
-        (Ok(h), Ok(Some(_))) if h.sglang == "ready" => match api::info(&client, &s.url, &s.token).await.ok().flatten() {
+        (Ok(h), Ok(Some(Ok(_)))) if h.sglang == "ready" => match api::info(&client, &s.url, &s.token).await.ok().flatten() {
             Some(i) => (Some(i.context_length), Some(i)),
             None => (api::context_len(&client, &s.url, &s.token).await.ok().flatten(), None),
         },
@@ -435,15 +435,30 @@ async fn status(cfg: &Config, name: Option<&str>) -> Result<()> {
         ui::ok("server", format!("{name}  {}", ui::dim(&s.url))),
         ui::ok("certificate", format!("pinned {}", tls::short(&s.fingerprint))),
     ];
-    let me = match me? {
-        Some(me) => me,
-        None => {
-            rows.push(ui::bad("device", "token rejected (revoked in the app)"));
+    let me = match me?.expect("health succeeded, so whoami ran") {
+        Ok(me) => me,
+        Err(why) => {
+            rows.push(ui::bad("device", match why {
+                api::Rejected::Revoked => "token rejected (revoked in the app)",
+                api::Rejected::Expired => "pairing expired (the server app sets how long pairings last)",
+            }));
             ui::panel("OpenPhalanx", &rows);
             bail!("pair again with `oppx pair {} <code> --as {name} --force`", s.url);
         }
     };
     rows.push(ui::ok("device", format!("{} {}", me.device_name, ui::dim(format!("({})", me.device_id)))));
+    rows.push(ui::ok("pairing", match me.expires_at {
+        None => "never expires".to_string(),
+        Some(t) => {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+            let days = ((t - now) / 86400.0).max(0.0);
+            if days >= 1.0 {
+                format!("expires in {} day{}", days.floor(), if days.floor() == 1.0 { "" } else { "s" })
+            } else {
+                format!("expires in {} h", ((t - now) / 3600.0).max(0.0).ceil())
+            }
+        }
+    }));
     rows.push(if health.sglang == "ready" {
         let ctx = ctx.map(|c| format!(" · {}k context", c / 1024)).unwrap_or_default();
         let id = info.map(|i| format!(" {}", ui::dim(format!("({})", i.model_id)))).unwrap_or_default();
@@ -510,8 +525,8 @@ async fn preflight_inner(name: &str, s: &Server) -> Result<ModelInfo> {
         ),
         Err(e) => return Err(e.context(format!("cannot reach {} (\"{name}\")", s.url))),
     };
-    if api::whoami(&client, &s.url, &s.token).await?.is_none() {
-        bail!("this device was revoked on \"{name}\". Pair again: oppx pair {} <code> --as {name} --force", s.url);
+    if let Err(why) = api::whoami(&client, &s.url, &s.token).await? {
+        bail!("{} on \"{name}\". Pair again: oppx pair {} <code> --as {name} --force", why.what(), s.url);
     }
     if health.sglang != "ready" {
         bail!("the model on \"{name}\" is still loading; try again in a minute (`oppx status` shows progress)");

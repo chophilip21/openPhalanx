@@ -6,6 +6,29 @@
   let follow = $state(true);
   let box: HTMLDivElement | undefined = $state();
 
+  // Which machine's logs: this one (live stream), or a cluster member (its
+  // backend and cluster events, forwarded with its reports every ~5 s).
+  const LOCAL = "local";
+  let source = $state(LOCAL);
+  let memberLines = $state<string[]>([]);
+  const cluster = $derived(app.snapshot?.cluster ?? null);
+  const members = $derived(cluster?.role.role === "host" ? cluster.members : []);
+  const thisName = $derived(cluster ? `${cluster.name} (this machine)` : "This machine");
+  // A member that left falls back to this machine.
+  $effect(() => {
+    if (source !== LOCAL && !members.some((m) => m.id === source)) source = LOCAL;
+  });
+  $effect(() => {
+    if (source === LOCAL) return;
+    const id = source;
+    const load = () => api.clusterMemberLogs(id).then((l) => { if (source === id) memberLines = l; }).catch(() => {});
+    memberLines = [];
+    load();
+    const t = setInterval(load, 2000);
+    return () => clearInterval(t);
+  });
+  const lines = $derived(source === LOCAL ? app.logs : memberLines);
+
   // Seed with recent history the first time the page opens.
   $effect(() => {
     if (app.logs.length === 0) {
@@ -16,7 +39,7 @@
   });
 
   const shown = $derived(
-    filter ? app.logs.filter((l) => l.toLowerCase().includes(filter.toLowerCase())) : app.logs,
+    filter ? lines.filter((l) => l.toLowerCase().includes(filter.toLowerCase())) : lines,
   );
 
   $effect(() => {
@@ -32,12 +55,26 @@
   <div class="head">
     <div>
       <h1>Logs</h1>
-      <p class="sub">SGLang and agent output from the backend container.</p>
+      <p class="sub">
+        {#if source === LOCAL}
+          SGLang and gateway output from this machine's backend container.
+        {:else}
+          Backend output and cluster events from this member, forwarded with its reports (about every 5 s).
+        {/if}
+      </p>
     </div>
     <div class="controls">
+      {#if members.length}
+        <select bind:value={source} aria-label="Machine">
+          <option value={LOCAL}>{thisName}</option>
+          {#each members as m (m.id)}
+            <option value={m.id}>{m.name}{m.online ? "" : " (offline)"}</option>
+          {/each}
+        </select>
+      {/if}
       <input placeholder="Filter (e.g. cache hit)" bind:value={filter} />
       <label><input type="checkbox" bind:checked={follow} /> Follow</label>
-      <button class="ghost" onclick={() => (app.logs.length = 0)}>Clear</button>
+      {#if source === LOCAL}<button class="ghost" onclick={() => (app.logs.length = 0)}>Clear</button>{/if}
     </div>
   </div>
   <div class="box mono" bind:this={box}>

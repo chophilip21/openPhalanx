@@ -51,10 +51,13 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 SGLANG_ROOT = f"http://127.0.0.1:{os.environ.get('SGLANG_PORT', '8080')}"
-SGLANG_BASE = f"{SGLANG_ROOT}/v1"
 MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", "openphalanx-coder")
 AGENT_PORT = int(os.environ.get("AGENT_PORT", "9090"))
 ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "9091"))
+# Inside the container's own network the port is published on the host's
+# loopback only. On the host's network (a model split across servers) the
+# gateway binds loopback itself.
+ADMIN_HOST = os.environ.get("ADMIN_HOST", "0.0.0.0")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 STATE_DIR = Path(os.environ.get("STATE_DIR", "/state"))
 # Largest accepted request body. A 32k-token prompt is ~130 KB of text.
@@ -105,6 +108,20 @@ TLS_DIR = STATE_DIR / "tls"
 CERT_PATH = TLS_DIR / "cert.pem"
 KEY_PATH = TLS_DIR / "key.pem"
 DEVICES_PATH = STATE_DIR / "devices.json"
+POLICY_PATH = STATE_DIR / "pairing_policy.json"
+
+
+def _ttl_days(raw: str | None) -> int | None:
+    """``DEVICE_TTL_DAYS``: whole days a pairing lasts; empty, 0 or "never"
+    for no expiry. Default one week."""
+    if raw is None:
+        return 7
+    raw = raw.strip().lower()
+    if raw in ("", "0", "never", "none"):
+        return None
+    return max(1, int(raw))
+# Usage counters are written at most this often (see DeviceStore).
+DEVICE_FLUSH_S = 5.0
 
 
 # --------------------------------------------------------------------------
@@ -125,16 +142,41 @@ def _hash_token(token: str) -> str:
 
 
 class DeviceStore:
-    """Paired devices, persisted with hashed tokens only."""
+    """Paired devices, persisted with hashed tokens only. Pairing and
+    revocation are saved at once; usage counters change on every request, so
+    they are only marked dirty and saved by `flush_devices` every few seconds."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, policy_path: Path):
         self.path = path
+        self.policy_path = policy_path
         self.devices: dict[str, dict] = {}
+        self.dirty = False
         if path.exists():
             self.devices = {d["id"]: d for d in json.loads(path.read_text())}
+        # Pairings expire `ttl_days` after they were made. Devices paired
+        # before expiry existed count from when it was introduced
+        # (`since`), so an upgrade doesn't cut anyone off at once.
+        policy = json.loads(policy_path.read_text()) if policy_path.exists() else {}
+        self.since = float(policy.get("since") or time.time())
+        self.ttl_days = _ttl_days(os.environ.get("DEVICE_TTL_DAYS"))
+        if not policy_path.exists():
+            _write_private_json(policy_path, {"since": self.since})
+
+    def set_ttl(self, days: int | None) -> None:
+        self.ttl_days = days
+
+    def expires_at(self, device: dict) -> float | None:
+        if self.ttl_days is None:
+            return None
+        return max(device["created_at"], self.since) + self.ttl_days * 86400
+
+    def expired(self, device: dict) -> bool:
+        exp = self.expires_at(device)
+        return exp is not None and time.time() >= exp
 
     def save(self) -> None:
         _write_private_json(self.path, list(self.devices.values()))
+        self.dirty = False
 
     def add(self, name: str) -> tuple[dict, str]:
         token = secrets.token_urlsafe(32)
@@ -163,16 +205,16 @@ class DeviceStore:
     def touch(self, device: dict) -> None:
         device["last_seen"] = time.time()
         device["requests"] += 1
-        self.save()
+        self.dirty = True
 
     def add_search(self, device: dict) -> None:
         device["web_searches"] = device.get("web_searches", 0) + 1
-        self.save()
+        self.dirty = True
 
     def add_usage(self, device: dict, prompt_tokens: int, completion_tokens: int) -> None:
         device["prompt_tokens"] = device.get("prompt_tokens", 0) + prompt_tokens
         device["completion_tokens"] = device.get("completion_tokens", 0) + completion_tokens
-        self.save()
+        self.dirty = True
 
     def revoke(self, device_id: str) -> bool:
         if self.devices.pop(device_id, None) is None:
@@ -182,7 +224,7 @@ class DeviceStore:
 
     def public(self) -> list[dict]:
         return [
-            {k: v for k, v in d.items() if k != "token_sha256"}
+            {**{k: v for k, v in d.items() if k != "token_sha256"}, "expires_at": self.expires_at(d)}
             for d in self.devices.values()
         ]
 
@@ -248,7 +290,7 @@ class Metrics:
         return dict(vars(self))
 
 
-devices = DeviceStore(DEVICES_PATH)
+devices = DeviceStore(DEVICES_PATH, POLICY_PATH)
 pairing = Pairing()
 metrics = Metrics()
 
@@ -288,12 +330,30 @@ def tls_fingerprint() -> str:
 
 async def sglang_ready() -> bool:
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{SGLANG_BASE}/models")
-            r.raise_for_status()
+        r = await upstream().get("/v1/models", timeout=5)
+        r.raise_for_status()
         return True
     except httpx.HTTPError:
         return False
+
+
+_kv_tokens: int | None = None
+
+
+async def effective_context() -> int:
+    """The context clients can actually use: the configured window, or less
+    when SGLang's KV cache holds fewer tokens (a request needs input plus
+    output in it; SGLang refuses input over ``min(context, kv) - 6``). Read
+    once SGLang is up; it doesn't change while it runs."""
+    global _kv_tokens
+    if _kv_tokens is None:
+        try:
+            r = await upstream().get("/get_server_info", timeout=5)
+            r.raise_for_status()
+            _kv_tokens = int(r.json().get("max_total_num_tokens") or 0) or None
+        except (httpx.HTTPError, ValueError):
+            return CONTEXT_LENGTH
+    return min(CONTEXT_LENGTH, _kv_tokens - 6) if _kv_tokens else CONTEXT_LENGTH
 
 
 _METRIC_RE = re.compile(r"^(sglang:[a-z_]+)(?:\{[^}]*\})?\s+([0-9.eE+-]+)$")
@@ -302,9 +362,8 @@ _METRIC_RE = re.compile(r"^(sglang:[a-z_]+)(?:\{[^}]*\})?\s+([0-9.eE+-]+)$")
 async def sglang_metrics() -> dict:
     """Sums each SGLang Prometheus series across labels."""
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{SGLANG_ROOT}/metrics")
-            r.raise_for_status()
+        r = await upstream().get("/metrics", timeout=5)
+        r.raise_for_status()
     except httpx.HTTPError:
         return {}
     sums: dict[str, float] = {}
@@ -338,6 +397,11 @@ def require_device(authorization: str = Header(default="")) -> dict:
     device = devices.authenticate(token) if scheme.lower() == "bearer" else None
     if device is None:
         raise HTTPException(status_code=401, detail="missing or invalid device token")
+    if devices.expired(device):
+        raise HTTPException(
+            status_code=401,
+            detail="this device's pairing expired; pair again with a new code from the server app",
+        )
     return device
 
 
@@ -372,7 +436,12 @@ async def pair(req: PairRequest) -> PairResponse:
 async def whoami(device: dict = Depends(require_device)) -> dict:
     """Lets a client confirm its token is still valid (e.g. `oppx status`)."""
     devices.touch(device)
-    return {"device_id": device["id"], "device_name": device["name"], "model": MODEL_NAME}
+    return {
+        "device_id": device["id"],
+        "device_name": device["name"],
+        "model": MODEL_NAME,
+        "expires_at": devices.expires_at(device),
+    }
 
 
 @app.get("/v1/info")
@@ -382,7 +451,7 @@ async def info(device: dict = Depends(require_device)) -> dict:
     return {
         "served_name": MODEL_NAME,
         "model_id": MODEL_ID,
-        "context_length": CONTEXT_LENGTH,
+        "context_length": await effective_context(),
         "edit_format": EDIT_FORMAT,
         "reasoning": REASONING,
         "web_search": bool(SEARXNG_URL),
@@ -834,20 +903,21 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
             content={"error": {"message": "The server is busy with other requests; try again shortly.", "type": "server_busy"}},
             headers={"retry-after": "10"},
         )
-    devices.touch(device)
     metrics.requests_total += 1
     metrics.requests_active += 1
     metrics.last_request_at = time.time()
     try:
+        # Inside the try: any error here must give the slots back.
+        devices.touch(device)
         if auto_search:
             resp = await _send_with_auto_search(body, device)
         else:
             resp = await _send(body)
-    except (httpx.HTTPError, asyncio.CancelledError) as e:
+    except BaseException as e:
         metrics.requests_active -= 1
         metrics.requests_failed += 1
         _release(device["id"])
-        if isinstance(e, asyncio.CancelledError):
+        if not isinstance(e, httpx.HTTPError):
             raise
         return openai_error(503, "The model is still loading; try again shortly.", "service_unavailable")
     if resp.status_code >= 400:
@@ -964,12 +1034,41 @@ async def admin_devices() -> list[dict]:
     return devices.public()
 
 
+class PairingPolicy(BaseModel):
+    # Whole days a pairing lasts; None: never expires.
+    ttl_days: int | None = Field(default=7, ge=1, le=36500)
+
+
+@admin.get("/admin/pairing-policy", dependencies=[Depends(require_admin)])
+async def admin_get_policy() -> dict:
+    return {"ttl_days": devices.ttl_days}
+
+
+@admin.put("/admin/pairing-policy", dependencies=[Depends(require_admin)])
+async def admin_set_policy(policy: PairingPolicy) -> dict:
+    """Changes how long pairings last, for every device (the app also passes
+    it as DEVICE_TTL_DAYS at start)."""
+    devices.set_ttl(policy.ttl_days)
+    return {"ttl_days": devices.ttl_days}
+
+
 @admin.delete("/admin/devices/{device_id}", dependencies=[Depends(require_admin)])
 async def admin_revoke(device_id: str) -> dict:
     """Revokes a device; its token stops working immediately."""
     if not devices.revoke(device_id):
         raise HTTPException(status_code=404, detail="unknown device")
     return {"revoked": device_id}
+
+
+async def flush_devices() -> None:
+    """Saves the usage counters every few seconds when they changed."""
+    while True:
+        await asyncio.sleep(DEVICE_FLUSH_S)
+        if devices.dirty:
+            try:
+                devices.save()
+            except OSError as e:  # e.g. a full disk: keep serving, retry next round
+                print(f"cannot save {DEVICES_PATH}: {e}", flush=True)
 
 
 async def main() -> None:
@@ -984,9 +1083,15 @@ async def main() -> None:
         )
     )
     admin_server = uvicorn.Server(
-        uvicorn.Config(admin, host="0.0.0.0", port=ADMIN_PORT, log_level="warning")
+        uvicorn.Config(admin, host=ADMIN_HOST, port=ADMIN_PORT, log_level="warning")
     )
-    await asyncio.gather(public_server.serve(), admin_server.serve())
+    flusher = asyncio.create_task(flush_devices())
+    try:
+        await asyncio.gather(public_server.serve(), admin_server.serve())
+    finally:
+        flusher.cancel()
+        if devices.dirty:
+            devices.save()
 
 
 if __name__ == "__main__":

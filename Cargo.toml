@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/openphalanx-core", "app/src-tauri", "client/oppx"]
+members = ["crates/openphalanx-core", "crates/openphalanx-server", "crates/pinned-tls", "app/src-tauri", "client/oppx"]
 
 [workspace.package]
 version = "0.3.0"

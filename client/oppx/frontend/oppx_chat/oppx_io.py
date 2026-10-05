@@ -23,6 +23,17 @@ from .render import BulletStream, hide_reasoning
 from .context import CONTEXT_MGR
 
 
+# Aider's questions before it creates or edits a file the model named (Coder.allowed_to_edit).
+EDIT_QUESTIONS = ("Create new file?", "Allow edits to file that has not been added to the chat?")
+
+
+def editable_path(path: str) -> bool:
+    """Inside the repo and outside .git/ (a hook there runs on the next git command)."""
+    root = Path(SESSION.coder.root if SESSION.coder is not None else ".").resolve()
+    target = (root / path).resolve()
+    return target.is_relative_to(root) and not target.is_relative_to(root / ".git")
+
+
 # Aider status lines that mean nothing to an OpenPhalanx user.
 SUPPRESS = [
     re.compile(p)
@@ -70,6 +81,8 @@ SUPPRESS = [
 # What the user should do when the server refuses a request. Keys are what
 # server_problem() returns; Aider's own follow-up hints map to "" (hidden).
 SERVER_PROBLEMS = {
+    "expired": f"This device's pairing with {SERVER} expired (the server app sets how long pairings last). "
+    "Pair again with a new code from the app: oppx pair <server> <code> --force",
     "revoked": f"This device is no longer paired with {SERVER}: it was revoked on the server. "
     "Pair again with a new code from the app: oppx pair <server> <code> --force",
     "loading": f"{SERVER} is starting up or busy, so it can't answer yet. "
@@ -96,6 +109,8 @@ def server_problem(message: str) -> str | None:
     if "cannot reach the OpenPhalanx server" in text or "Connection refused" in text or "ConnectError" in text:
         return "unreachable"
     code = re.search(r"Error code: (\d{3})", text)
+    if "pairing expired" in text:
+        return "expired"
     if "missing or invalid device token" in text or (code and code.group(1) == "401"):
         return "revoked"
     if (code and code.group(1) in ("502", "503")) or "ServiceUnavailableError" in text or "model is still loading" in text:
@@ -190,7 +205,7 @@ class OppxIO(InputOutput):
             return False
         if kind and not UI.server_error:
             UI.server_error = kind
-            step(SERVER_PROBLEMS[kind], RED if kind == "revoked" else YELLOW)
+            step(SERVER_PROBLEMS[kind], RED if kind in ("revoked", "expired") else YELLOW)
         return True
 
     def rule(self):
@@ -229,6 +244,11 @@ class OppxIO(InputOutput):
     def confirm_ask(self, question, default="y", subject=None, explicit_yes_required=False, group=None, allow_never=False):
         self.num_user_asks += 1
         q = question.strip()
+        # Edits are accepted without asking, so they must stay in the project:
+        # Aider itself joins the model's path onto the repo root unchecked.
+        if q in EDIT_QUESTIONS and subject and not editable_path(str(subject)):
+            step(f"Refused an edit outside this project: {subject}", RED)
+            return False
         # Things only a person should decide: running commands the model
         # proposed, and going over the context window.
         if explicit_yes_required or "proceed anyway" in q.lower():

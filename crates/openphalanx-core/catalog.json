@@ -217,7 +217,8 @@
       "linear_layers": 48
     },
     "quantized_by": "cyankiwi",
-    "reasoning_parser": "qwen3"
+    "reasoning_parser": "qwen3",
+    "dtype": "bfloat16"
   },
   {
     "id": "Qwen/Qwen3.6-35B-A3B",
@@ -275,7 +276,8 @@
       "linear_layers": 30
     },
     "quantized_by": "QuantTrio",
-    "reasoning_parser": "qwen3"
+    "reasoning_parser": "qwen3",
+    "dtype": "bfloat16"
   },
   {
     "id": "google/gemma-4-E4B-it",

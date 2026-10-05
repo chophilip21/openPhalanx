@@ -23,6 +23,13 @@ pub const SEARXNG_IMAGE: &str =
     "searxng/searxng@sha256:c642712fcedcdaa78fac44f71eada86aff510745826ba1bd1a368211fea2ce7f";
 pub const SEARXNG_SETTINGS: &str = include_str!("../searxng/settings.yml");
 const SEARXNG_INTERNAL_URL: &str = "http://openphalanx-searxng:8080";
+/// SearXNG on the host's loopback, for a backend on the host's network (split
+/// model); still unreachable from other machines.
+pub const SEARXNG_LOOPBACK_PORT: u16 = 9098;
+/// Prefill chunk for every rank of a split model (see `SplitRank::args`).
+pub const SPLIT_PREFILL_CHUNK: u32 = 2048;
+/// A member's share of a split model (a headless SGLang rank, no gateway).
+pub const WORKER_CONTAINER: &str = "openphalanx-worker";
 const MANAGED_LABEL: &str = "io.openphalanx.managed";
 const MODEL_LABEL: &str = "io.openphalanx.model";
 
@@ -136,6 +143,8 @@ pub struct ContainerInfo {
     pub image: String,
     pub managed: bool,
     pub model_key: Option<String>,
+    /// The context window it was started with (`CONTEXT_LENGTH`).
+    pub context_len: Option<u32>,
     /// Recovered from the container's environment, so the GUI can reattach
     /// after a restart without storing the secret anywhere else.
     #[serde(skip)]
@@ -151,16 +160,20 @@ pub async fn inspect() -> Result<Option<ContainerInfo>> {
     let c = &v[0];
     let state: ContainerState = serde_json::from_value(c["State"].clone())?;
     let labels = &c["Config"]["Labels"];
-    let admin_token = c["Config"]["Env"].as_array().and_then(|env| {
-        env.iter()
-            .filter_map(|e| e.as_str())
-            .find_map(|e| e.strip_prefix("ADMIN_TOKEN=").map(str::to_string))
-    });
+    let env_var = |name: &str| {
+        let prefix = format!("{name}=");
+        c["Config"]["Env"].as_array().and_then(|env| {
+            env.iter().filter_map(|e| e.as_str()).find_map(|e| e.strip_prefix(prefix.as_str()).map(str::to_string))
+        })
+    };
+    let admin_token = env_var("ADMIN_TOKEN");
+    let context_len = env_var("CONTEXT_LENGTH").and_then(|v| v.parse().ok());
     Ok(Some(ContainerInfo {
         state,
         image: c["Config"]["Image"].as_str().unwrap_or_default().to_string(),
         managed: labels[MANAGED_LABEL].as_str() == Some("true"),
         model_key: labels[MODEL_LABEL].as_str().map(str::to_string),
+        context_len,
         admin_token,
     }))
 }
@@ -182,6 +195,55 @@ pub struct RunSpec {
     pub model_id: String,
     pub edit_format: String,
     pub reasoning_parser: Option<String>,
+    /// SGLang `--dtype` override.
+    pub dtype: Option<String>,
+    /// Days a client pairing lasts (`None`: never).
+    pub pairing_ttl_days: Option<u32>,
+    /// Rank 0 of a model split across servers.
+    pub split: Option<SplitRank>,
+}
+
+/// One rank of a pipeline-parallel SGLang run across machines. These
+/// containers share the host's network: NCCL and torch connect back to the
+/// address each rank announces, which a Docker bridge would hide.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SplitRank {
+    pub rank: u32,
+    pub nnodes: u32,
+    /// `host:port` of rank 0's rendezvous.
+    pub dist_init_addr: String,
+    /// `SGLANG_PP_LAYER_PARTITION`, e.g. "40,24".
+    pub partition: String,
+    /// Interface for NCCL and gloo (the LAN one), if known.
+    pub interface: Option<String>,
+}
+
+impl SplitRank {
+    fn env(&self) -> Vec<(&'static str, String)> {
+        let mut env = vec![
+            ("SGLANG_PP_LAYER_PARTITION", self.partition.clone()),
+            // Plain TCP between the machines; no InfiniBand on a LAN.
+            ("NCCL_IB_DISABLE", "1".into()),
+        ];
+        if let Some(i) = &self.interface {
+            env.push(("NCCL_SOCKET_IFNAME", i.clone()));
+            env.push(("GLOO_SOCKET_IFNAME", i.clone()));
+        }
+        env
+    }
+
+    fn args(&self) -> String {
+        // Every rank must chunk prefills the same way: SGLang otherwise picks
+        // a size per GPU (4096 on a 24 GB card, 2048 on 16 GB), and a rank
+        // handed a bigger chunk than its own fails to reshape it. 2048 is
+        // the smaller default, so activations fit the smaller cards.
+        format!(
+            "--pp-size {n} --nnodes {n} --node-rank {r} --dist-init-addr {a} --chunked-prefill-size {SPLIT_PREFILL_CHUNK}",
+            n = self.nnodes,
+            r = self.rank,
+            a = self.dist_init_addr
+        )
+    }
 }
 
 pub fn run_args(spec: &RunSpec) -> Vec<String> {
@@ -193,20 +255,30 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
         "--gpus".into(),
         format!("\"device={}\"", spec.gpu_index),
         "--ipc=host".into(),
-        "--network".into(),
-        NETWORK.into(),
-        "-p".into(),
-        format!("{0}:{0}", spec.agent_port),
-        // Admin API is reachable from this machine only.
-        "-p".into(),
-        format!("127.0.0.1:{ADMIN_PORT}:{ADMIN_PORT}"),
+    ];
+    if spec.split.is_some() {
+        // The gateway then binds the agent port itself, and the admin API
+        // and SGLang only on loopback (ADMIN_HOST, --host 127.0.0.1).
+        a.extend(["--network".into(), "host".into()]);
+    } else {
+        a.extend([
+            "--network".into(),
+            NETWORK.into(),
+            "-p".into(),
+            format!("{0}:{0}", spec.agent_port),
+            // Admin API is reachable from this machine only.
+            "-p".into(),
+            format!("127.0.0.1:{ADMIN_PORT}:{ADMIN_PORT}"),
+        ]);
+    }
+    a.extend([
         "-v".into(),
         format!("{}:/state", spec.state_dir.display()),
         "--label".into(),
         format!("{MANAGED_LABEL}=true"),
         "--label".into(),
         format!("{MODEL_LABEL}={}", spec.model_key),
-    ];
+    ]);
     for dir in &spec.model.dirs {
         a.push("-v".into());
         a.push(format!("{0}:{0}:ro", dir.display()));
@@ -218,6 +290,7 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
         ("AGENT_PORT", spec.agent_port.to_string()),
         ("ADMIN_PORT", ADMIN_PORT.to_string()),
         ("ADMIN_TOKEN", spec.admin_token.clone()),
+        ("DEVICE_TTL_DAYS", spec.pairing_ttl_days.map_or_else(|| "never".to_string(), |d| d.to_string())),
         // Weights are always fetched by the GUI; never let SGLang download.
         ("HF_HUB_OFFLINE", "1".into()),
     ] {
@@ -226,21 +299,141 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
     }
     if spec.web_search {
         a.push("-e".into());
-        a.push(format!("SEARXNG_URL={SEARXNG_INTERNAL_URL}"));
+        a.push(match spec.split {
+            Some(_) => format!("SEARXNG_URL=http://127.0.0.1:{SEARXNG_LOOPBACK_PORT}"),
+            None => format!("SEARXNG_URL={SEARXNG_INTERNAL_URL}"),
+        });
+    }
+    let mut extra: Vec<String> = Vec::new();
+    if let Some(split) = &spec.split {
+        for (k, v) in split.env() {
+            a.push("-e".into());
+            a.push(format!("{k}={v}"));
+        }
+        for (k, v) in [("ADMIN_HOST", "127.0.0.1".to_string()), ("SGLANG_PORT", crate::split::SGLANG_HOST_PORT.to_string())] {
+            a.push("-e".into());
+            a.push(format!("{k}={v}"));
+        }
+        extra.push(split.args());
     }
     for (k, v) in [("MODEL_ID", spec.model_id.clone()), ("EDIT_FORMAT", spec.edit_format.clone())] {
         a.push("-e".into());
         a.push(format!("{k}={v}"));
     }
+    if let Some(dtype) = &spec.dtype {
+        extra.push(format!("--dtype {dtype}"));
+    }
     if let Some(parser) = &spec.reasoning_parser {
-        a.push("-e".into());
-        a.push(format!("SGLANG_EXTRA_ARGS=--reasoning-parser {parser}"));
+        extra.push(format!("--reasoning-parser {parser}"));
         // The gateway drives reasoning models differently (see gateway.classify).
         a.push("-e".into());
         a.push(format!("REASONING_PARSER={parser}"));
     }
+    if !extra.is_empty() {
+        a.push("-e".into());
+        a.push(format!("SGLANG_EXTRA_ARGS={}", extra.join(" ")));
+    }
     a.push(spec.image.clone());
     a
+}
+
+/// A member's rank of a split model: SGLang alone (the image's launch
+/// script, no gateway), on the host's network, reading the weights read-only.
+#[derive(Debug, Clone)]
+pub struct WorkerSpec {
+    pub image: String,
+    pub gpu_index: u32,
+    pub model: ModelMount,
+    pub model_key: String,
+    pub mem_fraction_static: f64,
+    pub context_len: u32,
+    pub split: SplitRank,
+    /// Must match rank 0's.
+    pub dtype: Option<String>,
+    pub run_id: String,
+}
+
+pub const RUN_LABEL: &str = "io.openphalanx.run";
+
+pub fn worker_run_args(spec: &WorkerSpec) -> Vec<String> {
+    let mut a: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        WORKER_CONTAINER.into(),
+        "--gpus".into(),
+        format!("\"device={}\"", spec.gpu_index),
+        "--ipc=host".into(),
+        "--network".into(),
+        "host".into(),
+        "--entrypoint".into(),
+        "/opt/openphalanx/start-sglang.sh".into(),
+        "--label".into(),
+        format!("{MANAGED_LABEL}=true"),
+        "--label".into(),
+        format!("{MODEL_LABEL}={}", spec.model_key),
+        "--label".into(),
+        format!("{RUN_LABEL}={}", spec.run_id),
+    ];
+    for dir in &spec.model.dirs {
+        a.push("-v".into());
+        a.push(format!("{0}:{0}:ro", dir.display()));
+    }
+    let mut env = vec![
+        ("MODEL_PATH", spec.model.model_path.clone()),
+        ("SERVED_MODEL_NAME", "worker".to_string()),
+        ("SGLANG_PORT", crate::split::SGLANG_HOST_PORT.to_string()),
+        ("MEM_FRACTION_STATIC", format!("{}", spec.mem_fraction_static)),
+        ("CONTEXT_LENGTH", spec.context_len.to_string()),
+        ("HF_HUB_OFFLINE", "1".into()),
+        (
+            "SGLANG_EXTRA_ARGS",
+            match &spec.dtype {
+                Some(d) => format!("{} --dtype {d}", spec.split.args()),
+                None => spec.split.args(),
+            },
+        ),
+    ];
+    env.extend(spec.split.env());
+    for (k, v) in env {
+        a.push("-e".into());
+        a.push(format!("{k}={v}"));
+    }
+    a.push(spec.image.clone());
+    a
+}
+
+pub async fn run_worker(spec: &WorkerSpec) -> Result<()> {
+    remove_worker().await?;
+    let args = worker_run_args(spec);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = docker(&refs).await?;
+    if !out.status.success() {
+        bail!("docker run failed: {}", stderr(&out));
+    }
+    Ok(())
+}
+
+pub async fn remove_worker() -> Result<()> {
+    docker(&["rm", "-f", WORKER_CONTAINER]).await?;
+    Ok(())
+}
+
+/// The worker's run id and state ("running", "exited", …), if it exists.
+pub async fn worker_state() -> Result<Option<(String, ContainerState)>> {
+    let out = docker(&["inspect", "--type", "container", WORKER_CONTAINER]).await?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    let state: ContainerState = serde_json::from_value(v[0]["State"].clone())?;
+    let run = v[0]["Config"]["Labels"][RUN_LABEL].as_str().unwrap_or_default().to_string();
+    Ok(Some((run, state)))
+}
+
+pub async fn worker_logs_tail(lines: u32) -> Result<String> {
+    let out = docker(&["logs", "--tail", &lines.to_string(), WORKER_CONTAINER]).await?;
+    Ok(format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
 }
 
 pub async fn run(spec: &RunSpec) -> Result<()> {
@@ -278,8 +471,8 @@ pub async fn ensure_network() -> Result<()> {
     Ok(())
 }
 
-pub fn searxng_run_args(settings_file: &Path, secret: &str) -> Vec<String> {
-    vec![
+pub fn searxng_run_args(settings_file: &Path, secret: &str, loopback: bool) -> Vec<String> {
+    let mut a: Vec<String> = vec![
         "run".into(),
         "-d".into(),
         "--name".into(),
@@ -299,14 +492,19 @@ pub fn searxng_run_args(settings_file: &Path, secret: &str) -> Vec<String> {
         format!("SEARXNG_SECRET={secret}"),
         "-v".into(),
         format!("{}:/etc/searxng/settings.yml:ro", settings_file.display()),
-        SEARXNG_IMAGE.into(),
-    ]
+    ];
+    if loopback {
+        a.extend(["-p".into(), format!("127.0.0.1:{SEARXNG_LOOPBACK_PORT}:8080")]);
+    }
+    a.push(SEARXNG_IMAGE.into());
+    a
 }
 
-/// (Re)starts SearXNG on the private network. No ports are published.
-pub async fn run_searxng(settings_file: &Path, secret: &str) -> Result<()> {
+/// (Re)starts SearXNG on the private network. No ports are published, except
+/// on loopback for a backend on the host's network (`loopback`).
+pub async fn run_searxng(settings_file: &Path, secret: &str, loopback: bool) -> Result<()> {
     docker(&["rm", "-f", SEARXNG_CONTAINER]).await?;
-    let args = searxng_run_args(settings_file, secret);
+    let args = searxng_run_args(settings_file, secret, loopback);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = docker(&refs).await?;
     if !out.status.success() {
@@ -364,9 +562,8 @@ pub fn diagnose_crash(logs: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn run_args_publish_admin_on_loopback_only() {
-        let spec = RunSpec {
+    fn spec() -> RunSpec {
+        RunSpec {
             image: DEFAULT_IMAGE.into(),
             gpu_index: 0,
             agent_port: 9090,
@@ -380,13 +577,32 @@ mod tests {
             model_id: "Qwen/X".into(),
             edit_format: "diff".into(),
             reasoning_parser: Some("qwen3".into()),
-        };
-        let a = run_args(&spec).join(" ");
+            dtype: None,
+            pairing_ttl_days: Some(7),
+            split: None,
+        }
+    }
+
+    fn split_rank(rank: u32) -> SplitRank {
+        SplitRank {
+            rank,
+            nnodes: 2,
+            dist_init_addr: "192.168.1.77:9100".into(),
+            partition: "40,24".into(),
+            interface: Some("eno1".into()),
+        }
+    }
+
+    #[test]
+    fn run_args_publish_admin_on_loopback_only() {
+        let a = run_args(&spec()).join(" ");
         assert!(a.contains("-p 9090:9090"));
         assert!(a.contains("-p 127.0.0.1:9091:9091"));
         assert!(a.contains("-v /m:/m:ro") && a.contains("-v /blobs:/blobs:ro"));
         assert!(a.contains("-e MEM_FRACTION_STATIC=0.812"));
         assert!(a.contains("-e HF_HUB_OFFLINE=1"));
+        assert!(a.contains("-e DEVICE_TTL_DAYS=7"));
+        assert!(run_args(&RunSpec { pairing_ttl_days: None, ..spec() }).join(" ").contains("-e DEVICE_TTL_DAYS=never"));
         assert!(a.contains("--network openphalanx"));
         assert!(a.contains("-e SEARXNG_URL=http://openphalanx-searxng:8080"));
         assert!(a.contains("-e MODEL_ID=Qwen/X") && a.contains("-e EDIT_FORMAT=diff"));
@@ -395,9 +611,47 @@ mod tests {
     }
 
     #[test]
+    fn split_rank_zero_shares_the_host_network_but_keeps_admin_on_loopback() {
+        let a = run_args(&RunSpec { split: Some(split_rank(0)), ..spec() }).join(" ");
+        assert!(a.contains("--network host") && !a.contains(" -p "), "{a}");
+        assert!(a.contains("-e ADMIN_HOST=127.0.0.1"), "host network: the gateway must bind admin to loopback");
+        assert!(a.contains("-e SEARXNG_URL=http://127.0.0.1:9098"));
+        assert!(a.contains("-e SGLANG_PP_LAYER_PARTITION=40,24"));
+        assert!(a.contains("-e NCCL_SOCKET_IFNAME=eno1") && a.contains("-e GLOO_SOCKET_IFNAME=eno1"));
+        assert!(a.contains(
+            "-e SGLANG_EXTRA_ARGS=--pp-size 2 --nnodes 2 --node-rank 0 --dist-init-addr 192.168.1.77:9100 \
+             --chunked-prefill-size 2048 --reasoning-parser qwen3"
+        ));
+    }
+
+    #[test]
+    fn workers_run_sglang_alone() {
+        let w = WorkerSpec {
+            image: DEFAULT_IMAGE.into(),
+            gpu_index: 0,
+            model: ModelMount { dirs: vec!["/m".into()], model_path: "/m".into() },
+            model_key: "catalog:Qwen/X".into(),
+            mem_fraction_static: 0.7,
+            context_len: 32768,
+            split: split_rank(1),
+            dtype: Some("bfloat16".into()),
+            run_id: "r1".into(),
+        };
+        let a = worker_run_args(&w).join(" ");
+        assert!(a.contains("--name openphalanx-worker") && a.contains("--network host"));
+        assert!(a.contains("--entrypoint /opt/openphalanx/start-sglang.sh"), "no gateway on a worker");
+        assert!(a.contains("--label io.openphalanx.run=r1"));
+        assert!(a.contains("--node-rank 1") && a.contains("-v /m:/m:ro"));
+        assert!(a.contains("--chunked-prefill-size 2048 --dtype bfloat16"), "same dtype as rank 0: {a}");
+        assert!(!a.contains("ADMIN_TOKEN"));
+    }
+
+    #[test]
     fn searxng_is_private_and_never_chowns() {
-        let a = searxng_run_args(Path::new("/d/settings.yml"), "k").join(" ");
+        let a = searxng_run_args(Path::new("/d/settings.yml"), "k", false).join(" ");
         assert!(!a.contains(" -p "), "SearXNG must not publish ports");
+        let lo = searxng_run_args(Path::new("/d/settings.yml"), "k", true).join(" ");
+        assert!(lo.contains("-p 127.0.0.1:9098:8080"), "only on loopback");
         assert!(a.contains("--network openphalanx"));
         assert!(a.contains("FORCE_OWNERSHIP=false"));
         assert!(a.contains("--log-driver none"), "queries must not be logged");

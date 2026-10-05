@@ -87,7 +87,7 @@ impl ArchSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Requirement {
     pub context_len: u32,
     /// Size of the downloaded weight files.
@@ -116,7 +116,7 @@ pub fn requirement(
     let factor = WEIGHT_LOAD_FACTOR * if fp8_upcast { 2.0 } else { 1.0 };
     let weight_bytes = (download_bytes as f64 * factor) as u64;
     let kv_bytes = (arch.kv_bytes_per_token() as f64 * context_len as f64 * KV_HEADROOM) as u64;
-    let overhead_bytes = RUNTIME_BASE + (weight_bytes as f64 * RUNTIME_PER_WEIGHT) as u64;
+    let overhead_bytes = runtime_overhead(weight_bytes);
     Requirement {
         context_len,
         download_bytes,
@@ -125,6 +125,24 @@ pub fn requirement(
         overhead_bytes,
         total_bytes: weight_bytes + kv_bytes + overhead_bytes,
         fp8_upcast,
+    }
+}
+
+/// Runtime memory next to `weight_bytes` of weights: CUDA context,
+/// activations and graphs (grows with the weights a GPU holds).
+pub fn runtime_overhead(weight_bytes: u64) -> u64 {
+    RUNTIME_BASE + (weight_bytes as f64 * RUNTIME_PER_WEIGHT) as u64
+}
+
+/// The need when one model is split across `servers` machines (pipeline
+/// parallel): weights, KV cache and the runtime memory that grows with the
+/// weights are shared out, but every machine pays the fixed part again.
+pub fn split_across(req: &Requirement, servers: u32) -> Requirement {
+    let extra = RUNTIME_BASE * u64::from(servers.max(1) - 1);
+    Requirement {
+        overhead_bytes: req.overhead_bytes + extra,
+        total_bytes: req.total_bytes + extra,
+        ..*req
     }
 }
 
@@ -321,5 +339,16 @@ mod tests {
         assert!(need(best).total_bytes <= free && need(best + 1024).total_bytes > free);
         assert_eq!(max_fitting_context(32_768, 100 * GIB, need), Some(32_768));
         assert_eq!(max_fitting_context(32_768, GIB, need), None);
+    }
+
+    #[test]
+    fn a_split_model_pays_runtime_memory_on_every_server() {
+        let arch = ArchSpec { kv_layers: 48, kv_heads: 8, head_dim: 128, ..Default::default() };
+        let one = requirement(9 << 30, Some("AWQ 4-bit"), &arch, 32768, Some(8.6));
+        assert_eq!(split_across(&one, 1), one);
+        let two = split_across(&one, 2);
+        assert_eq!(two.weight_bytes, one.weight_bytes);
+        assert_eq!(two.kv_bytes, one.kv_bytes);
+        assert_eq!(two.total_bytes, one.total_bytes + RUNTIME_BASE);
     }
 }
