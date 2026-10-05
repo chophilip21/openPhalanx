@@ -33,7 +33,6 @@ PREFIXES = {
     "major": "major", "breaking": "major",
 }
 NO_RELEASE = {"docs", "doc", "ci", "chore", "test", "refactor"}
-WORKSPACE_CRATES = ("openphalanx-core", "openphalanx", "oppx")
 TITLE = re.compile(r"^\s*\[(?P<kind>[A-Za-z]+)\]\s*(?P<rest>.+)$")
 
 
@@ -70,6 +69,24 @@ def current() -> str:
     return m.group(1)
 
 
+def workspace_crates() -> list[str]:
+    """Package names of the workspace members that take the workspace
+    version (`version.workspace = true`). Read from the manifests, so a new
+    crate can't be left behind in Cargo.lock (v0.4.0's first build failed
+    on exactly that: `--locked` refused the stale lock file)."""
+    text = (ROOT / "Cargo.toml").read_text()
+    m = re.search(r"(?ms)^\[workspace\].*?^members\s*=\s*\[(.*?)\]", text)
+    if not m:
+        sys.exit("no [workspace] members in Cargo.toml")
+    names = []
+    for member in re.findall(r'"([^"]+)"', m.group(1)):
+        manifest = (ROOT / member / "Cargo.toml").read_text()
+        name = re.search(r'(?ms)^\[package\].*?^name\s*=\s*"([^"]+)"', manifest)
+        if name and re.search(r"(?m)^version\.workspace\s*=\s*true", manifest):
+            names.append(name.group(1))
+    return names
+
+
 def write(old: str, new: str):
     cargo = ROOT / "Cargo.toml"
     text = cargo.read_text()
@@ -78,7 +95,7 @@ def write(old: str, new: str):
     lock = ROOT / "Cargo.lock"
     if lock.exists():
         text = lock.read_text()
-        for name in WORKSPACE_CRATES:
+        for name in workspace_crates():
             text = text.replace(f'name = "{name}"\nversion = "{old}"', f'name = "{name}"\nversion = "{new}"')
         lock.write_text(text)
 
