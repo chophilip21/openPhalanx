@@ -66,27 +66,52 @@ In split mode, rank 0 and the workers run with `--network host`. The torch rende
 **Fix:** say clearly in the docs and in the cluster panel that split mode requires a trusted LAN. Optionally, `ufw` rules limiting `9100-9116` and the ephemeral ports to member IPs while serving.
 </details>
 
-### S5. The backend image is pulled by a mutable tag (Low)
+### ~~S5. The backend image is pulled by a mutable tag (Low)~~ ✅ Mitigated
+**Done:** we chose the fallback. Pinning by digest would need the digest at app build time, but the image is published *after* the app release, so that's a release-process change for later. `scripts/publish-image.sh` now refuses to push a tag that's already on GHCR (`docker manifest inspect`; `OPPX_REPUSH=1` forces it) and prints the pushed digest so it can be recorded. Documented in CLAUDE.md. Verified: the real registry check finds `0.1.0` (exit 0) and reports the unpushed tags as unknown; with a stand-in `docker`, the guard stops before build and push, and `OPPX_REPUSH=1` goes through. Side finding: only `0.1.0` is on GHCR. `0.2.0` isn't either, not just `0.3.0`, so apps of those versions can't pull their image (see the Status table).
+
+<details><summary>Original finding</summary>
+
 `docker.rs:15`: `DEFAULT_IMAGE` is `ghcr.io/…/openphalanx-backend:<version>`, a tag. Anyone who can push to that GHCR package (or a re-run of `publish-image.sh`) can swap what every GUI runs next, with GPU access and the backend state mount. SGLang and SearXNG are already pinned by digest; our own image isn't.
 **Fix:** after publishing, record the digest (for example in `catalog.json` or a constant bumped by the release) and pull `…@sha256:`. If that's too much process for now, at least never re-push an existing tag.
+</details>
 
-### S6. LAN-facing endpoints without authentication have no bounds (Low)
+### ~~S6. LAN-facing endpoints without authentication have no bounds (Low)~~ ✅ Fixed
+**Done** (`cluster.rs`):
+* Pending invitations and host requests older than `INVITE_TTL_SECS` (10 min, the host's own invite lifetime) are dropped before the cap is applied.
+* Beacon handling moved into `record_beacon`: stale entries are pruned first, then new ids beyond `MAX_CANDIDATES` (64) are ignored. Known servers keep updating.
+* `check_candidates` runs its pinned health checks concurrently (`join_all`), so one dead or fake address no longer holds up the round.
+
+Tests: `stale_invitations_and_host_requests_make_room`, and `a_beacon_flood_is_capped_but_known_servers_stay` (1,000 fake ids end up as 64 entries and the real server stays). The concurrent checks weren't re-run on the LAN. Burning pairing codes is left as is, as planned.
+
+<details><summary>Original finding</summary>
+
 These are cheap denial-of-service paths for anyone on the LAN:
 * **Pending invitations never expire:** `cluster.rs:930-945` caps them at 8 but never drops old ones (`received_at` is never read). 8 fake invites to `/cluster/v1/invite` block real ones with 429 until each is declined by hand.
   * **Fix:** `pending.retain(|p| now() - p.received_at < INVITE_TTL_SECS)` before the cap; the same for `host_requests`.
 * **Discovery accepts any number of servers:** beacons with random ids grow `candidates` freely, and `check_candidates` health-checks them **one by one** with a 3 s timeout (`cluster.rs:1316-1335`). Spoofed beacons stall the verification of real servers, and make this machine open TLS connections to any IP.
   * **Fix:** cap `candidates`, for example at 64, and ignore new ids beyond that.
 * **Pairing codes can be burned:** 5 bad `/v1/pair` guesses from anyone kill the active code (`gateway.py:226-236`). This is a nuisance, not a breach; leave it unless it actually happens.
+</details>
 
 # performance
 
-### P1. Every chat request rewrites `devices.json` 2–3 times, blocking the event loop (Low)
+### ~~P1. Every chat request rewrites `devices.json` 2–3 times, blocking the event loop (Low)~~ ✅ Fixed
+**Done:** `touch`, `add_search` and `add_usage` now only set `DeviceStore.dirty`. A `flush_devices` task saves every `DEVICE_FLUSH_S` (5 s) when something changed, logs and retries on `OSError` instead of dying, and runs once more at shutdown. Pairing and revocation still save at once. Worst case, about 5 s of usage counters are lost on a crash. Harness (fake SGLang): 5 streamed requests make 0 writes with the counters correct (5 requests, 35/15 tokens), the flusher makes 1 write and then nothing while idle, and it survives a full disk; revocation is written immediately.
+
+<details><summary>Original finding</summary>
+
 `gateway.py:167-179`: `touch`, `add_usage` (and `add_search`) each call `save()`, which writes indented JSON of all devices to disk synchronously inside the asyncio loop. That's small today, but it's the hot path. It also causes B1.
 **Fix:** keep the counters in memory and save at most every few seconds (or on revoke and pair). Only pairing and revocation need an immediate write.
+</details>
 
-### P2. Each SGLang probe opens a new HTTP client, including from the unauthenticated `/health` (Low)
+### ~~P2. Each SGLang probe opens a new HTTP client, including from the unauthenticated `/health` (Low)~~ ✅ Fixed
+**Done:** `sglang_ready()` and `sglang_metrics()` use the shared `upstream()` client (`timeout=5`); the now-unused `SGLANG_BASE` is removed. Harness: `/health` and `/admin/status` both reach the fake SGLang through the shared client, and the cache-hit ratio parses.
+
+<details><summary>Original finding</summary>
+
 `gateway.py:293-311`: `sglang_ready()` and `sglang_metrics()` create a new `httpx.AsyncClient` per call. They're called by `/health` (open to the LAN), `/v1/info`, and the GUI's 2 s admin poll. A shared pooled client, `upstream()`, already exists.
 **Fix:** use `upstream()` with `timeout=5` in both. A one-line change each.
+</details>
 
 # Checked and fine (don't re-audit)
 

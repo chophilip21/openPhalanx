@@ -51,7 +51,6 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 SGLANG_ROOT = f"http://127.0.0.1:{os.environ.get('SGLANG_PORT', '8080')}"
-SGLANG_BASE = f"{SGLANG_ROOT}/v1"
 MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", "openphalanx-coder")
 AGENT_PORT = int(os.environ.get("AGENT_PORT", "9090"))
 ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "9091"))
@@ -109,6 +108,8 @@ TLS_DIR = STATE_DIR / "tls"
 CERT_PATH = TLS_DIR / "cert.pem"
 KEY_PATH = TLS_DIR / "key.pem"
 DEVICES_PATH = STATE_DIR / "devices.json"
+# Usage counters are written at most this often (see DeviceStore).
+DEVICE_FLUSH_S = 5.0
 
 
 # --------------------------------------------------------------------------
@@ -129,16 +130,20 @@ def _hash_token(token: str) -> str:
 
 
 class DeviceStore:
-    """Paired devices, persisted with hashed tokens only."""
+    """Paired devices, persisted with hashed tokens only. Pairing and
+    revocation are saved at once; usage counters change on every request, so
+    they are only marked dirty and saved by `flush_devices` every few seconds."""
 
     def __init__(self, path: Path):
         self.path = path
         self.devices: dict[str, dict] = {}
+        self.dirty = False
         if path.exists():
             self.devices = {d["id"]: d for d in json.loads(path.read_text())}
 
     def save(self) -> None:
         _write_private_json(self.path, list(self.devices.values()))
+        self.dirty = False
 
     def add(self, name: str) -> tuple[dict, str]:
         token = secrets.token_urlsafe(32)
@@ -167,16 +172,16 @@ class DeviceStore:
     def touch(self, device: dict) -> None:
         device["last_seen"] = time.time()
         device["requests"] += 1
-        self.save()
+        self.dirty = True
 
     def add_search(self, device: dict) -> None:
         device["web_searches"] = device.get("web_searches", 0) + 1
-        self.save()
+        self.dirty = True
 
     def add_usage(self, device: dict, prompt_tokens: int, completion_tokens: int) -> None:
         device["prompt_tokens"] = device.get("prompt_tokens", 0) + prompt_tokens
         device["completion_tokens"] = device.get("completion_tokens", 0) + completion_tokens
-        self.save()
+        self.dirty = True
 
     def revoke(self, device_id: str) -> bool:
         if self.devices.pop(device_id, None) is None:
@@ -292,9 +297,8 @@ def tls_fingerprint() -> str:
 
 async def sglang_ready() -> bool:
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{SGLANG_BASE}/models")
-            r.raise_for_status()
+        r = await upstream().get("/v1/models", timeout=5)
+        r.raise_for_status()
         return True
     except httpx.HTTPError:
         return False
@@ -306,9 +310,8 @@ _METRIC_RE = re.compile(r"^(sglang:[a-z_]+)(?:\{[^}]*\})?\s+([0-9.eE+-]+)$")
 async def sglang_metrics() -> dict:
     """Sums each SGLang Prometheus series across labels."""
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{SGLANG_ROOT}/metrics")
-            r.raise_for_status()
+        r = await upstream().get("/metrics", timeout=5)
+        r.raise_for_status()
     except httpx.HTTPError:
         return {}
     sums: dict[str, float] = {}
@@ -842,8 +845,7 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
     metrics.requests_active += 1
     metrics.last_request_at = time.time()
     try:
-        # Inside the try: a failed devices.json write (full disk) must not
-        # keep the slots taken.
+        # Inside the try: any error here must give the slots back.
         devices.touch(device)
         if auto_search:
             resp = await _send_with_auto_search(body, device)
@@ -978,6 +980,17 @@ async def admin_revoke(device_id: str) -> dict:
     return {"revoked": device_id}
 
 
+async def flush_devices() -> None:
+    """Saves the usage counters every few seconds when they changed."""
+    while True:
+        await asyncio.sleep(DEVICE_FLUSH_S)
+        if devices.dirty:
+            try:
+                devices.save()
+            except OSError as e:  # e.g. a full disk: keep serving, retry next round
+                print(f"cannot save {DEVICES_PATH}: {e}", flush=True)
+
+
 async def main() -> None:
     ensure_tls()
     public_server = uvicorn.Server(
@@ -992,7 +1005,13 @@ async def main() -> None:
     admin_server = uvicorn.Server(
         uvicorn.Config(admin, host=ADMIN_HOST, port=ADMIN_PORT, log_level="warning")
     )
-    await asyncio.gather(public_server.serve(), admin_server.serve())
+    flusher = asyncio.create_task(flush_devices())
+    try:
+        await asyncio.gather(public_server.serve(), admin_server.serve())
+    finally:
+        flusher.cancel()
+        if devices.dirty:
+            devices.save()
 
 
 if __name__ == "__main__":

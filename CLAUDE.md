@@ -365,7 +365,7 @@ cargo run -p openphalanx-core --example lifecycle               # full start →
 cargo run -p openphalanx-core --example download -- <repo> <dir>  # verified, resumable HF download
 
 docker build -f docker/Dockerfile.server -t ghcr.io/chophilip21/openphalanx-backend:0.3.0 docker/
-scripts/publish-image.sh                                        # build and push to GHCR (needs write:packages)
+scripts/publish-image.sh                                        # build and push to GHCR (needs write:packages); refuses an existing tag (OPPX_REPUSH=1 forces)
 scripts/bench_session.py --oppx target/debug/oppx               # prefix-cache benchmark (in a scratch copy of a repo)
 scripts/gen_docs.py --oppx target/debug/oppx --out target/docs  # docs sources; then: mdbook build target/docs
 OPENAI_API_BASE=… OPENAI_API_KEY=… scripts/probe_routing.py     # via `oppx proxy --no-web`; run after any model change
@@ -395,7 +395,7 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
   1. `oppx` for `x86_64`/`aarch64-unknown-linux-musl` (static) and `aarch64`/`x86_64-apple-darwin`, with `OPPX_RELEASE_TARGET` set; the app as `.deb` and AppImage.
   2. A GitHub release with the archives, `SHA256SUMS`, `install.sh`, `install-server.sh`, and notes from `main`'s `CHANGELOG.md`.
   3. The docs (`scripts/gen_docs.py` + mdBook) on GitHub Pages.
-  4. The backend image (about 50 GB, too big for GitHub's runners) only when the repository variable `IMAGE_RUNNER` names a self-hosted runner (e.g. `["self-hosted","gpu"]`). Otherwise run `scripts/publish-image.sh <version>` on the server node after the release.
+  4. The backend image (about 50 GB, too big for GitHub's runners) only when the repository variable `IMAGE_RUNNER` names a self-hosted runner (e.g. `["self-hosted","gpu"]`). Otherwise run `scripts/publish-image.sh <version>` on the server node after the release. It refuses to overwrite a tag that's already on GHCR, since every app of that version pulls it (`OPPX_REPUSH=1` forces), so a Publish re-run fails at that step once the image is out.
 * **Why two workflows:** a tag pushed with `GITHUB_TOKEN` starts no workflow, but a dispatch does. A `pull_request` run can't deploy Pages, because its ref is the PR's merge ref, not `main`.
 * **One-time repository settings:** Actions → workflow permissions "Read and write"; if `main` is protected, allow GitHub Actions to push to it; Pages → source "GitHub Actions"; make the GHCR package public.
 * Lint the workflows locally with `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest`.

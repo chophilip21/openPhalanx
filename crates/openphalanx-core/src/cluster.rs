@@ -60,6 +60,9 @@ const CANDIDATE_TTL_SECS: u64 = 10;
 const RECHECK_SECS: u64 = 8;
 const INVITE_TTL_SECS: u64 = 600;
 const MAX_PENDING: usize = 8;
+/// Servers tracked from beacons at once; beacons are unauthenticated, so a
+/// flood of made-up ids must not grow memory or the health-check round.
+const MAX_CANDIDATES: usize = 64;
 const MAGIC: &str = "openphalanx-cluster-v1";
 const MAX_NAME: usize = 64;
 
@@ -974,7 +977,9 @@ impl Cluster {
         let mut host = msg.host;
         host.name = clean_name(&host.name);
         let mut pending = self.pending.lock().unwrap();
-        pending.retain(|p| p.host.id != host.id);
+        // Anyone on the LAN can send these: old ones expire (as the host's invitation does).
+        let t = now();
+        pending.retain(|p| p.host.id != host.id && t.saturating_sub(p.received_at) < INVITE_TTL_SECS);
         if pending.len() >= MAX_PENDING {
             return Err((StatusCode::TOO_MANY_REQUESTS, "too many pending invitations".into()));
         }
@@ -1069,7 +1074,8 @@ impl Cluster {
         }
         msg.from.name = clean_name(&msg.from.name);
         let mut reqs = self.host_requests.lock().unwrap();
-        reqs.retain(|r| r.from.id != msg.from.id);
+        let t = now();
+        reqs.retain(|r| r.from.id != msg.from.id && t.saturating_sub(r.received_at) < INVITE_TTL_SECS);
         if reqs.len() >= MAX_PENDING {
             return Err((StatusCode::TOO_MANY_REQUESTS, "too many pending requests".into()));
         }
@@ -1314,34 +1320,42 @@ impl Cluster {
                     let _ = socket.send_to(&bytes, SocketAddr::new(from.ip(), DISCOVERY_PORT)).await;
                 }
             }
-            let mut new = false;
-            let mut cands = self.candidates.lock().unwrap();
-            let entry = cands.entry(beacon.id.clone()).or_insert(Candidate {
-                beacon: beacon.clone(),
-                address: from.ip(),
-                last_seen: 0,
-                reachable: None,
-                checked_at: 0,
-            });
-            // New, back after a gap, or a new address or certificate: check now.
-            let t = now();
-            if entry.last_seen == 0
-                || t.saturating_sub(entry.last_seen) > CANDIDATE_TTL_SECS
-                || entry.address != from.ip()
-                || entry.beacon.fingerprint != beacon.fingerprint
-            {
-                entry.reachable = None;
-                entry.checked_at = 0;
-                new = true;
-            }
-            entry.address = from.ip();
-            entry.beacon = beacon;
-            entry.last_seen = t;
-            drop(cands);
-            if new {
+            if self.record_beacon(beacon, from.ip()) {
                 self.check_now.notify_one();
             }
         }
+    }
+
+    /// Notes a server's beacon; true when it needs a reachability check now.
+    fn record_beacon(&self, beacon: Beacon, address: IpAddr) -> bool {
+        let mut cands = self.candidates.lock().unwrap();
+        let t = now();
+        if !cands.contains_key(&beacon.id) {
+            cands.retain(|_, c| t.saturating_sub(c.last_seen) <= CANDIDATE_TTL_SECS);
+            if cands.len() >= MAX_CANDIDATES {
+                return false;
+            }
+        }
+        let entry = cands.entry(beacon.id.clone()).or_insert(Candidate {
+            beacon: beacon.clone(),
+            address,
+            last_seen: 0,
+            reachable: None,
+            checked_at: 0,
+        });
+        // New, back after a gap, or a new address or certificate: check now.
+        let new = entry.last_seen == 0
+            || t.saturating_sub(entry.last_seen) > CANDIDATE_TTL_SECS
+            || entry.address != address
+            || entry.beacon.fingerprint != beacon.fingerprint;
+        if new {
+            entry.reachable = None;
+            entry.checked_at = 0;
+        }
+        entry.address = address;
+        entry.beacon = beacon;
+        entry.last_seen = t;
+        new
     }
 
     /// Lists a candidate only after a TLS health check pinned to the
@@ -1358,7 +1372,9 @@ impl Cluster {
                     .map(|c| (c.beacon.id.clone(), url_for(c.address, c.beacon.port), c.beacon.fingerprint.clone()))
                     .collect()
             };
-            for (id, url, fp) in due {
+            // All at once: one unreachable address doesn't hold up the others.
+            let me = &self;
+            futures_util::future::join_all(due.into_iter().map(|(id, url, fp)| async move {
                 let ok = async {
                     let client = pinned_tls::pinned_client(&fp)?;
                     let v: serde_json::Value =
@@ -1367,11 +1383,12 @@ impl Cluster {
                 }
                 .await
                 .unwrap_or(false);
-                if let Some(c) = self.candidates.lock().unwrap().get_mut(&id) {
+                if let Some(c) = me.candidates.lock().unwrap().get_mut(&id) {
                     c.reachable = Some(ok);
                     c.checked_at = now();
                 }
-            }
+            }))
+            .await;
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 _ = self.check_now.notified() => {}
@@ -2090,6 +2107,59 @@ mod tests {
         assert!(!c.members().iter().find(|m| m.id == "b").unwrap().online);
         c.live.lock().unwrap().get_mut("a").unwrap().last_seen = Some(now() - 30);
         assert_eq!(c.dropped_members(12).len(), 2);
+    }
+
+    #[test]
+    fn stale_invitations_and_host_requests_make_room() {
+        let (_d, c) = cluster();
+        for i in 0..MAX_PENDING {
+            let msg = InviteMsg { host: peer(&format!("h{i}")), invite_id: "x".into(), secret: "y".into() };
+            c.receive_invite(msg).unwrap();
+            c.receive_host_request(HostRequestMsg { from: peer(&format!("h{i}")), members: vec![] }).unwrap();
+        }
+        let late = || InviteMsg { host: peer("late"), invite_id: "x".into(), secret: "y".into() };
+        assert!(c.receive_invite(late()).is_err(), "full");
+        for p in c.pending.lock().unwrap().iter_mut() {
+            p.received_at = now() - INVITE_TTL_SECS;
+        }
+        for r in c.host_requests.lock().unwrap().iter_mut() {
+            r.received_at = now() - INVITE_TTL_SECS;
+        }
+        assert!(c.receive_invite(late()).is_ok(), "expired ones are dropped");
+        assert_eq!(c.pending.lock().unwrap().len(), 1);
+        assert!(c.receive_host_request(HostRequestMsg { from: peer("late"), members: vec![] }).is_ok());
+        assert_eq!(c.host_requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_beacon_flood_is_capped_but_known_servers_stay() {
+        let (_d, c) = cluster();
+        let beacon = |id: &str| Beacon {
+            magic: MAGIC.into(),
+            id: id.into(),
+            name: id.into(),
+            port: CLUSTER_PORT,
+            fingerprint: "AA".repeat(32),
+            role: "standalone".into(),
+            host_id: None,
+            version: "0".into(),
+            query: false,
+        };
+        let ip: IpAddr = "192.168.1.5".parse().unwrap();
+        assert!(c.record_beacon(beacon("real"), ip), "new: check it");
+        assert!(!c.record_beacon(beacon("real"), ip), "seen: no re-check");
+        for i in 0..1000 {
+            c.record_beacon(beacon(&format!("fake{i}")), ip);
+        }
+        assert_eq!(c.candidates.lock().unwrap().len(), MAX_CANDIDATES);
+        assert!(c.candidates.lock().unwrap().contains_key("real"));
+        c.record_beacon(beacon("real"), ip);
+        // Once the flood's entries go stale, new servers fit again.
+        for cand in c.candidates.lock().unwrap().values_mut() {
+            cand.last_seen = now() - CANDIDATE_TTL_SECS - 1;
+        }
+        assert!(c.record_beacon(beacon("newcomer"), ip));
+        assert_eq!(c.candidates.lock().unwrap().len(), 1);
     }
 
     fn order() -> WorkerOrder {
