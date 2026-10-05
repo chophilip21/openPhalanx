@@ -151,6 +151,42 @@ pub struct WorkerOrder {
     pub stage: crate::split::Stage,
 }
 
+impl ModelSpec {
+    /// A member checks the host's model before it goes into a folder path
+    /// and Hugging Face URLs (`..` would escape the models folder).
+    fn check(&self) -> Result<()> {
+        crate::model::validate_repo(&self.repo)?;
+        if self.revision.len() != 40 || !self.revision.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("the host asked for revision \"{}\", which isn't a commit id", self.revision);
+        }
+        Ok(())
+    }
+}
+
+impl WorkerOrder {
+    /// A member checks the host's order before it becomes SGLang arguments
+    /// (they are split on spaces, so a value could smuggle in extra flags).
+    fn check(&self) -> Result<()> {
+        self.model.check()?;
+        if let Some(d) = &self.dtype {
+            if !["auto", "half", "float16", "bfloat16", "float", "float32"].contains(&d.as_str()) {
+                bail!("the host asked for an unknown dtype \"{d}\"");
+            }
+        }
+        let p = &self.rank.partition;
+        if p.is_empty() || !p.split(',').all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
+            bail!("the host sent an invalid layer partition \"{p}\"");
+        }
+        if self.rank.dist_init_addr.parse::<SocketAddr>().is_err() {
+            bail!("the host sent an invalid rendezvous address \"{}\"", self.rank.dist_init_addr);
+        }
+        if self.image.starts_with('-') || self.image.contains(char::is_whitespace) {
+            bail!("the host sent an invalid image name \"{}\"", self.image);
+        }
+        Ok(())
+    }
+}
+
 /// A member's worker for the host's current run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerStatus {
@@ -1462,6 +1498,23 @@ impl Cluster {
     /// (the app's models folder or the Hugging Face cache) → ready; otherwise
     /// downloads it, resumable and verified, from the same pinned commit.
     fn ensure_model(self: Arc<Self>, spec: ModelSpec) {
+        if let Err(e) = spec.check() {
+            let mut sync = self.sync.lock().unwrap();
+            // Reported once; the host repeats the request every few seconds.
+            if !sync.as_ref().is_some_and(|s| s.repo == spec.repo && s.revision == spec.revision) {
+                *sync = Some(ModelSync {
+                    label: spec.label.clone(),
+                    repo: spec.repo.clone(),
+                    revision: spec.revision.clone(),
+                    state: "error".into(),
+                    error: Some(format!("{e:#}")),
+                    ..Default::default()
+                });
+                drop(sync);
+                self.log(format!("refused the host's model: {e:#}"));
+            }
+            return;
+        }
         {
             let sync = self.sync.lock().unwrap();
             let same = sync.as_ref().is_some_and(|s| s.repo == spec.repo && s.revision == spec.revision);
@@ -1627,6 +1680,7 @@ impl Cluster {
 
 /// As member: launches its share of the host's split model.
 async fn start_worker(order: &WorkerOrder) -> Result<()> {
+    order.check()?;
     let dir = crate::model::find_installed(&order.model.repo, Some(&order.model.revision))
         .with_context(|| format!("{} isn't on this machine yet", order.model.label))?;
     if !crate::docker::image_exists(&order.image).await? {
@@ -2036,5 +2090,77 @@ mod tests {
         assert!(!c.members().iter().find(|m| m.id == "b").unwrap().online);
         c.live.lock().unwrap().get_mut("a").unwrap().last_seen = Some(now() - 30);
         assert_eq!(c.dropped_members(12).len(), 2);
+    }
+
+    fn order() -> WorkerOrder {
+        let req = crate::vram::Requirement {
+            context_len: 32768,
+            download_bytes: 0,
+            weight_bytes: 0,
+            kv_bytes: 0,
+            overhead_bytes: 0,
+            total_bytes: 0,
+            fp8_upcast: false,
+        };
+        WorkerOrder {
+            run_id: "r1".into(),
+            model: ModelSpec {
+                key: "catalog:Qwen/X".into(),
+                label: "X".into(),
+                repo: "Qwen/Qwen3-8B-AWQ".into(),
+                revision: "0123456789abcdef0123456789abcdef01234567".into(),
+                weight_bytes: 0,
+            },
+            image: crate::docker::DEFAULT_IMAGE.into(),
+            context_len: 32768,
+            dtype: Some("bfloat16".into()),
+            rank: crate::docker::SplitRank {
+                rank: 1,
+                nnodes: 2,
+                dist_init_addr: "192.168.1.77:9100".into(),
+                partition: "40,24".into(),
+                interface: None,
+            },
+            stage: crate::split::Stage { id: "m".into(), name: "m".into(), rank: 1, layers: 24, free_bytes: 0, requirement: req },
+        }
+    }
+
+    #[test]
+    fn members_refuse_host_orders_that_escape_paths_or_add_flags() {
+        assert!(order().check().is_ok());
+        let bad_model = |repo: &str, revision: &str| {
+            let mut o = order();
+            o.model.repo = repo.into();
+            o.model.revision = revision.into();
+            o.check().is_err()
+        };
+        let rev = "0123456789abcdef0123456789abcdef01234567";
+        assert!(bad_model("../../.config", rev), "path traversal in the repo");
+        assert!(bad_model("a/b/../../../x", rev));
+        assert!(bad_model("Qwen/Qwen3-8B-AWQ", "main"), "a moving branch, not a commit");
+        assert!(bad_model("Qwen/Qwen3-8B-AWQ", "../../../api/models/x/y/tree/main?x="));
+        let bad = |f: fn(&mut WorkerOrder)| {
+            let mut o = order();
+            f(&mut o);
+            o.check().is_err()
+        };
+        assert!(bad(|o| o.dtype = Some("bfloat16 --trust-remote-code".into())), "flag smuggled in dtype");
+        assert!(bad(|o| o.rank.partition = "40,24 --trust-remote-code".into()));
+        assert!(bad(|o| o.rank.partition = String::new()));
+        assert!(bad(|o| o.rank.dist_init_addr = "1.2.3.4:9100 --enable-x".into()));
+        assert!(bad(|o| o.image = "--privileged".into()));
+    }
+
+    #[test]
+    fn a_member_refuses_an_invalid_host_model_without_downloading() {
+        let (_d, c) = cluster();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut spec = order().model;
+        spec.repo = "../../.config".into();
+        rt.block_on(async { c.clone().ensure_model(spec.clone()) });
+        let sync = c.sync.lock().unwrap().clone().unwrap();
+        assert_eq!(sync.state, "error");
+        assert!(sync.error.unwrap().contains("not a valid Hugging Face repo"));
+        assert!(c.sync_cancel.lock().unwrap().is_none(), "no download started");
     }
 }

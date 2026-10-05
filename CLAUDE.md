@@ -263,6 +263,7 @@ Servers on one network form a cluster: one **host** and its **members**. They do
   * **While serving:** a member dropping out pauses serving; a failed worker stops it with that member's reason. Stop clears the orders, so workers stop too. The Server page's model pill shows the split ("rig-3090: 40 layers (…) · laptop-4090: 24 layers (…)").
   * **Same settings on every rank:** `--chunked-prefill-size 2048` (`docker::SPLIT_PREFILL_CHUNK`; SGLang otherwise picks 4096 on a 24 GB card and 2048 on 16 GB, and the smaller rank crashed reshaping a 4096-token chunk), and the model's `dtype` override if the catalog has one.
   * **Ports between the servers:** `9100` and the next 16 on the host, plus NCCL's ephemeral ports both ways; keep the servers on one LAN without a firewall between them.
+  * **Trusted LAN only:** the rendezvous (`9100`) and NCCL/gloo traffic aren't authenticated, and SGLang passes objects between ranks with `pickle` (`broadcast_pyobj` in `sglang/srt/utils/common.py`). Anyone who can reach those ports while a split model starts or runs can potentially execute code on the servers. That's inherent to multi-node SGLang; the cluster panel's Split tooltip says so.
   * **Planning by hand:** `cargo run -p openphalanx-core --example split_plan -- rig-3090=22.1 laptop-4090=15.5` prints the plan for the selected model and context (the host first, free GiB per server).
   * **Verified by hand** (containers with the app's arguments, 3090 + 4090 laptop on gigabit Ethernet): Qwen3-8B-AWQ 20/16 layers, about 100 tokens/s, a 6.1k-token prompt in 2.3 s; Qwen3.6-27B-AWQ 42/22 layers at 32k context (18.6 of 24 GB and 11.0 of 16 GB used), correct on a 16.8k-token prompt in 13.7 s. The full app flow (Start on the host, worker orders, pause) is still to be run.
 * **Model sync:**
@@ -345,6 +346,7 @@ Open `9090/tcp` in your firewall for the clients' network, and `9092/tcp` plus `
   * limits each device to 120 requests a minute (`429`).
 
   The settings live in `gateway.py`, and the `MAX_ACTIVE_REQUESTS`, `MAX_DEVICE_REQUESTS`, `QUEUE_WAIT_S` and `RATE_PER_MINUTE` variables override them. Slots are released through an idempotent cleanup that also runs as the response's background task, so a client that disconnects before streaming starts can't leak one. SGLang itself rejects over-length input with a clean 400 and queues overload: 12 concurrent 20k-token requests all completed.
+* **Split model:** needs a trusted LAN; the traffic between ranks is unauthenticated and pickle-based (see Cluster → Split serving).
 * **No code stored or executed:** the server keeps no code and runs no commands for clients. Request bodies (prompts) are never logged; only per-device request and token counts are kept. Model weights are mounted read-only, and the backend never downloads weights on its own.
 
 ## Development

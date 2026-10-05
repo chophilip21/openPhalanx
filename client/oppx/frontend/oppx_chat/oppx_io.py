@@ -23,6 +23,17 @@ from .render import BulletStream, hide_reasoning
 from .context import CONTEXT_MGR
 
 
+# Aider's questions before it creates or edits a file the model named (Coder.allowed_to_edit).
+EDIT_QUESTIONS = ("Create new file?", "Allow edits to file that has not been added to the chat?")
+
+
+def editable_path(path: str) -> bool:
+    """Inside the repo and outside .git/ (a hook there runs on the next git command)."""
+    root = Path(SESSION.coder.root if SESSION.coder is not None else ".").resolve()
+    target = (root / path).resolve()
+    return target.is_relative_to(root) and not target.is_relative_to(root / ".git")
+
+
 # Aider status lines that mean nothing to an OpenPhalanx user.
 SUPPRESS = [
     re.compile(p)
@@ -229,6 +240,11 @@ class OppxIO(InputOutput):
     def confirm_ask(self, question, default="y", subject=None, explicit_yes_required=False, group=None, allow_never=False):
         self.num_user_asks += 1
         q = question.strip()
+        # Edits are accepted without asking, so they must stay in the project:
+        # Aider itself joins the model's path onto the repo root unchecked.
+        if q in EDIT_QUESTIONS and subject and not editable_path(str(subject)):
+            step(f"Refused an edit outside this project: {subject}", RED)
+            return False
         # Things only a person should decide: running commands the model
         # proposed, and going over the context window.
         if explicit_yes_required or "proceed anyway" in q.lower():

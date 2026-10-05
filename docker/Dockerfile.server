@@ -11,9 +11,10 @@ RUN apt-get update \
 
 # The gateway gets a small venv of its own so SGLang upgrades can't break it.
 # (The coding agent runs on the client; nothing agent-related lives here.)
+# Pinned to the versions tested in 0.3.0, so a rebuild of a tag is the same gateway.
 RUN uv venv /opt/gateway --python 3.12 \
     && uv pip install --python /opt/gateway/bin/python --no-cache \
-        fastapi "uvicorn[standard]" httpx
+        fastapi==0.142.2 starlette==1.7.0 pydantic==2.13.5 "uvicorn[standard]==0.54.0" httpx==0.28.1
 
 COPY server/supervisord.conf /etc/supervisor/conf.d/openphalanx.conf
 COPY server/start-sglang.sh /opt/openphalanx/start-sglang.sh

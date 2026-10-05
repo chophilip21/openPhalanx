@@ -191,7 +191,8 @@
       <span class="tip-box">
         <strong>Split model</strong> (default): one model, its layers spread across the servers. Load models
         bigger than any one machine (e.g. a 32B coder on a 24 GB + 16 GB pair). About single-GPU speed;
-        needs every server up and a fast wired network.
+        needs every server up and a fast wired network. The servers' traffic to each other isn't
+        authenticated, so use it only on a network you trust.
         <br /><br />
         <strong>Replicas</strong>: every server runs its own full copy, and requests are spread across them.
         More users and parallel agents at full speed, and service continues if a server drops out; the

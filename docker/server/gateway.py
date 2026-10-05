@@ -838,20 +838,22 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
             content={"error": {"message": "The server is busy with other requests; try again shortly.", "type": "server_busy"}},
             headers={"retry-after": "10"},
         )
-    devices.touch(device)
     metrics.requests_total += 1
     metrics.requests_active += 1
     metrics.last_request_at = time.time()
     try:
+        # Inside the try: a failed devices.json write (full disk) must not
+        # keep the slots taken.
+        devices.touch(device)
         if auto_search:
             resp = await _send_with_auto_search(body, device)
         else:
             resp = await _send(body)
-    except (httpx.HTTPError, asyncio.CancelledError) as e:
+    except BaseException as e:
         metrics.requests_active -= 1
         metrics.requests_failed += 1
         _release(device["id"])
-        if isinstance(e, asyncio.CancelledError):
+        if not isinstance(e, httpx.HTTPError):
             raise
         return openai_error(503, "The model is still loading; try again shortly.", "service_unavailable")
     if resp.status_code >= 400:

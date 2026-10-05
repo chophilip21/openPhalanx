@@ -514,7 +514,24 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
     // A host asks its members to have the same model on disk (they download
     // it from the same pinned commit if they don't).
     if let Some(c) = state.cluster.as_ref().filter(|c| !c.is_member()) {
-        let _ = c.set_desired_model(model_spec(&settings));
+        let spec = model_spec(&settings);
+        let _ = c.set_desired_model(spec.clone());
+        // Members answer on their next report (every 5 s): wait for each
+        // online one to report on this model, so the split check below sees
+        // whether it's there instead of the previous model.
+        if let Some(spec) = spec.filter(|_| c.role() == Role::Host && c.strategy() == Strategy::Split) {
+            for _ in 0..16 {
+                let pending = c.members().iter().filter(|m| m.online).any(|m| {
+                    !m.report.as_ref().and_then(|r| r.model_sync.as_ref()).is_some_and(|s| {
+                        s.repo == spec.repo && s.revision == spec.revision && s.state != "checking"
+                    })
+                });
+                if !pending {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
     }
     let mut pf = server::preflight(&settings).await;
     let plan = plan_split(&state, &settings, &mut pf);
