@@ -130,7 +130,7 @@ pub struct ModelSync {
     pub label: String,
     pub repo: String,
     pub revision: String,
-    /// "checking", "downloading", "ready" or "error".
+    /// "checking", "missing" (waiting for the host to approve a download), "downloading", "ready" or "error".
     pub state: String,
     pub done_bytes: u64,
     pub total_bytes: u64,
@@ -314,9 +314,13 @@ struct Persisted {
     /// As host (or standalone): how this cluster uses its GPUs.
     #[serde(default)]
     strategy: Strategy,
-    /// As host: the model members should have on disk (set when the host starts serving).
+    /// As host: the model members should have on disk (follows the host's
+    /// selected model).
     #[serde(default)]
     desired_model: Option<ModelSpec>,
+    /// As host: the user agreed that members without it download it.
+    #[serde(default)]
+    download_approved: bool,
 }
 
 /// A member, as its host stores it (`members.json`).
@@ -447,6 +451,8 @@ pub struct ClusterView {
     pub discovery_error: Option<String>,
     /// As host: the model members are asked to have.
     pub desired_model: Option<ModelSpec>,
+    /// As host: members that lack it may download it.
+    pub download_approved: bool,
     /// As member: this machine's copy of the host's model.
     pub model_sync: Option<ModelSync>,
     /// As member: the host is running the cluster's server, so this machine
@@ -490,6 +496,9 @@ struct ReportReply {
     /// The model members should have on disk.
     #[serde(default)]
     ensure_model: Option<ModelSpec>,
+    /// They may download it if they lack it (the user agreed on the host).
+    #[serde(default)]
+    allow_download: bool,
     /// The host's server is running or starting: members can't start theirs.
     #[serde(default)]
     host_serving: bool,
@@ -567,6 +576,7 @@ impl Cluster {
                 trusted_hosts: Vec::new(),
                 strategy: Strategy::default(),
                 desired_model: None,
+                download_approved: false,
             },
         };
         let members = match std::fs::read(dir.join("members.json")) {
@@ -660,7 +670,23 @@ impl Cluster {
     /// starts serving; members that lack it download it (verified, from the
     /// same pinned commit) and report progress. `None` stops asking.
     pub fn set_desired_model(&self, model: Option<ModelSpec>) -> Result<()> {
-        self.state.lock().unwrap().desired_model = model;
+        {
+            let mut st = self.state.lock().unwrap();
+            let same = st.desired_model.as_ref().map(|m| (&m.repo, &m.revision)) == model.as_ref().map(|m| (&m.repo, &m.revision));
+            if same {
+                return Ok(());
+            }
+            // A new model: members only check for it until the user agrees
+            // to download it where it's missing.
+            st.desired_model = model;
+            st.download_approved = false;
+        }
+        self.save_state()
+    }
+
+    /// As host: members that lack the cluster's model may download it.
+    pub fn approve_download(&self) -> Result<()> {
+        self.state.lock().unwrap().download_approved = true;
         self.save_state()
     }
 
@@ -1208,7 +1234,10 @@ impl Cluster {
         let host_link = matches!(role, Role::Member { .. }).then(|| self.host_link.lock().unwrap().clone());
         // Read these before building the view: a lock taken inside the struct
         // literal is held until the literal ends.
-        let desired_model = self.state.lock().unwrap().desired_model.clone();
+        let (desired_model, download_approved) = {
+            let st = self.state.lock().unwrap();
+            (st.desired_model.clone(), st.download_approved)
+        };
         let locked_by_host = self.is_member() && *self.host_serving.lock().unwrap();
         ClusterView {
             id: self.id(),
@@ -1225,6 +1254,7 @@ impl Cluster {
             host_link,
             discovery_error: self.discovery_error.lock().unwrap().clone(),
             desired_model,
+            download_approved,
             model_sync: self.sync.lock().unwrap().clone(),
             locked_by_host,
         }
@@ -1447,7 +1477,7 @@ impl Cluster {
                         }
                         if let Ok(reply) = resp.json::<ReportReply>().await {
                             if let Some(spec) = reply.ensure_model.clone() {
-                                self.clone().ensure_model(spec);
+                                self.clone().ensure_model(spec, reply.allow_download);
                             }
                             if let Some(fp) = reply.expect_host {
                                 *self.expect_host.lock().unwrap() = Some((fp, now() + INVITE_TTL_SECS));
@@ -1514,7 +1544,7 @@ impl Cluster {
     /// As member: makes sure the host's model is on disk. Already present
     /// (the app's models folder or the Hugging Face cache) → ready; otherwise
     /// downloads it, resumable and verified, from the same pinned commit.
-    fn ensure_model(self: Arc<Self>, spec: ModelSpec) {
+    fn ensure_model(self: Arc<Self>, spec: ModelSpec, allow_download: bool) {
         if let Err(e) = spec.check() {
             let mut sync = self.sync.lock().unwrap();
             // Reported once; the host repeats the request every few seconds.
@@ -1534,10 +1564,13 @@ impl Cluster {
         }
         {
             let sync = self.sync.lock().unwrap();
-            let same = sync.as_ref().is_some_and(|s| s.repo == spec.repo && s.revision == spec.revision);
-            // Working on it, or done: nothing to do. A failed one is retried.
-            if same && sync.as_ref().is_some_and(|s| s.state != "error") {
-                return;
+            let same = sync.as_ref().filter(|s| s.repo == spec.repo && s.revision == spec.revision);
+            // Working on it, or done: nothing to do. A failed one is retried,
+            // and a missing one is fetched once the host allows it.
+            if let Some(s) = same {
+                if s.state != "error" && !(s.state == "missing" && allow_download) {
+                    return;
+                }
             }
         }
         if let Some(cancel) = self.sync_cancel.lock().unwrap().take() {
@@ -1547,6 +1580,12 @@ impl Cluster {
         if crate::model::find_installed(&spec.repo, Some(&spec.revision)).is_some() {
             *self.sync.lock().unwrap() = Some(ModelSync { state: "ready".into(), ..base });
             self.log(format!("{} is already on this machine", spec.label));
+            return;
+        }
+        if !allow_download {
+            // Report it missing; the host asks its user before a download.
+            *self.sync.lock().unwrap() = Some(ModelSync { state: "missing".into(), total_bytes: spec.weight_bytes, ..base });
+            self.log(format!("{} isn't on this machine; waiting for the host to approve a download", spec.label));
             return;
         }
         *self.sync.lock().unwrap() = Some(ModelSync { state: "checking".into(), ..base.clone() });
@@ -1847,10 +1886,13 @@ async fn report_handler(
     };
     c.record_report(&id, report);
     let expect_host = c.handover.lock().unwrap().clone().filter(|(_, until)| *until > now()).map(|(fp, _)| fp);
-    let ensure_model = c.state.lock().unwrap().desired_model.clone();
+    let (ensure_model, allow_download) = {
+        let st = c.state.lock().unwrap();
+        (st.desired_model.clone(), st.download_approved)
+    };
     let host_serving = c.control.lock().unwrap().serving;
     let worker = c.workers.lock().unwrap().get(&id).cloned();
-    Json(ReportReply { expect_host, strategy: Some(c.strategy()), ensure_model, host_serving, worker }).into_response()
+    Json(ReportReply { expect_host, strategy: Some(c.strategy()), ensure_model, allow_download, host_serving, worker }).into_response()
 }
 
 async fn take_over_handler(State(c): State<Arc<Cluster>>, headers: HeaderMap, Json(peer): Json<Peer>) -> Response {
@@ -2063,7 +2105,36 @@ mod tests {
         let (dir, c) = cluster();
         let spec = ModelSpec { key: "k".into(), label: "M".into(), repo: "org/m".into(), revision: "abc".into(), weight_bytes: 1 };
         c.set_desired_model(Some(spec.clone())).unwrap();
-        assert_eq!(Cluster::open(dir.path()).unwrap().view().desired_model, Some(spec));
+        assert_eq!(Cluster::open(dir.path()).unwrap().view().desired_model, Some(spec.clone()));
+
+        // Downloads need the user's yes, which a new model resets.
+        assert!(!c.view().download_approved);
+        c.approve_download().unwrap();
+        c.set_desired_model(Some(spec.clone())).unwrap();
+        assert!(c.view().download_approved, "same model: still approved");
+        c.set_desired_model(Some(ModelSpec { revision: "def".into(), ..spec })).unwrap();
+        assert!(!Cluster::open(dir.path()).unwrap().view().download_approved, "another model asks again");
+    }
+
+    #[test]
+    fn a_member_reports_a_missing_model_and_downloads_only_when_allowed() {
+        let (_d, c) = cluster();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let spec = ModelSpec {
+            key: "k".into(),
+            label: "M".into(),
+            repo: "openphalanx-test/does-not-exist".into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            weight_bytes: 5,
+        };
+        rt.block_on(async { c.clone().ensure_model(spec.clone(), false) });
+        let sync = c.sync.lock().unwrap().clone().unwrap();
+        assert_eq!((sync.state.as_str(), sync.total_bytes), ("missing", 5));
+        assert!(c.sync_cancel.lock().unwrap().is_none(), "nothing downloads without approval");
+        rt.block_on(async { c.clone().ensure_model(spec.clone(), false) });
+        assert!(c.sync_cancel.lock().unwrap().is_none(), "asking again doesn't start it either");
+        rt.block_on(async { c.clone().ensure_model(spec, true) });
+        assert!(c.sync_cancel.lock().unwrap().is_some(), "approved: the download starts");
     }
 
     #[test]
@@ -2227,7 +2298,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut spec = order().model;
         spec.repo = "../../.config".into();
-        rt.block_on(async { c.clone().ensure_model(spec.clone()) });
+        rt.block_on(async { c.clone().ensure_model(spec.clone(), true) });
         let sync = c.sync.lock().unwrap().clone().unwrap();
         assert_eq!(sync.state, "error");
         assert!(sync.error.unwrap().contains("not a valid Hugging Face repo"));

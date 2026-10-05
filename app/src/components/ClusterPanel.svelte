@@ -254,8 +254,8 @@
         {#if c.busy}
           <span class="badge neutral">In another cluster</span>
         {:else if role.role !== "member"}
-          <button disabled={!!busy} onclick={() => act(`add:${c.id}`, () => api.clusterInvite(c.id), `Invited ${c.name}. It joins once someone approves there.`)}>
-            <Icon name="plus" size={13} /> Add to cluster
+          <button class="primary add" disabled={!!busy} onclick={() => act(`add:${c.id}`, () => api.clusterInvite(c.id), `Invited ${c.name}. It joins once someone approves there.`)}>
+            <Icon name="plus" size={14} stroke={2.6} /> Add to cluster
           </button>
           <button class="ghost" disabled={!!busy} title="Ask it to host this machine{memberCount ? ' and its members' : ''}"
             onclick={() => act(`host:${c.id}`, () => api.clusterMakeHost(c.id), `Asked ${c.name} to host. Approve it on that machine.`)}>
@@ -291,6 +291,16 @@
   /* Not in it: dashed outline, so it reads as "available". */
   .server.available { background: transparent; border: 1px dashed var(--border); }
   .server.available.busy { opacity: 0.55; }
+  .server.available:not(.busy):hover { border-color: var(--on); }
+  /* The main action on an available server: filled green with a soft glow. */
+  .server button.add { padding: 7px 14px; font-size: 13px; box-shadow: 0 0 0 0 var(--on-glow); animation: add-glow 2.4s ease-in-out infinite; }
+  .server button.add:hover:not(:disabled) { animation: none; box-shadow: 0 0 0 4px var(--on-glow); }
+  .server button.add:disabled { animation: none; }
+  @keyframes add-glow {
+    0%, 100% { box-shadow: 0 0 0 0 var(--on-glow); }
+    50% { box-shadow: 0 0 0 5px var(--on-glow); }
+  }
+  @media (prefers-reduced-motion: reduce) { .server button.add { animation: none; } }
   .eyebrow.in { color: var(--on); }
   .badge.host { color: var(--link); background: var(--surface); }
   .server-text { display: flex; flex-direction: column; flex: 1; min-width: 180px; }

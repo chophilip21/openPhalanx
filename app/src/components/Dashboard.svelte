@@ -141,6 +141,8 @@
                             {:else if s.state === "downloading"}
                               ↓ {s.label} · {s.total_bytes ? Math.floor((100 * s.done_bytes) / s.total_bytes) : 0}% · {rate(s.bytes_per_sec)}
                               <span class="sync-bar"><i style="width:{s.total_bytes ? (100 * s.done_bytes) / s.total_bytes : 0}%"></i></span>
+                            {:else if s.state === "missing"}
+                              ✗ {s.label} not on this machine (download from the Server page)
                             {:else if s.state === "error"}
                               ! {s.label}: download failed, retrying
                             {:else}
@@ -258,6 +260,7 @@
   .sync.ready { color: var(--on); }
   .sync.downloading { color: var(--link); }
   .sync.error { color: var(--bad); }
+  .sync.missing { color: var(--busy); }
   .sync-bar { height: 4px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
   .sync-bar i { display: block; height: 100%; background: var(--link); }
   .row-actions { display: flex; gap: 2px; margin: 2px 0 0 -6px; }

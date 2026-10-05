@@ -381,6 +381,7 @@ async fn get_snapshot(app: AppHandle) -> Snapshot {
 #[tauri::command]
 async fn get_preflight(state: State<'_, AppState>) -> CmdResult<server::Preflight> {
     let settings = state.settings();
+    follow_selection(&state, &settings);
     let mut pf = server::preflight(&settings).await;
     plan_split(&state, &settings, &mut pf);
     Ok(pf)
@@ -404,6 +405,14 @@ fn model_spec(settings: &Settings) -> Option<cluster::ModelSpec> {
         revision: m.revision.clone()?,
         weight_bytes: m.weight_bytes,
     })
+}
+
+/// As host: the model members are asked for is the one selected here (also
+/// after a restart, or a selection made before this machine was host).
+fn follow_selection(state: &AppState, settings: &Settings) {
+    if let Some(c) = state.cluster.as_ref().filter(|c| c.role() == Role::Host) {
+        let _ = c.set_desired_model(model_spec(settings));
+    }
 }
 
 /// Split strategy, as host with online members: a model that doesn't fit
@@ -436,6 +445,14 @@ fn plan_split(state: &AppState, settings: &Settings, pf: &mut server::Preflight)
             }
             match &r.model_sync {
                 Some(s) if s.repo == spec.repo && s.revision == spec.revision && s.state == "ready" => {}
+                Some(s) if s.repo == spec.repo && s.revision == spec.revision && s.state == "missing" => {
+                    return Err(format!(
+                        "{} doesn't have {} ({}). Download it there first; Start offers to.",
+                        n.name,
+                        spec.label,
+                        vram::fmt_gib(spec.weight_bytes)
+                    ));
+                }
                 Some(s) if s.repo == spec.repo && s.revision == spec.revision && s.state == "downloading" => {
                     let pct = (s.done_bytes * 100).checked_div(s.total_bytes).unwrap_or(0);
                     return Err(format!("{} is still downloading {} ({pct}%). Start again when it's done.", n.name, spec.label));
@@ -448,12 +465,7 @@ fn plan_split(state: &AppState, settings: &Settings, pf: &mut server::Preflight)
                         s.error.clone().unwrap_or_default()
                     ));
                 }
-                _ => {
-                    return Err(format!(
-                        "{} doesn't have {} yet; it starts downloading it now. Start again when it's done.",
-                        n.name, spec.label
-                    ))
-                }
+                _ => return Err(format!("checking whether {} has {}…", n.name, spec.label)),
             }
         }
         let dir = model.installed_dir.as_deref().ok_or("The model isn't downloaded on this machine.")?;
@@ -475,8 +487,7 @@ fn plan_split(state: &AppState, settings: &Settings, pf: &mut server::Preflight)
                 vram::fmt_gib(fit.free_bytes),
                 split::describe(&plan.stages)
             );
-            let running = !pf.can_start && pf.checks.iter().all(|c| c.status != CheckStatus::Fail);
-            pf.can_start = !running && pf.checks.iter().all(|c| c.status != CheckStatus::Fail);
+            pf.can_start = !pf.running && pf.checks.iter().all(|c| c.status != CheckStatus::Fail);
             Some(plan)
         }
         Err(reason) => {
@@ -514,8 +525,8 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
     // A host asks its members to have the same model on disk (they download
     // it from the same pinned commit if they don't).
     if let Some(c) = state.cluster.as_ref().filter(|c| !c.is_member()) {
+        follow_selection(&state, &settings);
         let spec = model_spec(&settings);
-        let _ = c.set_desired_model(spec.clone());
         // Members answer on their next report (every 5 s): wait for each
         // online one to report on this model, so the split check below sees
         // whether it's there instead of the previous model.
@@ -1205,6 +1216,12 @@ fn cluster_set_strategy(state: State<'_, AppState>, strategy: Strategy) -> CmdRe
     require_cluster(&state)?.set_strategy(strategy).map_err(err)
 }
 
+/// As host: members that lack the cluster's model may download it.
+#[tauri::command]
+fn cluster_approve_download(state: State<'_, AppState>) -> CmdResult<()> {
+    require_cluster(&state)?.approve_download().map_err(err)
+}
+
 /// A member's recent log lines (its backend and cluster events), as host.
 #[tauri::command]
 fn cluster_member_logs(state: State<'_, AppState>, id: String) -> CmdResult<Vec<String>> {
@@ -1272,6 +1289,7 @@ pub fn run() {
             cluster_dissolve,
             cluster_rename,
             cluster_set_strategy,
+            cluster_approve_download,
             cluster_member_logs,
         ])
         .build(tauri::generate_context!())

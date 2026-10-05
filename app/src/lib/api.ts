@@ -102,7 +102,8 @@ export type ModelSync = {
   label: string;
   repo: string;
   revision: string;
-  state: "checking" | "downloading" | "ready" | "error";
+  /** "missing": not on that machine; it waits for the host to approve a download. */
+  state: "checking" | "missing" | "downloading" | "ready" | "error";
   done_bytes: number;
   total_bytes: number;
   bytes_per_sec: number;
@@ -150,6 +151,8 @@ export type ClusterState = {
   host_link: { connected: boolean; last_ok: number | null; error: string | null } | null;
   discovery_error: string | null;
   desired_model: ModelSpec | null;
+  /** As host: members that lack the model may download it. */
+  download_approved: boolean;
   model_sync: ModelSync | null;
   /** This machine is a member and the host is serving: it can't start a server. */
   locked_by_host: boolean;
@@ -208,6 +211,8 @@ export type Check = {
 export type Preflight = {
   checks: Check[];
   can_start: boolean;
+  /** The backend is already running. */
+  running: boolean;
   gpu: GpuInfo | null;
   requirement: Requirement | null;
   fit: FitCheck | null;
@@ -320,6 +325,7 @@ export const api = {
   clusterRename: (name: string) => invoke<void>("cluster_rename", { name }),
   clusterMemberLogs: (id: string) => invoke<string[]>("cluster_member_logs", { id }),
   clusterSetStrategy: (strategy: ClusterStrategy) => invoke<void>("cluster_set_strategy", { strategy }),
+  clusterApproveDownload: () => invoke<void>("cluster_approve_download"),
 };
 
 export const events = {

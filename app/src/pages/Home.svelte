@@ -25,6 +25,30 @@
   const cluster = $derived(snap?.cluster ?? null);
   // A member whose host is serving: only the host starts the cluster's server.
   const locked = $derived(idle && !!cluster?.locked_by_host);
+  // As host: members that report the cluster's model missing, or fetching it.
+  const wanted = $derived(cluster?.role.role === "host" ? cluster.desired_model : null);
+  const copies = $derived(
+    (cluster?.members ?? [])
+      .filter((m) => m.online)
+      .map((m) => ({ name: m.name, sync: m.report?.model_sync ?? null }))
+      .filter((m) => wanted && m.sync?.repo === wanted.repo && m.sync?.revision === wanted.revision),
+  );
+  const missing = $derived(copies.filter((m) => m.sync?.state === "missing"));
+  const fetching = $derived(copies.filter((m) => m.sync?.state === "downloading"));
+  let approving = $state(false);
+  async function approveDownload() {
+    approving = true;
+    actionError = "";
+    try {
+      await api.clusterApproveDownload();
+    } catch (e) {
+      actionError = errorText(e);
+    } finally {
+      approving = false;
+    }
+  }
+  const pct = (s: { done_bytes: number; total_bytes: number }) =>
+    s.total_bytes ? Math.floor((100 * s.done_bytes) / s.total_bytes) : 0;
   const hostName = $derived(cluster?.role.role === "member" ? cluster.role.host.name : "");
 
   const headline = $derived(
@@ -113,6 +137,28 @@
             {/if}
           </span>
           <button class="ghost close" onclick={() => (nav.startHint = null)} aria-label="Dismiss"><Icon name="x" size={14} /></button>
+        </div>
+      {/if}
+
+      {#if idle && wanted && missing.length}
+        <div class="hint download-ask" role="status">
+          <Icon name="download" size={16} />
+          <span>
+            <strong>{missing.map((m) => m.name).join(", ")}</strong>
+            {missing.length === 1 ? "doesn't" : "don't"} have <strong>{wanted.label}</strong> ({gib(wanted.weight_bytes)}).
+            Download it there, so the model can be split across the cluster?
+          </span>
+          <button class="primary" disabled={approving} onclick={approveDownload}>
+            <Icon name="download" size={14} /> Download on {missing.length === 1 ? missing[0].name : "them"}
+          </button>
+        </div>
+      {:else if idle && fetching.length}
+        <div class="hint info" role="status">
+          <Icon name="download" size={16} />
+          <span>
+            {#each fetching as m, i}{i ? " · " : ""}<strong>{m.name}</strong> is downloading {wanted?.label}: {pct(m.sync!)}%{/each}.
+            Start when it's done.
+          </span>
         </div>
       {/if}
 
@@ -227,6 +273,8 @@
   .dot.running { background: var(--on); box-shadow: 0 0 10px var(--on); }
   .dot.starting, .dot.stopping, .dot.external { background: var(--busy); }
   .dot.error, .dot.paused { background: var(--bad); }
+  .download-ask { border-color: var(--on); background: var(--on-soft); }
+  .download-ask .primary { white-space: nowrap; display: inline-flex; gap: 6px; align-items: center; }
   .running-model { display: flex; justify-content: center; margin: 2px 0 6px; }
   .locked-note { color: var(--violet); display: inline-flex; gap: 6px; align-items: baseline; max-width: 560px; }
   .paused-note { color: var(--bad); display: inline-flex; gap: 6px; align-items: baseline; max-width: 560px; font-weight: 500; }

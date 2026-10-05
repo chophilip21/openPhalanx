@@ -128,6 +128,8 @@ impl Check {
 pub struct Preflight {
     pub checks: Vec<Check>,
     pub can_start: bool,
+    /// The backend is already running (`can_start` is false for that alone).
+    pub running: bool,
     pub gpu: Option<GpuInfo>,
     pub gpus: Vec<GpuInfo>,
     pub model: Option<ResolvedModel>,
@@ -240,7 +242,7 @@ pub async fn preflight(settings: &Settings) -> Preflight {
     }
 
     let can_start = !running && checks.iter().all(|c| c.status != Fail);
-    Preflight { checks, can_start, gpu, gpus, model, requirement, fit, image_present }
+    Preflight { checks, can_start, running, gpu, gpus, model, requirement, fit, image_present }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -275,7 +277,7 @@ pub async fn start(
     if let Some(check) = blocking {
         bail!(check.detail.clone());
     }
-    if !pf.can_start && pf.checks.iter().all(|c| c.status != CheckStatus::Fail) {
+    if pf.running {
         bail!("The backend is already running.");
     }
     if pf.model.as_ref().and_then(|m| m.installed_dir.as_ref()).is_none() {
