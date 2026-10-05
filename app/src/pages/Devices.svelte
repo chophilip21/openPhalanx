@@ -2,7 +2,7 @@
   import { ask } from "@tauri-apps/plugin-dialog";
   import Icon from "../components/Icon.svelte";
   import { api, errorText, type Device } from "../lib/api";
-  import { ago, tokens } from "../lib/format";
+  import { ago, tokens, until } from "../lib/format";
   import { app } from "../lib/store.svelte";
 
   let devices = $state<Device[]>([]);
@@ -25,6 +25,37 @@
     const t = setInterval(refresh, 5000);
     return () => clearInterval(t);
   });
+
+  // How long pairings last; clients pair again after that.
+  const TTLS: { days: number | null; label: string }[] = [
+    { days: 1, label: "1 day" },
+    { days: 7, label: "1 week" },
+    { days: 30, label: "1 month" },
+    { days: 365, label: "1 year" },
+    { days: null, label: "Never expire" },
+  ];
+  const ttl = $derived(app.snapshot?.settings.pairing_ttl_days === undefined ? 7 : app.snapshot.settings.pairing_ttl_days);
+  let savingTtl = $state(false);
+  async function setTtl(value: string) {
+    const days = value === "never" ? null : Number(value);
+    if (days === null) {
+      const yes = await ask("Paired clients will stay paired until you revoke them. Continue?", {
+        title: "Never expire pairings",
+        kind: "warning",
+      });
+      if (!yes) return;
+    }
+    savingTtl = true;
+    error = "";
+    try {
+      await api.setPairingTtl(days);
+      await refresh();
+    } catch (e) {
+      error = errorText(e);
+    } finally {
+      savingTtl = false;
+    }
+  }
 
   async function revoke(d: Device) {
     const yes = await ask(`Revoke "${d.name}"? It will need a new pairing code to connect again.`, {
@@ -54,6 +85,22 @@
     </p>
   {/if}
 
+  <div class="card ttl">
+    <div class="ttl-text">
+      <span class="eyebrow">Pairing expiry</span>
+      <span class="muted small">
+        A client's pairing ends after this long, counted from when it paired; it then needs a new pairing code.
+        Changing it applies to every paired client at once.
+      </span>
+    </div>
+    <select value={ttl === null ? "never" : String(ttl)} disabled={savingTtl}
+      onchange={(e) => setTtl(e.currentTarget.value)} aria-label="Pairing expiry">
+      {#each TTLS as t}
+        <option value={t.days === null ? "never" : String(t.days)}>{t.label}{t.days === 7 ? " (default)" : ""}</option>
+      {/each}
+    </select>
+  </div>
+
   {#if !available}
     <div class="card empty muted">
       <Icon name="laptop" size={28} />
@@ -75,7 +122,12 @@
               <span class="title">{d.name}</span>
               <span class="muted small mono">{d.id}</span>
             </span>
-            <span class="muted small">Paired {ago(d.created_at)}</span>
+            <span class="small expiry" class:soon={d.expires_at !== null && d.expires_at - Date.now() / 1000 < 86400}
+              class:expired={d.expires_at !== null && d.expires_at <= Date.now() / 1000}
+              title={d.expires_at ? `Pairing expires ${new Date(d.expires_at * 1000).toLocaleString()}` : "Pairing never expires"}>
+              <span class="muted">Paired {ago(d.created_at)}</span>
+              <span>{d.expires_at === null ? "never expires" : until(d.expires_at) === "expired" ? "expired: pair again" : `expires ${until(d.expires_at)}`}</span>
+            </span>
             <span class="muted small">Last seen {ago(d.last_seen)}</span>
             <span class="muted small" title="Prompt / generated tokens (counted when the client reports usage)">
               {d.requests} request{d.requests === 1 ? "" : "s"} · {tokens(d.prompt_tokens)} in / {tokens(d.completion_tokens)} out{d.web_searches ? ` · ${d.web_searches} searches` : ""}
@@ -97,6 +149,12 @@
   .name { display: flex; flex-direction: column; }
   .title { font-weight: 600; }
   .small { font-size: 12.5px; }
+  .ttl { display: flex; align-items: center; gap: 16px; padding: 14px 18px; margin-bottom: 16px; flex-wrap: wrap; }
+  .ttl-text { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 240px; }
+  .ttl select { min-width: 170px; }
+  .expiry { display: flex; flex-direction: column; }
+  .expiry.soon span:last-child { color: var(--warn-text, var(--busy)); }
+  .expiry.expired span:last-child { color: var(--bad); font-weight: 600; }
   .fp { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; margin: -12px 0 20px; }
   .fp .mono { word-break: break-all; }
 </style>

@@ -349,6 +349,7 @@ pub async fn start(
         edit_format: model.edit_format.clone().unwrap_or_else(|| DEFAULT_EDIT_FORMAT.to_string()),
         reasoning_parser: model.reasoning_parser.clone(),
         dtype: model.dtype.clone(),
+        pairing_ttl_days: settings.pairing_ttl_days,
         split: split.map(|s| s.rank),
     })
     .await

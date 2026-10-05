@@ -197,6 +197,8 @@ pub struct RunSpec {
     pub reasoning_parser: Option<String>,
     /// SGLang `--dtype` override.
     pub dtype: Option<String>,
+    /// Days a client pairing lasts (`None`: never).
+    pub pairing_ttl_days: Option<u32>,
     /// Rank 0 of a model split across servers.
     pub split: Option<SplitRank>,
 }
@@ -288,6 +290,7 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
         ("AGENT_PORT", spec.agent_port.to_string()),
         ("ADMIN_PORT", ADMIN_PORT.to_string()),
         ("ADMIN_TOKEN", spec.admin_token.clone()),
+        ("DEVICE_TTL_DAYS", spec.pairing_ttl_days.map_or_else(|| "never".to_string(), |d| d.to_string())),
         // Weights are always fetched by the GUI; never let SGLang download.
         ("HF_HUB_OFFLINE", "1".into()),
     ] {
@@ -575,6 +578,7 @@ mod tests {
             edit_format: "diff".into(),
             reasoning_parser: Some("qwen3".into()),
             dtype: None,
+            pairing_ttl_days: Some(7),
             split: None,
         }
     }
@@ -597,6 +601,8 @@ mod tests {
         assert!(a.contains("-v /m:/m:ro") && a.contains("-v /blobs:/blobs:ro"));
         assert!(a.contains("-e MEM_FRACTION_STATIC=0.812"));
         assert!(a.contains("-e HF_HUB_OFFLINE=1"));
+        assert!(a.contains("-e DEVICE_TTL_DAYS=7"));
+        assert!(run_args(&RunSpec { pairing_ttl_days: None, ..spec() }).join(" ").contains("-e DEVICE_TTL_DAYS=never"));
         assert!(a.contains("--network openphalanx"));
         assert!(a.contains("-e SEARXNG_URL=http://openphalanx-searxng:8080"));
         assert!(a.contains("-e MODEL_ID=Qwen/X") && a.contains("-e EDIT_FORMAT=diff"));

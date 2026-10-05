@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::vram::{fmt_gib, Requirement};
+use crate::vram::{fmt_gib, runtime_overhead, Requirement, RUNTIME_BASE, RUNTIME_PER_WEIGHT};
 
 /// torch's rendezvous on the host (rank 0). SGLang also uses the next few
 /// ports for its own sockets, so `DIST_PORT..DIST_PORT+16` must be free.
@@ -68,9 +68,12 @@ pub struct Stage {
 }
 
 /// Splits `shape.layers` across `nodes` (in rank order, the host first) in
-/// proportion to the VRAM each can give after its fixed costs: runtime
-/// memory on every server, the embedding on the first, the output head on
-/// the last. Every server gets at least one layer.
+/// proportion to the VRAM each can give after its fixed costs: the fixed
+/// runtime memory on every server, the embedding on the first, the output
+/// head on the last. Runtime memory that grows with the weights is charged
+/// per server for the weights it holds (charging every server for the whole
+/// model left SGLang a KV cache shorter than the context window, with
+/// gigabytes unused). Every server gets at least one layer.
 pub fn plan(req: &Requirement, shape: &ModelShape, nodes: &[Capacity]) -> Result<Vec<Stage>, String> {
     let n = nodes.len();
     let total_layers = shape.layers.max(1);
@@ -84,8 +87,9 @@ pub fn plan(req: &Requirement, shape: &ModelShape, nodes: &[Capacity]) -> Result
     let body_weights = req.weight_bytes.saturating_sub(2 * shape.embed_bytes);
     let layer_weights = body_weights.div_ceil(u64::from(total_layers));
     let layer_kv = req.kv_bytes.div_ceil(u64::from(total_layers));
-    let per_layer = (layer_weights + layer_kv).max(1);
-    let fixed = |i: usize| req.overhead_bytes + ends(i);
+    let with_runtime = |w: u64| w + (w as f64 * RUNTIME_PER_WEIGHT) as u64;
+    let per_layer = (with_runtime(layer_weights) + layer_kv).max(1);
+    let fixed = |i: usize| RUNTIME_BASE + with_runtime(ends(i));
 
     let caps: Vec<u64> = nodes.iter().enumerate().map(|(i, c)| c.free_bytes.saturating_sub(fixed(i)) / per_layer).collect();
     if let Some((i, _)) = caps.iter().enumerate().find(|(_, c)| **c == 0) {
@@ -125,6 +129,7 @@ pub fn plan(req: &Requirement, shape: &ModelShape, nodes: &[Capacity]) -> Result
         .map(|(i, c)| {
             let weight_bytes = ends(i) + layers[i] * layer_weights;
             let kv_bytes = layers[i] * layer_kv;
+            let overhead_bytes = runtime_overhead(weight_bytes);
             Stage {
                 id: c.id.clone(),
                 name: c.name.clone(),
@@ -134,7 +139,8 @@ pub fn plan(req: &Requirement, shape: &ModelShape, nodes: &[Capacity]) -> Result
                 requirement: Requirement {
                     weight_bytes,
                     kv_bytes,
-                    total_bytes: weight_bytes + kv_bytes + req.overhead_bytes,
+                    overhead_bytes,
+                    total_bytes: weight_bytes + kv_bytes + overhead_bytes,
                     ..*req
                 },
             }
@@ -220,6 +226,9 @@ mod tests {
     fn one_server_gets_everything() {
         let stages = plan(&req(), &SHAPE, &[node("a", 40 * GIB)]).unwrap();
         assert_eq!(stages[0].layers, 64);
-        assert!(stages[0].requirement.total_bytes <= 30 * GIB);
+        let r = stages[0].requirement;
+        assert!(r.weight_bytes.abs_diff(req().weight_bytes) < GIB / 8, "all the weights, rounding aside");
+        assert_eq!(r.overhead_bytes, runtime_overhead(r.weight_bytes));
+        assert_eq!(r.total_bytes, r.weight_bytes + r.kv_bytes + r.overhead_bytes);
     }
 }

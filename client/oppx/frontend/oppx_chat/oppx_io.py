@@ -81,6 +81,8 @@ SUPPRESS = [
 # What the user should do when the server refuses a request. Keys are what
 # server_problem() returns; Aider's own follow-up hints map to "" (hidden).
 SERVER_PROBLEMS = {
+    "expired": f"This device's pairing with {SERVER} expired (the server app sets how long pairings last). "
+    "Pair again with a new code from the app: oppx pair <server> <code> --force",
     "revoked": f"This device is no longer paired with {SERVER}: it was revoked on the server. "
     "Pair again with a new code from the app: oppx pair <server> <code> --force",
     "loading": f"{SERVER} is starting up or busy, so it can't answer yet. "
@@ -107,6 +109,8 @@ def server_problem(message: str) -> str | None:
     if "cannot reach the OpenPhalanx server" in text or "Connection refused" in text or "ConnectError" in text:
         return "unreachable"
     code = re.search(r"Error code: (\d{3})", text)
+    if "pairing expired" in text:
+        return "expired"
     if "missing or invalid device token" in text or (code and code.group(1) == "401"):
         return "revoked"
     if (code and code.group(1) in ("502", "503")) or "ServiceUnavailableError" in text or "model is still loading" in text:
@@ -201,7 +205,7 @@ class OppxIO(InputOutput):
             return False
         if kind and not UI.server_error:
             UI.server_error = kind
-            step(SERVER_PROBLEMS[kind], RED if kind == "revoked" else YELLOW)
+            step(SERVER_PROBLEMS[kind], RED if kind in ("revoked", "expired") else YELLOW)
         return True
 
     def rule(self):

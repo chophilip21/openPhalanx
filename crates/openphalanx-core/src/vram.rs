@@ -116,7 +116,7 @@ pub fn requirement(
     let factor = WEIGHT_LOAD_FACTOR * if fp8_upcast { 2.0 } else { 1.0 };
     let weight_bytes = (download_bytes as f64 * factor) as u64;
     let kv_bytes = (arch.kv_bytes_per_token() as f64 * context_len as f64 * KV_HEADROOM) as u64;
-    let overhead_bytes = RUNTIME_BASE + (weight_bytes as f64 * RUNTIME_PER_WEIGHT) as u64;
+    let overhead_bytes = runtime_overhead(weight_bytes);
     Requirement {
         context_len,
         download_bytes,
@@ -128,11 +128,17 @@ pub fn requirement(
     }
 }
 
+/// Runtime memory next to `weight_bytes` of weights: CUDA context,
+/// activations and graphs (grows with the weights a GPU holds).
+pub fn runtime_overhead(weight_bytes: u64) -> u64 {
+    RUNTIME_BASE + (weight_bytes as f64 * RUNTIME_PER_WEIGHT) as u64
+}
+
 /// The need when one model is split across `servers` machines (pipeline
-/// parallel): weights and KV cache are shared out, but every machine pays its
-/// own runtime memory (CUDA context, activations, graphs).
+/// parallel): weights, KV cache and the runtime memory that grows with the
+/// weights are shared out, but every machine pays the fixed part again.
 pub fn split_across(req: &Requirement, servers: u32) -> Requirement {
-    let extra = req.overhead_bytes * u64::from(servers.max(1) - 1);
+    let extra = RUNTIME_BASE * u64::from(servers.max(1) - 1);
     Requirement {
         overhead_bytes: req.overhead_bytes + extra,
         total_bytes: req.total_bytes + extra,
@@ -343,6 +349,6 @@ mod tests {
         let two = split_across(&one, 2);
         assert_eq!(two.weight_bytes, one.weight_bytes);
         assert_eq!(two.kv_bytes, one.kv_bytes);
-        assert_eq!(two.total_bytes, one.total_bytes + one.overhead_bytes);
+        assert_eq!(two.total_bytes, one.total_bytes + RUNTIME_BASE);
     }
 }

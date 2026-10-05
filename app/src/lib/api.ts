@@ -68,6 +68,8 @@ export type Settings = {
   agent_port: number;
   image: string | null;
   web_search: boolean;
+  /** Days a client pairing lasts; null: never expires. */
+  pairing_ttl_days: number | null;
 };
 
 /** A server's hardware, as it reports it. */
@@ -289,6 +291,8 @@ export type Device = {
   prompt_tokens: number;
   completion_tokens: number;
   web_searches: number;
+  /** When its pairing expires (unix seconds); null: never. */
+  expires_at: number | null;
 };
 
 export const api = {
@@ -302,6 +306,7 @@ export const api = {
   clearPairingCode: () => invoke<Pairing>("clear_pairing_code"),
   devices: () => invoke<Device[]>("list_devices"),
   revokeDevice: (id: string) => invoke<void>("revoke_device", { id }),
+  setPairingTtl: (days: number | null) => invoke<Settings>("set_pairing_ttl", { days }),
   models: () => invoke<ModelsView>("get_models"),
   selectModel: (key: string) => invoke<Settings>("select_model", { key }),
   setContextLen: (contextLen: number) => invoke<Settings>("set_context_len", { contextLen }),

@@ -700,6 +700,20 @@ async fn list_devices() -> CmdResult<Vec<admin::Device>> {
     require_admin().await?.devices().await.map_err(err)
 }
 
+/// How long client pairings last (`None`: never). Saved, and applied at once
+/// when the backend runs (it also gets it at every start).
+#[tauri::command]
+async fn set_pairing_ttl(state: State<'_, AppState>, days: Option<u32>) -> CmdResult<Settings> {
+    if !openphalanx_core::settings::PAIRING_TTL_CHOICES.contains(&days) {
+        return Err("Choose 1 day, 1 week, 1 month, 1 year or never.".into());
+    }
+    let settings = state.update_settings(|s| s.pairing_ttl_days = days)?;
+    if let Some(admin) = admin_client().await {
+        admin.set_pairing_ttl(days).await.map_err(err)?;
+    }
+    Ok(settings)
+}
+
 #[tauri::command]
 async fn revoke_device(id: String) -> CmdResult<()> {
     require_admin().await?.revoke(&id).await.map(|_| ()).map_err(err)
@@ -1266,6 +1280,7 @@ pub fn run() {
             new_pairing_code,
             clear_pairing_code,
             list_devices,
+            set_pairing_ttl,
             revoke_device,
             get_models,
             select_model,

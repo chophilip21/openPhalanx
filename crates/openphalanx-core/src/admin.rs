@@ -73,6 +73,9 @@ pub struct Device {
     pub completion_tokens: u64,
     #[serde(default)]
     pub web_searches: u64,
+    /// When its pairing expires (unix seconds); `None`: never.
+    #[serde(default)]
+    pub expires_at: Option<f64>,
 }
 
 pub struct AdminClient {
@@ -124,6 +127,19 @@ impl AdminClient {
 
     pub async fn revoke(&self, id: &str) -> Result<serde_json::Value> {
         self.call(reqwest::Method::DELETE, &format!("/admin/devices/{id}")).await
+    }
+
+    /// How long pairings last, for every device (`None`: never expire).
+    pub async fn set_pairing_ttl(&self, days: Option<u32>) -> Result<()> {
+        self.http
+            .put(format!("{}/admin/pairing-policy", self.base))
+            .header("x-admin-token", &self.token)
+            .json(&serde_json::json!({ "ttl_days": days }))
+            .send()
+            .await
+            .context("backend admin API is not reachable yet")?
+            .error_for_status()?;
+        Ok(())
     }
 }
 

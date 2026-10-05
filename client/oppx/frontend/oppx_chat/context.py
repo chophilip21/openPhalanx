@@ -1,10 +1,12 @@
 """Fits every request Aider builds into the model's context window, cheapest loss first."""
 
 import os
+import re
 import threading
 from pathlib import Path
 
 import aider.coders.base_coder as base_coder
+import aider.exceptions as aider_exceptions
 import httpx
 from rich.markup import escape
 
@@ -22,6 +24,10 @@ OUTPUT_RESERVE = 4096  # room left for the model's answer
 # real ratio (after the first answer), then that ratio plus a little slack.
 UNCALIBRATED_FACTOR = 1.10
 CALIBRATED_SLACK = 1.03
+# Uncalibrated and above this share of the budget: measure before sending.
+# The 1.10 guess was 20% short on Qwen3.6, whose first request then failed
+# again and again, so no answer ever came to calibrate from.
+CALIBRATE_FIRST_AT = 0.6
 MAP_MAX, MAP_MIN = 8192, 1024  # repo map share of the budget (Aider alone allows ~28k)
 # File priorities: higher stays longer.
 PRI_MODEL, PRI_USER, PRI_EDITED = 1, 2, 3
@@ -45,6 +51,10 @@ class ContextManager:
         self.files = {}  # abs path -> [priority, last turn used]
         self.used = 0  # tokens of the last request, for the status bar
         self.notes = []  # what was done to make room this turn
+        # The server's own input limit, once a refusal has told us (it can be
+        # below the context window when its KV cache is smaller).
+        self.limit = None
+        self.overflow = None  # (tokens sent, limit) of this turn's refusal
 
     @property
     def factor(self) -> float:
@@ -54,11 +64,24 @@ class ContextManager:
 
     @property
     def budget(self) -> int:
-        return int((CONTEXT - OUTPUT_RESERVE) / self.factor)
+        room = CONTEXT - OUTPUT_RESERVE
+        if self.limit:
+            room = min(room, self.limit - 256)
+        return int(room / self.factor)
 
-    def calibrate(self, coder):
-        """Measures the request we just sent with the server's tokenizer, in
-        the background, so the budget matches whatever model is loaded."""
+    def overflowed(self, sent: int, limit: int):
+        """The server refused a request of ``sent`` tokens over its ``limit``:
+        learn the real tokenizer ratio from it, so the refit is right."""
+        self.overflow = (sent, limit)
+        self.limit = limit
+        if self.used > 500:
+            ratio = min(max(sent / self.used, 0.7), 1.5)
+            self.ratio = max(self.ratio or 0, ratio)
+
+    def calibrate(self, coder, wait: bool = False):
+        """Measures the request with the server's tokenizer, in the background
+        (or at once with ``wait``), so the budget matches whatever model is
+        loaded."""
         base, key = os.environ.get("OPENAI_API_BASE"), os.environ.get("OPENAI_API_KEY")
         if not base or not key:
             return
@@ -83,7 +106,10 @@ class ContextManager:
             ratio = min(max(count / estimate, 0.7), 1.5)
             self.ratio = ratio if self.ratio is None else 0.5 * self.ratio + 0.5 * ratio
 
-        threading.Thread(target=run, daemon=True).start()
+        if wait:
+            run()
+        else:
+            threading.Thread(target=run, daemon=True).start()
 
     def note(self, abs_path: str, priority: int):
         cur = self.files.get(abs_path)
@@ -146,6 +172,8 @@ class ContextManager:
             rm.map_mul_no_files = 1
             rm.max_map_tokens = self.map_tokens
         total = _raw_tokens(coder)
+        if self.ratio is None and total * UNCALIBRATED_FACTOR > CALIBRATE_FIRST_AT * (CONTEXT - OUTPUT_RESERVE):
+            self.calibrate(coder, wait=True)  # a large first request: measure, don't guess
         compacted = False
         set_aside = []
         while total > self.budget:
@@ -207,3 +235,37 @@ def _check_tokens(self, messages):
     step(f"This request needs about {n:,} tokens, more than the model's {CONTEXT:,}-token context "
          "even after making room. Drop files (/drop) or split the request.", RED)
     return False
+
+
+# SGLang's refusals of over-long input (both wordings; model-agnostic).
+_TOO_LONG = re.compile(
+    r"Input length \((\d+) tokens\) exceeds the maximum allowed length \((\d+) tokens\)"
+    r"|The input \((\d+) tokens\) is longer than the model's context length \((\d+) tokens\)"
+)
+_orig_get_ex_info = aider_exceptions.LiteLLMExceptions.get_ex_info
+
+
+def _get_ex_info(self, ex):
+    """An over-long request is a context overflow, not a connection problem:
+    Aider would otherwise retry the identical request with growing delays for
+    about a minute, with nothing on screen."""
+    m = _TOO_LONG.search(str(ex))
+    if m:
+        nums = [int(g) for g in m.groups() if g]
+        CONTEXT_MGR.overflowed(nums[0], nums[1])
+        return aider_exceptions.ExInfo("ContextWindowExceededError", False, None)
+    return _orig_get_ex_info(self, ex)
+
+
+aider_exceptions.LiteLLMExceptions.get_ex_info = _get_ex_info
+_orig_show_exhausted = base_coder.Coder.show_exhausted_error
+
+
+def _show_exhausted(self):
+    """Our own refusal handling (run_turn retries once) replaces Aider's
+    'context window exhausted' advice."""
+    if CONTEXT_MGR.overflow is None:
+        _orig_show_exhausted(self)
+
+
+base_coder.Coder.show_exhausted_error = _show_exhausted

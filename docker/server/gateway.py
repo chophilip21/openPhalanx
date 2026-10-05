@@ -108,6 +108,18 @@ TLS_DIR = STATE_DIR / "tls"
 CERT_PATH = TLS_DIR / "cert.pem"
 KEY_PATH = TLS_DIR / "key.pem"
 DEVICES_PATH = STATE_DIR / "devices.json"
+POLICY_PATH = STATE_DIR / "pairing_policy.json"
+
+
+def _ttl_days(raw: str | None) -> int | None:
+    """``DEVICE_TTL_DAYS``: whole days a pairing lasts; empty, 0 or "never"
+    for no expiry. Default one week."""
+    if raw is None:
+        return 7
+    raw = raw.strip().lower()
+    if raw in ("", "0", "never", "none"):
+        return None
+    return max(1, int(raw))
 # Usage counters are written at most this often (see DeviceStore).
 DEVICE_FLUSH_S = 5.0
 
@@ -134,12 +146,33 @@ class DeviceStore:
     revocation are saved at once; usage counters change on every request, so
     they are only marked dirty and saved by `flush_devices` every few seconds."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, policy_path: Path):
         self.path = path
+        self.policy_path = policy_path
         self.devices: dict[str, dict] = {}
         self.dirty = False
         if path.exists():
             self.devices = {d["id"]: d for d in json.loads(path.read_text())}
+        # Pairings expire `ttl_days` after they were made. Devices paired
+        # before expiry existed count from when it was introduced
+        # (`since`), so an upgrade doesn't cut anyone off at once.
+        policy = json.loads(policy_path.read_text()) if policy_path.exists() else {}
+        self.since = float(policy.get("since") or time.time())
+        self.ttl_days = _ttl_days(os.environ.get("DEVICE_TTL_DAYS"))
+        if not policy_path.exists():
+            _write_private_json(policy_path, {"since": self.since})
+
+    def set_ttl(self, days: int | None) -> None:
+        self.ttl_days = days
+
+    def expires_at(self, device: dict) -> float | None:
+        if self.ttl_days is None:
+            return None
+        return max(device["created_at"], self.since) + self.ttl_days * 86400
+
+    def expired(self, device: dict) -> bool:
+        exp = self.expires_at(device)
+        return exp is not None and time.time() >= exp
 
     def save(self) -> None:
         _write_private_json(self.path, list(self.devices.values()))
@@ -191,7 +224,7 @@ class DeviceStore:
 
     def public(self) -> list[dict]:
         return [
-            {k: v for k, v in d.items() if k != "token_sha256"}
+            {**{k: v for k, v in d.items() if k != "token_sha256"}, "expires_at": self.expires_at(d)}
             for d in self.devices.values()
         ]
 
@@ -257,7 +290,7 @@ class Metrics:
         return dict(vars(self))
 
 
-devices = DeviceStore(DEVICES_PATH)
+devices = DeviceStore(DEVICES_PATH, POLICY_PATH)
 pairing = Pairing()
 metrics = Metrics()
 
@@ -304,6 +337,25 @@ async def sglang_ready() -> bool:
         return False
 
 
+_kv_tokens: int | None = None
+
+
+async def effective_context() -> int:
+    """The context clients can actually use: the configured window, or less
+    when SGLang's KV cache holds fewer tokens (a request needs input plus
+    output in it; SGLang refuses input over ``min(context, kv) - 6``). Read
+    once SGLang is up; it doesn't change while it runs."""
+    global _kv_tokens
+    if _kv_tokens is None:
+        try:
+            r = await upstream().get("/get_server_info", timeout=5)
+            r.raise_for_status()
+            _kv_tokens = int(r.json().get("max_total_num_tokens") or 0) or None
+        except (httpx.HTTPError, ValueError):
+            return CONTEXT_LENGTH
+    return min(CONTEXT_LENGTH, _kv_tokens - 6) if _kv_tokens else CONTEXT_LENGTH
+
+
 _METRIC_RE = re.compile(r"^(sglang:[a-z_]+)(?:\{[^}]*\})?\s+([0-9.eE+-]+)$")
 
 
@@ -345,6 +397,11 @@ def require_device(authorization: str = Header(default="")) -> dict:
     device = devices.authenticate(token) if scheme.lower() == "bearer" else None
     if device is None:
         raise HTTPException(status_code=401, detail="missing or invalid device token")
+    if devices.expired(device):
+        raise HTTPException(
+            status_code=401,
+            detail="this device's pairing expired; pair again with a new code from the server app",
+        )
     return device
 
 
@@ -379,7 +436,12 @@ async def pair(req: PairRequest) -> PairResponse:
 async def whoami(device: dict = Depends(require_device)) -> dict:
     """Lets a client confirm its token is still valid (e.g. `oppx status`)."""
     devices.touch(device)
-    return {"device_id": device["id"], "device_name": device["name"], "model": MODEL_NAME}
+    return {
+        "device_id": device["id"],
+        "device_name": device["name"],
+        "model": MODEL_NAME,
+        "expires_at": devices.expires_at(device),
+    }
 
 
 @app.get("/v1/info")
@@ -389,7 +451,7 @@ async def info(device: dict = Depends(require_device)) -> dict:
     return {
         "served_name": MODEL_NAME,
         "model_id": MODEL_ID,
-        "context_length": CONTEXT_LENGTH,
+        "context_length": await effective_context(),
         "edit_format": EDIT_FORMAT,
         "reasoning": REASONING,
         "web_search": bool(SEARXNG_URL),
@@ -970,6 +1032,24 @@ async def admin_clear_pairing() -> dict:
 async def admin_devices() -> list[dict]:
     """Paired devices with their usage counts."""
     return devices.public()
+
+
+class PairingPolicy(BaseModel):
+    # Whole days a pairing lasts; None: never expires.
+    ttl_days: int | None = Field(default=7, ge=1, le=36500)
+
+
+@admin.get("/admin/pairing-policy", dependencies=[Depends(require_admin)])
+async def admin_get_policy() -> dict:
+    return {"ttl_days": devices.ttl_days}
+
+
+@admin.put("/admin/pairing-policy", dependencies=[Depends(require_admin)])
+async def admin_set_policy(policy: PairingPolicy) -> dict:
+    """Changes how long pairings last, for every device (the app also passes
+    it as DEVICE_TTL_DAYS at start)."""
+    devices.set_ttl(policy.ttl_days)
+    return {"ttl_days": devices.ttl_days}
 
 
 @admin.delete("/admin/devices/{device_id}", dependencies=[Depends(require_admin)])

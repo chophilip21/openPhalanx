@@ -122,6 +122,16 @@ def _whole_file_retry(coder, text: str, before: dict):
     return back, edited
 
 
+def _drop_refused(coder):
+    """Removes the refused message and Aider's placeholder answer from the
+    conversation, so a retry doesn't send them twice."""
+    msgs = coder.cur_messages
+    if msgs and msgs[-1]["role"] == "assistant" and "FinishReasonLength" in str(msgs[-1].get("content")):
+        msgs.pop()
+    if msgs and msgs[-1]["role"] == "user":
+        msgs.pop()
+
+
 def run_turn(coder, text: str):
     """Runs one message; returns the coder to continue with (a new one after
     a mode switch such as /ask, which runs in its own temporary coder)."""
@@ -134,10 +144,23 @@ def run_turn(coder, text: str):
     CONTEXT_MGR.start_turn(coder, text)
     before = snapshot(coder)
     result = coder
+    CONTEXT_MGR.overflow = None
     try:
         with EscWatcher() as w:
             SESSION.watcher = w
             coder.run_one(text, preproc=True)
+            if CONTEXT_MGR.overflow is not None:
+                # The server refused it as too long; the budget now uses the
+                # measured ratio and the server's limit, so refit and resend once.
+                sent, limit = CONTEXT_MGR.overflow
+                step(f"Context: the request was {sent:,} tokens, over the server's limit of {limit:,}; "
+                     "fitting it again", MUTED)
+                _drop_refused(coder)
+                CONTEXT_MGR.overflow = None
+                coder.run_one(text, preproc=True)
+                if CONTEXT_MGR.overflow is not None:
+                    _drop_refused(coder)
+                    step("Still too long for the model. Try /clear, /drop some files, or a shorter message.", YELLOW)
     except SwitchCoder as switch:
         if getattr(switch, "placeholder", None) is not None:
             coder.io.placeholder = switch.placeholder
