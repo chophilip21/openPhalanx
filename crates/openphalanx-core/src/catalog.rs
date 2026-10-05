@@ -45,6 +45,12 @@ pub struct CatalogEntry {
     /// SGLang `--reasoning-parser` for models that emit thinking blocks.
     #[serde(default)]
     pub reasoning_parser: Option<String>,
+    /// SGLang `--dtype`, when the checkpoint's own is wrong for SGLang. Some
+    /// 4-bit builds of hybrid linear-attention models declare float16, while
+    /// SGLang keeps their recurrent state in bfloat16, and the first prefill
+    /// fails on the mix.
+    #[serde(default)]
+    pub dtype: Option<String>,
 }
 
 impl CatalogEntry {

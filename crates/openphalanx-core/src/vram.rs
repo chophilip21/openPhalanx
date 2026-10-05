@@ -87,7 +87,7 @@ impl ArchSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Requirement {
     pub context_len: u32,
     /// Size of the downloaded weight files.
@@ -125,6 +125,18 @@ pub fn requirement(
         overhead_bytes,
         total_bytes: weight_bytes + kv_bytes + overhead_bytes,
         fp8_upcast,
+    }
+}
+
+/// The need when one model is split across `servers` machines (pipeline
+/// parallel): weights and KV cache are shared out, but every machine pays its
+/// own runtime memory (CUDA context, activations, graphs).
+pub fn split_across(req: &Requirement, servers: u32) -> Requirement {
+    let extra = req.overhead_bytes * u64::from(servers.max(1) - 1);
+    Requirement {
+        overhead_bytes: req.overhead_bytes + extra,
+        total_bytes: req.total_bytes + extra,
+        ..*req
     }
 }
 
@@ -321,5 +333,16 @@ mod tests {
         assert!(need(best).total_bytes <= free && need(best + 1024).total_bytes > free);
         assert_eq!(max_fitting_context(32_768, 100 * GIB, need), Some(32_768));
         assert_eq!(max_fitting_context(32_768, GIB, need), None);
+    }
+
+    #[test]
+    fn a_split_model_pays_runtime_memory_on_every_server() {
+        let arch = ArchSpec { kv_layers: 48, kv_heads: 8, head_dim: 128, ..Default::default() };
+        let one = requirement(9 << 30, Some("AWQ 4-bit"), &arch, 32768, Some(8.6));
+        assert_eq!(split_across(&one, 1), one);
+        let two = split_across(&one, 2);
+        assert_eq!(two.weight_bytes, one.weight_bytes);
+        assert_eq!(two.kv_bytes, one.kv_bytes);
+        assert_eq!(two.total_bytes, one.total_bytes + one.overhead_bytes);
     }
 }

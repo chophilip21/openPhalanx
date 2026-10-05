@@ -3,6 +3,8 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import Icon from "../components/Icon.svelte";
   import VramBar from "../components/VramBar.svelte";
+  import VramPool from "../components/VramPool.svelte";
+  import RunningModel from "../components/RunningModel.svelte";
   import { api, errorText, type CustomInspect, type ModelRow, type ModelsView } from "../lib/api";
   import { gb, gib, rate, tokens } from "../lib/format";
   import { app } from "../lib/store.svelte";
@@ -144,6 +146,9 @@
     dragging = null;
   }
   const selectedRow = $derived(view?.rows.find((r) => r.key === view?.selected) ?? null);
+  const pooled = $derived(!!view?.pool);
+  const live = $derived(running ? (app.snapshot?.server.model ?? null) : null);
+  const where = $derived(pooled ? "on this cluster" : "on this GPU");
 
   // Filters.
   let family = $state("All");
@@ -169,13 +174,27 @@
     a commit and checked against its SHA-256 hashes.
   </p>
 
+  {#if live}
+    <div class="live-banner">
+      <RunningModel model={live} loading={app.snapshot?.server.state === "starting"} />
+      <span class="muted">The server is live, so this model is locked in. Stop the server to switch models or change
+        the context window.</span>
+    </div>
+  {/if}
+
   <section class="card ctx-card">
     <div class="ctx-head">
       <div>
         <span class="eyebrow">Server setting · Context window</span>
         <div class="ctx-value">{tokens(ctxValue)} <span class="muted">tokens</span></div>
       </div>
-      {#if view?.gpu}
+      {#if view?.pool}
+        <div class="avail">
+          <Icon name="users" size={14} />
+          <span>{view.pool.length} servers</span>
+          <span class="muted">· {gib(view.available_bytes)} {view.available_basis}</span>
+        </div>
+      {:else if view?.gpu}
         <div class="avail">
           <Icon name="cpu" size={14} />
           <span>{view.gpu.name}</span>
@@ -212,22 +231,26 @@
         <span>{selectedRow.name} · {selectedRow.quant}</span>
         <span class="muted">·</span>
         {#if selectedRow.max_fit_context}
-          <span>fits up to <strong>{tokens(selectedRow.max_fit_context)}</strong> on this GPU</span>
+          <span>fits up to <strong>{tokens(selectedRow.max_fit_context)}</strong> {where}</span>
           {#if selectedRow.max_fit_context !== ctxValue && selectedRow.max_fit_context < (STEPS.at(-1) ?? 0)}
             <button class="ghost small" onclick={() => run(() => api.setContextLen(Math.min(selectedRow!.max_fit_context!, selectedRow!.max_context)))}>
               Use {tokens(selectedRow.max_fit_context)}
             </button>
           {/if}
         {:else}
-          <span class="warn-note">doesn't fit on this GPU at any context</span>
+          <span class="warn-note">doesn't fit {where} at any context</span>
         {/if}
       </div>
     {/if}
   </section>
 
+  {#if view?.pool}
+    <VramPool nodes={view.pool} selected={selectedRow} />
+  {/if}
+
   <p class="muted estimate">
     <strong>VRAM needed</strong> is deliberately conservative: weights as loaded, the KV cache for the context window
-    above plus 25%, and runtime memory. Models marked <em>Won't fit</em> can't be started on this GPU.
+    above plus 25%, and runtime memory{pooled ? " on every server" : ""}. Models marked <em>Won't fit</em> can't be started {where}.
   </p>
 
   <div class="filters">
@@ -252,7 +275,7 @@
       {@const dl = app.downloads[row.key]}
       {@const downloading = dl && !dl.finished && !dl.error}
       {@const selected = view?.selected === row.key}
-      <div class="tr" class:selected>
+      <div class="tr" class:selected class:live={live?.key === row.key}>
         <span class="name">
           <span class="title">
             {row.name}
@@ -304,7 +327,9 @@
             </div>
             <button class="ghost icon" title="Cancel download" onclick={() => api.cancelDownload(row.key)}><Icon name="x" size={14} /></button>
           {:else if row.installed_dir}
-            {#if selected}
+            {#if live?.key === row.key}
+              <span class="badge ok" title="The server is running this model. Stop the server to switch models."><Icon name="lock" size={12} stroke={2.6} /> Running</span>
+            {:else if selected}
               <span class="badge ok"><Icon name="check" size={12} stroke={3} /> Selected</span>
             {:else}
               <button disabled={running} title={running ? "Stop the server to switch models" : ""} onclick={() => use(row)}>Use</button>
@@ -397,6 +422,8 @@
   }
   .tr.th { border-top: none; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); font-weight: 600; padding: 8px 18px; }
   .tr.selected { background: var(--on-soft); box-shadow: inset 3px 0 0 var(--on); }
+  .tr.live { box-shadow: inset 4px 0 0 var(--on), 0 0 0 1px color-mix(in srgb, var(--on) 40%, transparent); }
+  .live-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin: 0 0 16px; font-size: 13px; }
   .name { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
   .title { font-weight: 600; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .link { border: none; background: none; padding: 0; color: var(--link); font-size: 11.5px; text-align: left; display: inline-flex; gap: 4px; align-items: center; }

@@ -12,4 +12,5 @@ pub mod net;
 pub mod paths;
 pub mod server;
 pub mod settings;
+pub mod split;
 pub mod vram;

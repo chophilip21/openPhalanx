@@ -12,7 +12,7 @@ use openphalanx_core::cluster::{self, Cluster, ClusterView, Role, Strategy};
 use openphalanx_core::server::{self, CheckStatus, StartProgress};
 use openphalanx_core::settings::{CustomModel, Settings};
 use openphalanx_core::vram::{self, FitCheck, Requirement};
-use openphalanx_core::{catalog, docker, download, gpu, model, net, paths};
+use openphalanx_core::{catalog, docker, download, gpu, model, net, paths, split};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -72,6 +72,8 @@ struct Inner {
     downloads: HashMap<String, DownloadView>,
     cancels: HashMap<String, download::Cancel>,
     log_follower: bool,
+    /// The running model is split across the cluster (its plan, for display).
+    split: Option<String>,
 }
 
 pub struct AppState {
@@ -111,6 +113,19 @@ struct ServerView {
     state: &'static str,
     detail: Option<String>,
     model_key: Option<String>,
+    /// What the backend is serving (or loading), for display; the model is
+    /// fixed until the server stops.
+    model: Option<RunningModel>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RunningModel {
+    key: String,
+    label: String,
+    quant: Option<String>,
+    context_len: Option<u32>,
+    /// Split across the cluster: each server's layers and memory.
+    split: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,21 +211,36 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
 
     if let Some(c) = st.cluster.as_ref().filter(|c| !c.is_member()) {
         // Split model: every server holds part of it, so one dropping out
-        // breaks inference. Pause instead of failing requests.
+        // (or its worker failing) breaks inference. Stop instead of failing
+        // requests, and say why.
         let serving_here = running && managed && matches!(inner.phase, Phase::Idle);
-        if serving_here && c.role() == Role::Host && c.strategy() == Strategy::Split {
-            let dropped = c.dropped_members(SPLIT_DROP_SECS);
-            if !dropped.is_empty() {
+        if serving_here && inner.split.is_some() {
+            let workers = c.worker_states();
+            let in_run: Vec<String> = workers.iter().map(|(name, _)| name.clone()).collect();
+            let dropped: Vec<String> = c.dropped_members(SPLIT_DROP_SECS).into_iter().filter(|n| in_run.contains(n)).collect();
+            let failed = workers.iter().find_map(|(name, w)| {
+                w.as_ref().filter(|w| w.state == "failed").map(|w| (name.clone(), w.message.clone().unwrap_or_default()))
+            });
+            let stop_with = if !dropped.is_empty() {
                 let names = dropped.join(", ");
-                inner.phase = Phase::Paused {
+                Some(Phase::Paused {
                     message: format!(
-                        "Paused: {names} dropped out of the cluster. With the split strategy every server holds part of \
-                         the model, so serving stopped instead of failing requests. Start again once {names} is back, \
-                         or remove it from the cluster."
+                        "Paused: {names} dropped out of the cluster. The model is split across the servers, so serving \
+                         stopped instead of failing requests. Start again once {names} is back, or remove it from the \
+                         cluster."
                     ),
-                };
+                })
+            } else {
+                failed.map(|(name, why)| Phase::Failed {
+                    message: format!("{name}'s share of the split model failed: {why}. See its log on the Logs page."),
+                })
+            };
+            if let Some(phase) = stop_with {
+                inner.phase = phase;
+                inner.split = None;
                 inner.expect_running = false;
                 inner.stop_epoch += 1;
+                c.set_workers(HashMap::new());
                 tauri::async_runtime::spawn(async { let _ = docker::stop().await; });
             }
         }
@@ -254,6 +284,7 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
     if need_follower {
         inner.log_follower = true;
     }
+    let split_plan = inner.split.clone();
     drop(inner);
     if need_follower {
         spawn_log_follower(app.clone());
@@ -263,6 +294,17 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
         server: ServerView {
             state,
             detail,
+            model: container.as_ref().filter(|c| c.state.running).and_then(|c| {
+                let key = c.model_key.clone()?;
+                let m = server::resolve(&settings, &key);
+                Some(RunningModel {
+                    label: m.as_ref().map_or_else(|| key.trim_start_matches("catalog:").to_string(), |m| m.label.clone()),
+                    quant: m.and_then(|m| m.quant),
+                    context_len: c.context_len,
+                    split: split_plan.clone(),
+                    key,
+                })
+            }),
             model_key: container.and_then(|c| c.model_key),
         },
         gpus,
@@ -338,7 +380,110 @@ async fn get_snapshot(app: AppHandle) -> Snapshot {
 
 #[tauri::command]
 async fn get_preflight(state: State<'_, AppState>) -> CmdResult<server::Preflight> {
-    Ok(server::preflight(&state.settings()).await)
+    let settings = state.settings();
+    let mut pf = server::preflight(&settings).await;
+    plan_split(&state, &settings, &mut pf);
+    Ok(pf)
+}
+
+/// A model split across this host and its members (cluster step 3).
+struct SplitPlan {
+    stages: Vec<split::Stage>,
+    model: cluster::ModelSpec,
+    dtype: Option<String>,
+}
+
+/// The model members are asked to keep on disk (repo and pinned commit).
+/// Local-folder models can't be fetched by members, so they have none.
+fn model_spec(settings: &Settings) -> Option<cluster::ModelSpec> {
+    let m = settings.selected_model.as_deref().and_then(|k| server::resolve(settings, k))?;
+    Some(cluster::ModelSpec {
+        key: m.key.clone(),
+        label: format!("{}{}", m.label, m.quant.as_deref().map(|q| format!(" · {q}")).unwrap_or_default()),
+        repo: m.repo.clone()?,
+        revision: m.revision.clone()?,
+        weight_bytes: m.weight_bytes,
+    })
+}
+
+/// Split strategy, as host with online members: a model that doesn't fit
+/// this GPU is split across the servers instead. A model that fits runs
+/// here alone (faster, and it keeps serving if a member drops out).
+/// Adjusts the VRAM check to match and returns the plan; `None` when this
+/// start doesn't split.
+fn plan_split(state: &AppState, settings: &Settings, pf: &mut server::Preflight) -> Option<SplitPlan> {
+    let (Some(req), Some(fit), Some(model)) = (pf.requirement, pf.fit.clone(), pf.model.clone()) else { return None };
+    if fit.fit != vram::Fit::Insufficient {
+        return None;
+    }
+    let c = state.cluster.as_ref()?;
+    let pool = cluster_pool(state, pf.gpu.as_ref(), Some(fit.free_bytes))?;
+    let names = pool.iter().filter(|n| !n.this).map(|n| n.name.clone()).collect::<Vec<_>>().join(", ");
+
+    let result = (|| -> Result<SplitPlan, String> {
+        let spec = model_spec(settings).ok_or_else(|| {
+            format!("{} is a local folder, which {names} can't fetch, so it can't be split across the cluster.", model.label)
+        })?;
+        let members = c.members();
+        for n in pool.iter().filter(|n| !n.this) {
+            let Some(r) = members.iter().find(|m| m.id == n.id).and_then(|m| m.report.as_ref()) else { continue };
+            if !r.inventory.nvidia_runtime {
+                return Err(format!(
+                    "{} can't run GPU containers yet: install the NVIDIA Container Toolkit there \
+                     (sudo nvidia-ctk runtime configure --runtime=docker, then restart Docker).",
+                    n.name
+                ));
+            }
+            match &r.model_sync {
+                Some(s) if s.repo == spec.repo && s.revision == spec.revision && s.state == "ready" => {}
+                Some(s) if s.repo == spec.repo && s.revision == spec.revision && s.state == "downloading" => {
+                    let pct = (s.done_bytes * 100).checked_div(s.total_bytes).unwrap_or(0);
+                    return Err(format!("{} is still downloading {} ({pct}%). Start again when it's done.", n.name, spec.label));
+                }
+                Some(s) if s.repo == spec.repo && s.state == "error" => {
+                    return Err(format!(
+                        "{} couldn't download {}: {}",
+                        n.name,
+                        spec.label,
+                        s.error.clone().unwrap_or_default()
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "{} doesn't have {} yet; it starts downloading it now. Start again when it's done.",
+                        n.name, spec.label
+                    ))
+                }
+            }
+        }
+        let dir = model.installed_dir.as_deref().ok_or("The model isn't downloaded on this machine.")?;
+        let shape = split::ModelShape::read(dir).map_err(|e| format!("{e:#}"))?;
+        let caps: Vec<split::Capacity> = pool
+            .iter()
+            .map(|n| split::Capacity { id: n.id.clone(), name: n.name.clone(), free_bytes: n.available_bytes })
+            .collect();
+        let stages = split::plan(&req, &shape, &caps)?;
+        Ok(SplitPlan { stages, model: spec, dtype: model.dtype.clone() })
+    })();
+
+    let check = pf.checks.iter_mut().find(|c| c.id == "vram")?;
+    match result {
+        Ok(plan) => {
+            check.status = CheckStatus::Pass;
+            check.detail = format!(
+                "Doesn't fit this GPU alone ({} free), so it's split across the cluster: {}.",
+                vram::fmt_gib(fit.free_bytes),
+                split::describe(&plan.stages)
+            );
+            let running = !pf.can_start && pf.checks.iter().all(|c| c.status != CheckStatus::Fail);
+            pf.can_start = !running && pf.checks.iter().all(|c| c.status != CheckStatus::Fail);
+            Some(plan)
+        }
+        Err(reason) => {
+            check.detail = format!("Fits the cluster's pooled VRAM with {names}, but can't be split yet: {reason}");
+            None
+        }
+    }
 }
 
 #[tauri::command]
@@ -366,7 +511,13 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
         }
     }
     let settings = state.settings();
-    let pf = server::preflight(&settings).await;
+    // A host asks its members to have the same model on disk (they download
+    // it from the same pinned commit if they don't).
+    if let Some(c) = state.cluster.as_ref().filter(|c| !c.is_member()) {
+        let _ = c.set_desired_model(model_spec(&settings));
+    }
+    let mut pf = server::preflight(&settings).await;
+    let plan = plan_split(&state, &settings, &mut pf);
     if !pf.can_start {
         release(&state);
         return Err(pf
@@ -378,25 +529,53 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
     }
     state.inner.lock().unwrap().phase = Phase::Starting { detail: "Preparing…".into() };
 
-    // A host asks its members to have the same model on disk (they download
-    // it from the same pinned commit if they don't). Local-folder models
-    // can't be fetched by members, so they aren't asked for.
-    if let Some(c) = state.cluster.as_ref().filter(|c| !c.is_member()) {
-        let spec = settings.selected_model.as_deref().and_then(|k| server::resolve(&settings, k)).and_then(|m| {
-            Some(cluster::ModelSpec {
-                key: m.key.clone(),
-                label: format!("{}{}", m.label, m.quant.as_deref().map(|q| format!(" · {q}")).unwrap_or_default()),
-                repo: m.repo.clone()?,
-                revision: m.revision.clone()?,
-                weight_bytes: m.weight_bytes,
-            })
-        });
-        let _ = c.set_desired_model(spec);
-    }
+    // Split: members get their orders in the next report reply (within 5 s)
+    // and start their workers; rank 0 waits for them to connect.
+    let split_start = match (&plan, &state.cluster) {
+        (Some(plan), Some(c)) => {
+            let Some(ip) = net::lan_ip() else {
+                release(&state);
+                return Err("This machine has no LAN address to split the model over.".into());
+            };
+            // Unique per start, so members replace any older worker.
+            let run_id = format!(
+                "{:x}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
+            );
+            let rank = |r: u32, interface: Option<String>| docker::SplitRank {
+                rank: r,
+                nnodes: plan.stages.len() as u32,
+                dist_init_addr: format!("{ip}:{}", split::DIST_PORT),
+                partition: split::partition(&plan.stages),
+                interface,
+            };
+            let orders = plan.stages[1..]
+                .iter()
+                .map(|stage| {
+                    (stage.id.clone(), cluster::WorkerOrder {
+                        run_id: run_id.clone(),
+                        model: plan.model.clone(),
+                        image: settings.image(),
+                        context_len: settings.context_len,
+                        dtype: plan.dtype.clone(),
+                        rank: rank(stage.rank, None),
+                        stage: stage.clone(),
+                    })
+                })
+                .collect();
+            c.set_workers(orders);
+            state.inner.lock().unwrap().split = Some(split::describe(&plan.stages));
+            Some(server::SplitStart { rank: rank(0, split::interface_for(ip)), stage: plan.stages[0].clone() })
+        }
+        _ => {
+            state.inner.lock().unwrap().split = None;
+            None
+        }
+    };
 
     tauri::async_runtime::spawn(async move {
         let progress_app = app.clone();
-        let result = server::start(&settings, move |p| {
+        let result = server::start(&settings, split_start, move |p| {
             let detail = match &p {
                 StartProgress::Checking => "Checking GPU memory…".to_string(),
                 StartProgress::PullingImage { line } => format!("Downloading backend image… {line}"),
@@ -418,8 +597,10 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
             }
             Err(e) => {
                 inner.phase = Phase::Failed { message: err(e) };
+                inner.split = None;
                 if let Some(c) = &st.cluster {
                     c.set_serving(false);
+                    c.set_workers(HashMap::new());
                 }
             }
         }
@@ -439,8 +620,12 @@ async fn stop_server(state: State<'_, AppState>) -> CmdResult<()> {
         inner.want_pairing = false;
         inner.stop_epoch += 1;
     }
+    if let Some(c) = &state.cluster {
+        c.set_workers(HashMap::new()); // members stop their shares too
+    }
     let result = docker::stop().await;
     let mut inner = state.inner.lock().unwrap();
+    inner.split = None;
     inner.phase = Phase::Idle;
     inner.expect_running = false;
     inner.stop_epoch += 1; // ticks that overlapped the stop are stale too
@@ -538,10 +723,60 @@ struct ModelsView {
     /// VRAM the backend can count on; measured before start when running.
     available_bytes: Option<u64>,
     available_basis: &'static str,
+    /// Split cluster (host with online members): the VRAM each server adds.
+    /// `available_bytes` is then their sum, and needs include every server's
+    /// runtime memory (`vram::split_across`).
+    pool: Option<Vec<PoolNode>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PoolNode {
+    id: String,
+    name: String,
+    this: bool,
+    gpu: Option<String>,
+    available_bytes: u64,
+    total_bytes: u64,
 }
 
 fn is_app_managed(dir: &Path) -> bool {
     dir.starts_with(paths::models_dir())
+}
+
+/// Split strategy: the model is shared out across the host and its online
+/// members, so it can use their VRAM too (one GPU per machine, the one with
+/// the most free memory, as reported every 5 s). `None` unless this is a
+/// split cluster's host with an online member.
+fn cluster_pool(state: &AppState, gpu: Option<&gpu::GpuInfo>, available: Option<u64>) -> Option<Vec<PoolNode>> {
+    state
+        .cluster
+        .as_ref()
+        .filter(|c| c.role() == Role::Host && c.strategy() == Strategy::Split)
+        .map(|c| {
+            let mut nodes = vec![PoolNode {
+                id: c.id(),
+                name: c.name(),
+                this: true,
+                gpu: gpu.map(|g| g.name.clone()),
+                available_bytes: available.unwrap_or(0),
+                total_bytes: gpu.map_or(0, |g| g.total_bytes),
+            }];
+            for m in c.members().into_iter().filter(|m| m.online) {
+                let best = m.report.as_ref().and_then(|r| r.inventory.gpus.iter().max_by_key(|g| g.free_bytes).cloned());
+                if let Some(g) = best {
+                    nodes.push(PoolNode {
+                        id: m.id,
+                        name: m.name,
+                        this: false,
+                        gpu: Some(g.name),
+                        available_bytes: g.free_bytes,
+                        total_bytes: g.total_bytes,
+                    });
+                }
+            }
+            nodes
+        })
+        .filter(|nodes| nodes.len() > 1)
 }
 
 #[tauri::command]
@@ -559,6 +794,13 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
         None => (None, "no GPU detected"),
     };
 
+    let pool = cluster_pool(&state, gpu.as_ref(), available);
+    let servers = pool.as_ref().map_or(1, |p| p.len() as u32);
+    let (available, basis) = match &pool {
+        Some(p) => (Some(p.iter().map(|n| n.available_bytes).sum()), "pooled across the cluster (split)"),
+        None => (available, basis),
+    };
+
     let mut keys: Vec<String> = catalog::catalog().iter().map(|e| server::catalog_key(&e.id)).collect();
     keys.extend(settings.custom_models.iter().map(|c| c.key.clone()));
     let mut rows: Vec<ModelRow> = keys
@@ -566,10 +808,10 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
         .filter_map(|key| {
             let m = server::resolve(&settings, key)?;
             let entry = key.strip_prefix("catalog:").and_then(catalog::find);
-            let requirement = m.requirement(settings.context_len, gpu.as_ref().and_then(|g| g.compute_capability));
             let cc = gpu.as_ref().and_then(|g| g.compute_capability);
-            let max_fit_context =
-                available.and_then(|free| vram::max_fitting_context(m.max_context, free, |c| m.requirement(c, cc)));
+            let need = |c: u32| vram::split_across(&m.requirement(c, cc), servers);
+            let requirement = need(settings.context_len);
+            let max_fit_context = available.and_then(|free| vram::max_fitting_context(m.max_context, free, need));
             Some(ModelRow {
                 key: key.clone(),
                 name: m.label.clone(),
@@ -619,12 +861,18 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
         gpu,
         available_bytes: available,
         available_basis: basis,
+        pool,
     })
 }
 
 #[tauri::command]
 fn select_model(state: State<'_, AppState>, key: String) -> CmdResult<Settings> {
-    state.update_settings(|s| s.selected_model = Some(key))
+    let settings = state.update_settings(|s| s.selected_model = Some(key))?;
+    // As host: members start fetching it now, so a split start doesn't wait.
+    if let Some(c) = state.cluster.as_ref().filter(|c| c.role() == Role::Host) {
+        let _ = c.set_desired_model(model_spec(&settings));
+    }
+    Ok(settings)
 }
 
 #[tauri::command]

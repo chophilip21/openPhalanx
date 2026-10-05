@@ -156,8 +156,18 @@ export type ClusterState = {
   error: string | null;
 };
 
+/** What the backend is serving (or loading); fixed until the server stops. */
+export type RunningModel = {
+  key: string;
+  label: string;
+  quant: string | null;
+  context_len: number | null;
+  /** Split across the cluster: "rig-3090: 40 layers (14.2 GiB) · laptop-4090: …". */
+  split: string | null;
+};
+
 export type Snapshot = {
-  server: { state: ServerState; detail: string | null; model_key: string | null };
+  server: { state: ServerState; detail: string | null; model_key: string | null; model: RunningModel | null };
   gpus: GpuInfo[];
   admin: AdminStatus | null;
   endpoint: string | null;
@@ -240,6 +250,17 @@ export type ModelsView = {
   gpu: GpuInfo | null;
   available_bytes: number | null;
   available_basis: string;
+  /** Split cluster: the VRAM each server adds (available_bytes is the sum). */
+  pool: PoolNode[] | null;
+};
+
+export type PoolNode = {
+  id: string;
+  name: string;
+  this: boolean;
+  gpu: string | null;
+  available_bytes: number;
+  total_bytes: number;
 };
 
 export type CustomInspect = {

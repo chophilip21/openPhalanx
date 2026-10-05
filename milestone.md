@@ -46,9 +46,13 @@ Server on an RTX 3090, client validated end to end from a separate laptop over t
     * Remove and re-add members; servers listed about 0.3 s after they start.
     * Start guard: one controller per cluster (a member's Start takes the host role over, refused while the host serves); members locked out show a violet button.
     * Split strategy pauses serving when a member drops out (goodbye on exit, or 12 s without a report).
+    * Strategy locked while the server runs; Models page pools VRAM across a split cluster (donut per server).
     * Verified between the 3090 and the 4090 laptop: invite, approve, hand-over, dissolve, and the drop-off of stopped servers.
   * 2\. Members run backends: the host starts or stops a model on a member, a router on the host spreads requests, and clients see one server.
-  * 3\. One model split across servers (pipeline parallel), experimental, wired networks only.
+  * 3\. One model split across servers (pipeline parallel), wired networks only. In progress:
+    * Done: layer plan by free VRAM (`split.rs`), rank 0 on the host network, member workers through report replies, split-aware pre-flight, pause/fail handling, per-model `dtype` in the catalog.
+    * Verified by hand on the 3090 + 4090: Qwen3-8B (about 100 tokens/s) and Qwen3.6-27B (42/22 layers, 32k context, a 16.8k-token prompt answered correctly).
+    * To do: the full app run (Start on the host with the 4090 as a member), then the backend image on GHCR so members can pull it.
   * Setup on the 4090 still needs sudo: the GUI build libraries, Node.js and the NVIDIA runtime for Docker.
 * \[ \] **Model matrix** (was Step 5.3): run every catalog model that fits 24 GB on hardware. For each: `probe_routing.py`, an edit task in `diff` and `whole` to set its `edit_format`, tokenizer ratio, tokens/s and time to first token. Record a table here.
   * Known from Step 5.1: gpt-oss-20b once nested a new function inside another, and misread clear search results ("Rust 1.99.0" answered as "1.116").

@@ -119,6 +119,7 @@ Open **Models**:
 On **Server**, check that the pre-flight list is green, then press the power button:
 
 * The first start downloads the backend image (about 16 GB). Loading the model then takes about 3–4 minutes.
+* The running model (name, quantization, context) shows under the headline with a lock, and as **Running** on Models; it's fixed until the server stops (the tooltip says so). The context comes from the container's `CONTEXT_LENGTH`.
 * The button turns green when SGLang is ready, and a **pairing code** appears. Use it to pair a client. Codes are single-use and expire after 10 minutes, but paired devices stay paired.
 * **Logs** shows live SGLang output. **Devices** lists paired clients and lets you revoke them.
 
@@ -250,7 +251,20 @@ Servers on one network form a cluster: one **host** and its **members**. They do
   * **Split model** (default): one model across the servers. Bigger models, about single-GPU speed, needs every server up and a wired network.
   * **Replicas:** a full copy per server. More concurrent users and resilience, no bigger models.
 
-  It's colour-coded in the cluster panel (violet / blue) with an ⓘ tooltip; `openphalanx-server strategy split|replicas` does the same. It's recorded for the next step; members don't serve models yet.
+  It's colour-coded in the cluster panel (violet / blue) with an ⓘ tooltip; `openphalanx-server strategy split|replicas` does the same.
+  * **Locked while serving:** `set_strategy` refuses a change while this server is serving ("Stop the server before changing the strategy"), and the panel shows the other option faded with a lock.
+  * **Pooled VRAM (split):** on a host with online members, the Models page measures fits against the sum of each server's free VRAM (its GPU with the most free memory, as last reported), and every server's runtime memory is added to the need (`vram::split_across`). A donut (`VramPool.svelte`) shows each server's share and the selected model's need. The pre-flight VRAM check follows the split plan (`plan_split` in the app).
+* **Split serving** (cluster step 3, `split.rs`; pipeline parallel with SGLang `--pp-size N --nnodes N`):
+  * **When:** the host, with the split strategy and online members, starts a model that doesn't fit its own GPU. A model that fits runs on the host alone: faster, and it keeps serving if a member drops out.
+  * **Plan** (`split::plan`): layers are shared out in proportion to each server's free VRAM after its fixed costs (runtime memory on every server, the input embedding on the first, the output head on the last), at least one each. Layer count and embedding size come from the model's `config.json` (`text_config` for multimodal models). Passed as `SGLANG_PP_LAYER_PARTITION`. SGLang takes the minimum KV capacity across ranks, so each server sizes its own `--mem-fraction-static` from its stage.
+  * **Rank 0 is the host's normal backend** on the host's network (`--network host`; NCCL and torch connect back to the address each rank announces, which a bridge would hide). The gateway then binds the admin API to loopback itself (`ADMIN_HOST=127.0.0.1`), SGLang moves to `9096`, and SearXNG is published on `127.0.0.1:9098` only.
+  * **Members run a worker:** the host puts a `WorkerOrder` (run id, model, rank, partition, `host:9100` rendezvous, stage) in each member's report reply. The member starts `openphalanx-worker` (the same image with `start-sglang.sh` as entrypoint, no gateway, host network, weights read-only) with its own GPU and LAN interface (`NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME`), and reports `starting`/`running`/`failed`. An order without a worker, or leaving the cluster, stops it. Its log goes to the host's Logs page prefixed `[split worker]`.
+  * **Before starting** the host checks every member: NVIDIA runtime present, and the model synced ("still downloading (45%)" otherwise). Members need the backend image too; the worker fails with a clear message if it's missing.
+  * **While serving:** a member dropping out pauses serving; a failed worker stops it with that member's reason. Stop clears the orders, so workers stop too. The Server page's model pill shows the split ("rig-3090: 40 layers (…) · laptop-4090: 24 layers (…)").
+  * **Same settings on every rank:** `--chunked-prefill-size 2048` (`docker::SPLIT_PREFILL_CHUNK`; SGLang otherwise picks 4096 on a 24 GB card and 2048 on 16 GB, and the smaller rank crashed reshaping a 4096-token chunk), and the model's `dtype` override if the catalog has one.
+  * **Ports between the servers:** `9100` and the next 16 on the host, plus NCCL's ephemeral ports both ways; keep the servers on one LAN without a firewall between them.
+  * **Planning by hand:** `cargo run -p openphalanx-core --example split_plan -- rig-3090=22.1 laptop-4090=15.5` prints the plan for the selected model and context (the host first, free GiB per server).
+  * **Verified by hand** (containers with the app's arguments, 3090 + 4090 laptop on gigabit Ethernet): Qwen3-8B-AWQ 20/16 layers, about 100 tokens/s, a 6.1k-token prompt in 2.3 s; Qwen3.6-27B-AWQ 42/22 layers at 32k context (18.6 of 24 GB and 11.0 of 16 GB used), correct on a 16.8k-token prompt in 13.7 s. The full app flow (Start on the host, worker orders, pause) is still to be run.
 * **Model sync:**
   * When the host starts its server, the app sets the cluster's model (`set_desired_model`; repo plus pinned commit; local-folder models are skipped). The host sends it to members in every report reply.
   * A member that already has it (the app's models folder or the HF cache) reports "ready"; otherwise it downloads it with the verified, resumable downloader, and reports progress and errors (retried).
@@ -307,6 +321,7 @@ Servers on one network form a cluster: one **host** and its **members**. They do
 | `9092/tcp` (all interfaces, while the app or `openphalanx-server` runs) | Cluster API between servers (TLS, the server's own certificate). `health`, `invite`, `host-request` and `join` (needs an invitation secret) are open; `report` and `leave` need a member token |
 | `9093/udp` (all interfaces) | Discovery beacons (LAN broadcast) |
 | `9094/tcp` (`127.0.0.1` only) | `openphalanx-server` control API; needs `control.token` |
+| `9096`, `9098` (`127.0.0.1` only), `9100`–`9116/tcp` and NCCL's ephemeral ports | Split model only: SGLang and SearXNG on the host's network, and the rendezvous and traffic between the ranks |
 | `~/.local/share/openphalanx/cluster/` | This server's certificate (`head.crt`, `head.key`, 0600), identity, role and trusted hosts (`state.json`), and members as host (`members.json`, hashed tokens). Deleting it resets the server's cluster identity |
 | `~/.config/openphalanx/settings.json` | Selected model, context length, GPU index, custom models |
 | `~/.local/share/openphalanx/models/` | Models downloaded by the GUI (verified, pinned to a commit) |
@@ -360,6 +375,7 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
 
 * **Adding models:** write a spec (id, name, family, params, quant, and `quantized_by` for community builds), run `scripts/catalog_entry.py specs.json`, and paste the entries into `catalog.json`. `scripts/catalog_entry.py --check` verifies every entry's weight size, attention shape and context against Hugging Face.
 * **Release date** (`released`, shown as a year on the Models page): the repo's creation date on Hugging Face; community quantizations take their base model's date (`base_model` in the spec).
+* **`dtype`** (optional, passed as SGLang `--dtype` to every rank): for checkpoints whose declared dtype SGLang can't run. The 4-bit Qwen3.6 builds (cyankiwi 27B, QuantTrio 35B-A3B) declare float16, but SGLang keeps the Gated-DeltaNet state in bfloat16 and the first prefill failed with "Index put requires the source and destination dtypes match"; they use `bfloat16` (verified on the 27B; the 35B-A3B by analogy).
 * **Check the architecture first:** the pinned SGLang must have the model class (`sglang/srt/models/` in the image). All current entries were checked against SGLang 0.5.21.
 * **Weights counted:** only root-level `.safetensors` (subfolders like gpt-oss's `original/` and `metal/` are skipped), and Mistral's duplicate `consolidated*.safetensors` are dropped when HF shards exist. The downloader applies the same rule.
 * **KV cache** (`vram::ArchSpec`), as SGLang allocates it:
@@ -400,7 +416,7 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
 app/                     Tauri 2 + Svelte 5 server GUI (Linux)
   src/                   frontend: pages, components, typed command bindings
   src-tauri/             Rust shell: Tauri commands, 2 s status monitor, log streaming
-crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight, cluster head (no Tauri, unit-tested)
+crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight, cluster, split plan (no Tauri, unit-tested)
 crates/openphalanx-server/ openphalanx-server: headless server (cluster service + command-line control)
 crates/pinned-tls/       TLS pinned to a certificate fingerprint (shared by oppx and the cluster)
   catalog.json           curated models pinned to Hugging Face commits (built with scripts/catalog_entry.py); optional per-model

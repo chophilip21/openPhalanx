@@ -4,6 +4,7 @@
   // Only running, reachable servers are listed (see core cluster.rs).
   import { ask } from "@tauri-apps/plugin-dialog";
   import Icon from "./Icon.svelte";
+  import { app } from "../lib/store.svelte";
   import { api, errorText, type ClusterState, type ClusterStrategy } from "../lib/api";
 
   let { cluster }: { cluster: ClusterState } = $props();
@@ -95,8 +96,15 @@
   ];
   const current = $derived(STRATEGIES.find((s) => s.id === cluster.strategy) ?? STRATEGIES[0]);
 
+  // The layout can't change under a running server (the core refuses too).
+  const serverOn = $derived(["running", "starting", "stopping"].includes(app.snapshot?.server.state ?? ""));
+
   async function setStrategy(s: ClusterStrategy) {
     if (s === cluster.strategy) return;
+    if (serverOn) {
+      error = "Stop the server before changing the strategy; it applies when the server starts.";
+      return;
+    }
     await act("strategy", () => api.clusterSetStrategy(s));
   }
 
@@ -172,8 +180,10 @@
           aria-checked={cluster.strategy === st.id}
           class:active={cluster.strategy === st.id}
           disabled={role.role === "member" || !!busy}
+          class:locked={serverOn && cluster.strategy !== st.id}
+          title={serverOn && cluster.strategy !== st.id ? "Stop the server to change the strategy" : undefined}
           onclick={() => setStrategy(st.id)}
-        >{st.label}</button>
+        >{#if serverOn && cluster.strategy !== st.id}<Icon name="lock" size={12} /> {/if}{st.label}</button>
       {/each}
     </div>
     <button type="button" class="tip" aria-label="About cluster strategies">
@@ -340,4 +350,5 @@
     background: color-mix(in srgb, var(--bad) 8%, transparent);
   }
   .remove:hover:not(:disabled) { background: color-mix(in srgb, var(--bad) 16%, transparent); }
+  .seg button.locked { opacity: 0.55; cursor: not-allowed; }
 </style>

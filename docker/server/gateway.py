@@ -55,6 +55,10 @@ SGLANG_BASE = f"{SGLANG_ROOT}/v1"
 MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", "openphalanx-coder")
 AGENT_PORT = int(os.environ.get("AGENT_PORT", "9090"))
 ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "9091"))
+# Inside the container's own network the port is published on the host's
+# loopback only. On the host's network (a model split across servers) the
+# gateway binds loopback itself.
+ADMIN_HOST = os.environ.get("ADMIN_HOST", "0.0.0.0")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 STATE_DIR = Path(os.environ.get("STATE_DIR", "/state"))
 # Largest accepted request body. A 32k-token prompt is ~130 KB of text.
@@ -984,7 +988,7 @@ async def main() -> None:
         )
     )
     admin_server = uvicorn.Server(
-        uvicorn.Config(admin, host="0.0.0.0", port=ADMIN_PORT, log_level="warning")
+        uvicorn.Config(admin, host=ADMIN_HOST, port=ADMIN_PORT, log_level="warning")
     )
     await asyncio.gather(public_server.serve(), admin_server.serve())
 

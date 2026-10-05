@@ -135,6 +135,31 @@ pub struct ModelSync {
     pub error: Option<String>,
 }
 
+/// As host: what a member should run for a model split across servers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerOrder {
+    /// New for every start; a member restarts its worker when it changes.
+    pub run_id: String,
+    pub model: ModelSpec,
+    pub image: String,
+    pub context_len: u32,
+    /// SGLang `--dtype` override; every rank must use rank 0's.
+    #[serde(default)]
+    pub dtype: Option<String>,
+    /// Its rank; the member fills in its own network interface.
+    pub rank: crate::docker::SplitRank,
+    pub stage: crate::split::Stage,
+}
+
+/// A member's worker for the host's current run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerStatus {
+    pub run_id: String,
+    /// "starting", "running" or "failed".
+    pub state: String,
+    pub message: Option<String>,
+}
+
 /// A member's report to its host.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Report {
@@ -146,6 +171,9 @@ pub struct Report {
     /// New log lines since the last report (its backend, and cluster events).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logs: Vec<String>,
+    /// Its share of a split model, if the host asked for one.
+    #[serde(default)]
+    pub worker: Option<WorkerStatus>,
 }
 
 /// Log lines a host keeps per member, for the Logs page.
@@ -426,6 +454,9 @@ struct ReportReply {
     /// The host's server is running or starting: members can't start theirs.
     #[serde(default)]
     host_serving: bool,
+    /// Run this share of a split model (`None`: run none).
+    #[serde(default)]
+    worker: Option<WorkerOrder>,
 }
 
 // --------------------------------------------------------------------------
@@ -466,6 +497,11 @@ pub struct Cluster {
     control: Mutex<Control>,
     /// As member: whether the host is serving (from its report replies).
     host_serving: Mutex<bool>,
+    /// As host: each member's share of the split model being served.
+    workers: Mutex<HashMap<String, WorkerOrder>>,
+    /// As member: the order it runs, and how that is going.
+    worker: Mutex<Option<WorkerOrder>>,
+    worker_status: Mutex<Option<WorkerStatus>>,
 }
 
 /// One controller per cluster: the host. Checked and set under one lock, so
@@ -521,6 +557,9 @@ impl Cluster {
             check_now: tokio::sync::Notify::new(),
             control: Mutex::new(Control::default()),
             host_serving: Mutex::new(false),
+            workers: Mutex::new(HashMap::new()),
+            worker: Mutex::new(None),
+            worker_status: Mutex::new(None),
         });
         c.save_state()?;
         Ok(c)
@@ -568,6 +607,11 @@ impl Cluster {
     pub fn set_strategy(&self, strategy: Strategy) -> Result<()> {
         if self.is_member() {
             bail!("the cluster's host decides its strategy");
+        }
+        // How the model is laid out across servers can't change under a
+        // running server; it takes effect on the next start.
+        if self.control.lock().unwrap().serving && self.strategy() != strategy {
+            bail!("Stop the server before changing the strategy; it applies when the server starts.");
         }
         self.state.lock().unwrap().strategy = strategy;
         self.save_state()
@@ -1303,18 +1347,23 @@ impl Cluster {
     /// pending invitations from hosts this machine already trusts.
     async fn report_loop(self: Arc<Self>) {
         loop {
+            if !self.is_member() && self.worker.lock().unwrap().is_some() {
+                // Left or removed while running a share of the host's model.
+                self.clone().follow_worker_order(None).await;
+            }
             if let Role::Member { host, token } = self.role() {
                 self.collect_backend_logs().await;
                 let logs: Vec<String> = {
                     let out = self.outbox.lock().unwrap();
                     out.iter().take(LOG_LINES_PER_REPORT).cloned().collect()
                 };
-                let report = Report {
-                    inventory: collect_inventory().await,
-                    serving: collect_serving().await,
-                    model_sync: self.sync.lock().unwrap().clone(),
-                    logs: logs.clone(),
-                };
+                // Awaited before the literal: a lock taken inside it would be
+                // held across these awaits.
+                let inventory = collect_inventory().await;
+                let serving = collect_serving().await;
+                let worker = self.check_worker().await;
+                let model_sync = self.sync.lock().unwrap().clone();
+                let report = Report { inventory, serving, model_sync, logs: logs.clone(), worker };
                 let result = async {
                     let client = pinned_tls::pinned_client(&host.fingerprint)?;
                     let resp = client
@@ -1354,6 +1403,7 @@ impl Cluster {
                                 *self.host_strategy.lock().unwrap() = Some(s);
                             }
                             *self.host_serving.lock().unwrap() = reply.host_serving;
+                            self.clone().follow_worker_order(reply.worker).await;
                         }
                         *self.host_link.lock().unwrap() = HostLink { connected: true, last_ok: Some(now()), error: None };
                     }
@@ -1473,24 +1523,143 @@ impl Cluster {
     async fn collect_backend_logs(&self) {
         let since = *self.backend_log_since.lock().unwrap();
         let until = now();
-        let out = tokio::process::Command::new("docker")
-            .args(["logs", "--since", &since.to_string(), "--until", &until.to_string(), crate::docker::CONTAINER_NAME])
-            .output()
-            .await;
         *self.backend_log_since.lock().unwrap() = until;
-        let Ok(out) = out else { return };
-        if !out.status.success() {
-            return; // no backend container on this machine
-        }
-        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        let mut outbox = self.outbox.lock().unwrap();
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            outbox.push_back(line.to_string());
-        }
-        while outbox.len() > OUTBOX_LOG_LINES {
-            outbox.pop_front();
+        // Its own backend, and its share of the host's split model.
+        for (container, prefix) in [(crate::docker::CONTAINER_NAME, ""), (crate::docker::WORKER_CONTAINER, "[split worker] ")] {
+            let out = tokio::process::Command::new("docker")
+                .args(["logs", "--since", &since.to_string(), "--until", &until.to_string(), container])
+                .output()
+                .await;
+            let Ok(out) = out else { continue };
+            if !out.status.success() {
+                continue; // no such container on this machine
+            }
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            let mut outbox = self.outbox.lock().unwrap();
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                outbox.push_back(format!("{prefix}{line}"));
+            }
+            while outbox.len() > OUTBOX_LOG_LINES {
+                outbox.pop_front();
+            }
         }
     }
+
+    /// As member: starts, replaces or stops the split-model worker so it
+    /// matches the host's order.
+    async fn follow_worker_order(self: Arc<Self>, order: Option<WorkerOrder>) {
+        let current = self.worker.lock().unwrap().clone();
+        let same = current.as_ref().map(|o| &o.run_id) == order.as_ref().map(|o| &o.run_id);
+        if same {
+            return;
+        }
+        if current.is_some() {
+            let _ = crate::docker::remove_worker().await;
+            self.log("Stopped this machine's share of the split model.".to_string());
+        }
+        *self.worker.lock().unwrap() = order.clone();
+        let Some(order) = order else {
+            *self.worker_status.lock().unwrap() = None;
+            return;
+        };
+        let status = |state: &str, message: Option<String>| WorkerStatus { run_id: order.run_id.clone(), state: state.into(), message };
+        *self.worker_status.lock().unwrap() = Some(status("starting", None));
+        self.log(format!(
+            "Starting this machine's share of {}: rank {} of {}, {} layers.",
+            order.model.label, order.rank.rank, order.rank.nnodes, order.stage.layers
+        ));
+        let result = start_worker(&order).await;
+        if let Err(e) = result {
+            let message = format!("{e:#}");
+            self.log(format!("Couldn't start the split-model worker: {message}"));
+            *self.worker_status.lock().unwrap() = Some(status("failed", Some(message)));
+        }
+    }
+
+    /// As member: the worker's state for the next report.
+    async fn check_worker(&self) -> Option<WorkerStatus> {
+        let mut status = self.worker_status.lock().unwrap().clone()?;
+        if status.state == "failed" {
+            return Some(status);
+        }
+        match crate::docker::worker_state().await {
+            Ok(Some((run, st))) if run == status.run_id && st.running => status.state = "running".into(),
+            Ok(Some((run, st))) if run == status.run_id => {
+                let log = crate::docker::worker_logs_tail(60).await.unwrap_or_default();
+                status.state = "failed".into();
+                status.message = Some(crate::docker::diagnose_crash(&log).unwrap_or_else(|| {
+                    format!("its SGLang worker stopped (exit code {})", st.exit_code)
+                }));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                status.state = "failed".into();
+                status.message = Some(format!("{e:#}"));
+            }
+        }
+        *self.worker_status.lock().unwrap() = Some(status.clone());
+        Some(status)
+    }
+
+    /// As host: the shares members should run for this start (empty to stop).
+    pub fn set_workers(&self, orders: HashMap<String, WorkerOrder>) {
+        *self.workers.lock().unwrap() = orders;
+    }
+
+    /// As host: each member's worker state for the run in progress.
+    pub fn worker_states(&self) -> Vec<(String, Option<WorkerStatus>)> {
+        let orders = self.workers.lock().unwrap().clone();
+        let live = self.live.lock().unwrap();
+        orders
+            .iter()
+            .map(|(id, order)| {
+                let name = self.members.lock().unwrap().iter().find(|m| &m.peer.id == id).map(|m| m.peer.name.clone()).unwrap_or_else(|| id.clone());
+                let st = live
+                    .get(id)
+                    .and_then(|l| l.report.as_ref())
+                    .and_then(|r| r.worker.clone())
+                    .filter(|w| w.run_id == order.run_id);
+                (name, st)
+            })
+            .collect()
+    }
+}
+
+/// As member: launches its share of the host's split model.
+async fn start_worker(order: &WorkerOrder) -> Result<()> {
+    let dir = crate::model::find_installed(&order.model.repo, Some(&order.model.revision))
+        .with_context(|| format!("{} isn't on this machine yet", order.model.label))?;
+    if !crate::docker::image_exists(&order.image).await? {
+        bail!("the backend image {} isn't on this machine", order.image);
+    }
+    let gpu = crate::gpu::query()
+        .await?
+        .into_iter()
+        .max_by_key(|g| g.free_bytes)
+        .context("no NVIDIA GPU found")?;
+    let req = order.stage.requirement;
+    let fraction = crate::vram::mem_fraction_static(&req, gpu.free_bytes, gpu.total_bytes).with_context(|| {
+        format!(
+            "its share needs {} of VRAM but {} is free on {}",
+            crate::vram::fmt_gib(req.total_bytes),
+            crate::vram::fmt_gib(gpu.free_bytes),
+            gpu.name
+        )
+    })?;
+    let mut rank = order.rank.clone();
+    rank.interface = crate::net::lan_ip().and_then(crate::split::interface_for);
+    crate::docker::run_worker(&crate::docker::WorkerSpec {
+        image: order.image.clone(),
+        gpu_index: gpu.index,
+        model: crate::model::mount_for(&dir)?,
+        model_key: order.model.key.clone(),
+        mem_fraction_static: fraction,
+        context_len: order.context_len,
+        split: rank,
+        dtype: order.dtype.clone(),
+        run_id: order.run_id.clone(),
+    })
+    .await
 }
 
 fn url_for(ip: IpAddr, port: u16) -> String {
@@ -1609,7 +1778,8 @@ async fn report_handler(
     let expect_host = c.handover.lock().unwrap().clone().filter(|(_, until)| *until > now()).map(|(fp, _)| fp);
     let ensure_model = c.state.lock().unwrap().desired_model.clone();
     let host_serving = c.control.lock().unwrap().serving;
-    Json(ReportReply { expect_host, strategy: Some(c.strategy()), ensure_model, host_serving }).into_response()
+    let worker = c.workers.lock().unwrap().get(&id).cloned();
+    Json(ReportReply { expect_host, strategy: Some(c.strategy()), ensure_model, host_serving, worker }).into_response()
 }
 
 async fn take_over_handler(State(c): State<Arc<Cluster>>, headers: HeaderMap, Json(peer): Json<Peer>) -> Response {
@@ -1790,6 +1960,10 @@ mod tests {
         assert_eq!(c.strategy(), Strategy::Split);
         c.set_strategy(Strategy::Replicas).unwrap();
         assert_eq!(Cluster::open(dir.path()).unwrap().strategy(), Strategy::Replicas);
+        c.set_serving(true);
+        assert!(c.set_strategy(Strategy::Split).is_err(), "not while the server runs");
+        c.set_strategy(Strategy::Replicas).unwrap();
+        c.set_serving(false);
         c.set_role(Role::Member { host: peer("h"), token: "t".into() }).unwrap();
         assert!(c.set_strategy(Strategy::Split).is_err(), "members follow the host");
         *c.host_strategy.lock().unwrap() = Some(Strategy::Split);

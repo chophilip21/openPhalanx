@@ -4,6 +4,7 @@
   import Icon from "../components/Icon.svelte";
   import PairingCard from "../components/PairingCard.svelte";
   import PowerButton from "../components/PowerButton.svelte";
+  import RunningModel from "../components/RunningModel.svelte";
   import VramBar from "../components/VramBar.svelte";
   import { api, errorText, type Preflight } from "../lib/api";
   import { gib, tokens } from "../lib/format";
@@ -120,6 +121,9 @@
       </div>
 
       <h2 class="headline">{headline}</h2>
+      {#if snap?.server.model && !idle}
+        <div class="running-model"><RunningModel model={snap.server.model} loading={st === "starting"} /></div>
+      {/if}
       <p class="detail">
         {#if locked}
           <span class="locked-note">
@@ -223,6 +227,7 @@
   .dot.running { background: var(--on); box-shadow: 0 0 10px var(--on); }
   .dot.starting, .dot.stopping, .dot.external { background: var(--busy); }
   .dot.error, .dot.paused { background: var(--bad); }
+  .running-model { display: flex; justify-content: center; margin: 2px 0 6px; }
   .locked-note { color: var(--violet); display: inline-flex; gap: 6px; align-items: baseline; max-width: 560px; }
   .paused-note { color: var(--bad); display: inline-flex; gap: 6px; align-items: baseline; max-width: 560px; font-weight: 500; }
   .headline { margin: 4px 0 0; font-size: 26px; font-weight: 650; }
