@@ -1,5 +1,6 @@
 """Wires everything into Aider and runs the conversation loop."""
 
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -84,6 +85,10 @@ def welcome(coder):
 
 
 INTERRUPT_NOTE = "I see that you interrupted my previous reply."
+# Plan mode and /ask take the editing tools away; without being told, a model
+# asked for a change "answers" that it made it.
+READ_ONLY_NOTE = ("(Read-only request: you can't change files this time. If a change is asked for, "
+                  "explain what you would change and where, and say that nothing was changed yet.)")
 
 
 def _was_interrupted(coder) -> bool:
@@ -208,8 +213,9 @@ def _memory(coder) -> str:
 def agent_turn(coder, text: str):
     """A message for the agent: a question (no edits) or a task."""
     can_edit = not UI.plan_mode
+    read_only = not can_edit
     if text.startswith("/ask "):
-        text, can_edit = text[5:].strip(), False
+        text, can_edit, read_only = text[5:].strip(), False, True
     elif can_edit:
         can_edit = wants_edit(text)
     agent = UI.agent
@@ -225,6 +231,8 @@ def agent_turn(coder, text: str):
     pointed = sorted(coder.get_rel_fname(f) for f in coder.abs_fnames)
     if pointed:
         text += "\n\n(Files the user added to the chat: " + ", ".join(pointed) + ")"
+    if read_only:
+        text += "\n\n" + READ_ONLY_NOTE
     reply = ""
     try:
         with EscWatcher() as w:
@@ -270,8 +278,11 @@ def run_turn(coder, text: str):
     before = snapshot(coder)
     result = coder
     CONTEXT_MGR.overflow = None
+    # A shell command owns the terminal (a pager, a prompt): the Esc watcher
+    # would read its keystrokes. Ctrl-C still reaches the command.
+    shell = text.split(" ", 1)[0] in ("/run", "/test", "/lint")
     try:
-        with EscWatcher() as w:
+        with contextlib.nullcontext() if shell else EscWatcher() as w:
             SESSION.watcher = w
             coder.run_one(text, preproc=True)
             if CONTEXT_MGR.overflow is not None:
@@ -367,6 +378,9 @@ def run(argv) -> int:
 
 
 def main() -> int:
+    # `!git log` and friends: the output goes into the chat, so no pager
+    # (less would take over the terminal and wait for keys).
+    os.environ["PAGER"] = os.environ["GIT_PAGER"] = "cat"
     try:
         return run(sys.argv[1:])
     except (KeyboardInterrupt, EOFError):

@@ -13,6 +13,7 @@ copy of a repo, since edit turns change files:
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -53,7 +54,8 @@ def main():
         repo_map = RepoMap(root=args.repo, io=InputOutput(pretty=False, yes=True))
     except Exception:  # noqa: BLE001
         repo_map = None
-    agent = Agent(ws=Workspace(args.repo, repo_map), hooks=hooks, context=args.context, web=False)
+    agent = Agent(ws=Workspace(args.repo, repo_map), hooks=hooks, context=args.context, web=False,
+                  reasoning=os.environ.get("OPPX_REASONING") == "1")  # as oppx passes it
 
     print(f"{'turn':>4} {'steps':>5} {'computed':>9} {'cached':>8} {'hit':>4} {'max req':>8} {'time':>6}  message")
     tot_c = tot_k = 0

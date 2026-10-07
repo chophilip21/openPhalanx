@@ -14,6 +14,9 @@ args=(
   --port "${SGLANG_PORT}"
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --enable-metrics
+  # usage.prompt_tokens_details.cached_tokens: the client's /cost and the
+  # benchmarks count prefix-cache hits from it.
+  --enable-cache-report
   # The GUI polls these every 2 s; keep them out of the log it displays.
   --uvicorn-access-log-exclude-prefixes /metrics /v1/models /health
 )
