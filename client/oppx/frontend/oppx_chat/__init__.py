@@ -12,7 +12,8 @@ Keys and commands follow Claude Code, so people can switch without relearning.
 Environment from oppx: OPENAI_API_BASE / OPENAI_API_KEY (the loopback proxy),
 OPPX_SERVER, OPPX_CONTEXT, OPPX_MODEL_ID (what the server runs), OPPX_WEB
 ("1"/"0"), OPPX_VERSION, OPPX_BIN, OPPX_INITIAL (a first prompt) and
-OPPX_PRINT ("1": answer once and exit).
+OPPX_PRINT ("1": answer once and exit) and OPPX_ENGINE ("agent", the default, or
+"aider" for Aider's own loop).
 
 Modules, lowest layer first (each imports only from the ones above it):
 
@@ -20,6 +21,8 @@ Modules, lowest layer first (each imports only from the ones above it):
     term       console output, the turn spinner, Esc-to-interrupt
     render     streamed answers (reasoning and edit blocks hidden), diffs
     context    ContextManager: fit every request into the context window
+    agent      the agent engine: the model reads the repository on demand with
+               tools (no UI code; app.py connects it to the terminal)
     oppx_io    Aider's InputOutput restyled: prompt, keys, confirmations
     routing    the one-token ask/edit check
     cache      keep requests prefix-cache friendly (stable repo map and prompts)

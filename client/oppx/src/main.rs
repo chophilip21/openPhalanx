@@ -37,6 +37,10 @@ struct Cli {
     /// With no command: use Aider's own terminal interface instead of OpenPhalanx's.
     #[arg(long)]
     classic: bool,
+    /// How the chat works: "agent" (the model reads files on demand with
+    /// tools) or "aider" (Aider sends whole files and a repo map every time).
+    #[arg(long, value_parser = ["agent", "aider"], default_value = "agent", env = "OPPX_ENGINE")]
+    engine: String,
     /// Automatic web search is the default; kept so old habits don't break.
     #[arg(long, hide = true)]
     web: bool,
@@ -65,6 +69,7 @@ struct Cli {
 struct Launch {
     web: bool,
     classic: bool,
+    engine: String,
     initial: Option<String>,
     print: bool,
     session: SessionChoice,
@@ -224,6 +229,7 @@ async fn run(cli: Cli) -> Result<()> {
             let launch = Launch {
                 web: !cli.no_web,
                 classic: cli.classic,
+                engine: cli.engine.clone(),
                 initial: cli.prompt,
                 print: cli.print,
                 session: match (cli.continue_last, cli.resume) {
@@ -247,7 +253,14 @@ async fn run(cli: Cli) -> Result<()> {
             cfg.save(&path)?;
         }
         Command::Aider { server, no_web, web: _, args } => {
-            let launch = Launch { web: !no_web, classic: true, initial: None, print: false, session: SessionChoice::New };
+            let launch = Launch {
+                web: !no_web,
+                classic: true,
+                engine: "aider".into(),
+                initial: None,
+                print: false,
+                session: SessionChoice::New,
+            };
             let code = run_aider(&cfg, server.as_deref(), &launch, &args).await?;
             std::process::exit(code);
         }
@@ -453,7 +466,9 @@ async fn status(cfg: &Config, name: Option<&str>) -> Result<()> {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
             let days = ((t - now) / 86400.0).max(0.0);
             if days >= 1.0 {
-                format!("expires in {} day{}", days.floor(), if days.floor() == 1.0 { "" } else { "s" })
+                // Rounded: a fresh one-week pairing reads "7 days", not "6".
+                let d = days.round();
+                format!("expires in {d} day{}", if d == 1.0 { "" } else { "s" })
             } else {
                 format!("expires in {} h", ((t - now) / 3600.0).max(0.0).ceil())
             }
@@ -711,6 +726,7 @@ async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args:
             .env("OPPX_MODEL_ID", &info.model_id)
             .env("OPPX_REASONING", if info.reasoning { "1" } else { "0" })
             .env("OPPX_WEB", if web { "1" } else { "0" })
+            .env("OPPX_ENGINE", &launch.engine)
             .env("OPPX_VERSION", env!("CARGO_PKG_VERSION"))
             .env("OPPX_BIN", std::env::current_exe().unwrap_or_else(|_| "oppx".into()))
             .env("OPPX_PRINT", if launch.print { "1" } else { "0" })

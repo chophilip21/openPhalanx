@@ -31,6 +31,7 @@ class UiState:
     hint = ""
     hint_until = 0.0
     vi = False
+    agent = None  # the agent (agent.Agent) when the agent engine runs
 
 
 UI = UiState()

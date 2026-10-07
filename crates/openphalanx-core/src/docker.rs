@@ -11,9 +11,32 @@ use tokio::process::{Child, Command};
 use crate::model::ModelMount;
 
 pub const CONTAINER_NAME: &str = "openphalanx-backend";
-/// Image tag follows the app version, so each release runs its matching backend.
-pub const DEFAULT_IMAGE: &str =
-    concat!("ghcr.io/chophilip21/openphalanx-backend:", env!("CARGO_PKG_VERSION"));
+/// Local name of the backend image the app builds (see `ensure_image`).
+pub const IMAGE_NAME: &str = "openphalanx-backend";
+
+/// The backend's build files, compiled into the app: on first start it
+/// builds the image itself, from the official SGLang image (pinned by digest
+/// in the Dockerfile) plus these few files. Nothing has to be hosted.
+pub const BUILD_FILES: &[(&str, &str)] = &[
+    ("Dockerfile.server", include_str!("../../../docker/Dockerfile.server")),
+    ("server/gateway.py", include_str!("../../../docker/server/gateway.py")),
+    ("server/start-sglang.sh", include_str!("../../../docker/server/start-sglang.sh")),
+    ("server/supervisord.conf", include_str!("../../../docker/server/supervisord.conf")),
+];
+
+/// `openphalanx-backend:<version>-<hash of the build files>`: a changed
+/// gateway or Dockerfile gets a new tag, so it is rebuilt, never stale.
+pub fn default_image() -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for (path, text) in BUILD_FILES {
+        h.update(path.as_bytes());
+        h.update([0]);
+        h.update(text.as_bytes());
+    }
+    let hash = hex::encode(h.finalize());
+    format!("{IMAGE_NAME}:{}-{}", env!("CARGO_PKG_VERSION"), &hash[..12])
+}
 pub const ADMIN_PORT: u16 = 9091;
 /// Private bridge network shared by the backend and SearXNG (no published ports for SearXNG).
 pub const NETWORK: &str = "openphalanx";
@@ -107,18 +130,48 @@ pub async fn pull(image: &str, on_line: impl FnMut(String)) -> Result<()> {
     stream(&["pull", image], on_line).await
 }
 
-/// Build from a local checkout (development fallback when the image has not
-/// been published yet).
-pub async fn build(context_dir: &Path, image: &str, on_line: impl FnMut(String)) -> Result<()> {
+async fn build(context_dir: &Path, image: &str, on_line: impl FnMut(String)) -> Result<()> {
     let dockerfile = context_dir.join("Dockerfile.server");
     let (df, ctx) = (dockerfile.to_string_lossy(), context_dir.to_string_lossy());
     stream(&["build", "--progress=plain", "-f", &df, "-t", image, &ctx], on_line).await
 }
 
-/// The repo's `docker/` folder, when running from a source checkout.
-pub fn local_build_context() -> Option<PathBuf> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker");
-    dir.join("Dockerfile.server").is_file().then(|| dir.canonicalize().unwrap_or(dir))
+/// Makes sure `image` exists locally. The app's own image is built from
+/// `BUILD_FILES` (the first time this downloads the SGLang base, ~16 GB);
+/// any other image (a custom `image` setting) is pulled. Returns whether it
+/// had to build or pull.
+pub async fn ensure_image(image: &str, on_line: impl FnMut(String)) -> Result<bool> {
+    if image_exists(image).await? {
+        return Ok(false);
+    }
+    if !image.starts_with(&format!("{IMAGE_NAME}:")) {
+        pull(image, on_line).await.with_context(|| format!("could not download the backend image {image}"))?;
+        return Ok(true);
+    }
+    let dir = crate::paths::data_dir().join("build").join(image.replace([':', '/'], "_"));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (path, text) in BUILD_FILES {
+        let p = dir.join(path);
+        std::fs::create_dir_all(p.parent().expect("has a parent"))?;
+        std::fs::write(&p, text)?;
+    }
+    let result = build(&dir, image, on_line).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result.context("could not build the backend image")?;
+    remove_old_images(image).await;
+    Ok(true)
+}
+
+/// Older builds of the app's image (other versions or build files). They
+/// share the SGLang base layers, so this frees only our small layers, but it
+/// keeps `docker images` tidy. Images in use by a container are kept.
+async fn remove_old_images(current: &str) {
+    let Ok(out) = docker(&["images", "--format", "{{.Repository}}:{{.Tag}}", IMAGE_NAME]).await else { return };
+    for tag in String::from_utf8_lossy(&out.stdout).lines() {
+        if tag != current && tag.starts_with(&format!("{IMAGE_NAME}:")) {
+            let _ = docker(&["image", "rm", tag]).await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -564,7 +617,7 @@ mod tests {
 
     fn spec() -> RunSpec {
         RunSpec {
-            image: DEFAULT_IMAGE.into(),
+            image: default_image(),
             gpu_index: 0,
             agent_port: 9090,
             model: ModelMount { dirs: vec!["/m".into(), "/blobs".into()], model_path: "/m".into() },
@@ -607,7 +660,7 @@ mod tests {
         assert!(a.contains("-e SEARXNG_URL=http://openphalanx-searxng:8080"));
         assert!(a.contains("-e MODEL_ID=Qwen/X") && a.contains("-e EDIT_FORMAT=diff"));
         assert!(a.contains("-e SGLANG_EXTRA_ARGS=--reasoning-parser qwen3"));
-        assert!(a.ends_with(DEFAULT_IMAGE));
+        assert!(a.ends_with(&default_image()));
     }
 
     #[test]
@@ -627,7 +680,7 @@ mod tests {
     #[test]
     fn workers_run_sglang_alone() {
         let w = WorkerSpec {
-            image: DEFAULT_IMAGE.into(),
+            image: default_image(),
             gpu_index: 0,
             model: ModelMount { dirs: vec!["/m".into()], model_path: "/m".into() },
             model_key: "catalog:Qwen/X".into(),
@@ -658,6 +711,21 @@ mod tests {
         assert!(a.contains("-v /d/settings.yml:/etc/searxng/settings.yml:ro"));
         assert!(a.contains("searxng/searxng@sha256:"));
         assert!(SEARXNG_SETTINGS.contains("formats: [json]"));
+    }
+
+    #[test]
+    fn the_image_tag_follows_the_version_and_the_build_files() {
+        let tag = default_image();
+        let prefix = format!("openphalanx-backend:{}-", env!("CARGO_PKG_VERSION"));
+        assert!(tag.starts_with(&prefix), "{tag}");
+        assert_eq!(tag.len(), prefix.len() + 12);
+        assert_eq!(tag, default_image(), "stable");
+        assert!(BUILD_FILES[0].1.contains("FROM lmsysorg/sglang@sha256:"), "the base stays pinned by digest");
+        // Every file the Dockerfile copies is embedded.
+        for line in BUILD_FILES[0].1.lines().filter(|l| l.starts_with("COPY ")) {
+            let src = line.split_whitespace().nth(1).unwrap();
+            assert!(BUILD_FILES.iter().any(|(p, _)| *p == src), "{src} isn't in BUILD_FILES");
+        }
     }
 
     #[test]

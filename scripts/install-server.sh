@@ -5,7 +5,8 @@
 #
 # Checks the prerequisites the app can't install for you (NVIDIA driver,
 # Docker, NVIDIA Container Toolkit), then installs the Openphalanx app from
-# the release's .deb. The app downloads the backend image on first start.
+# the release's .deb. The app builds the backend image on first start (Docker
+# downloads the official SGLang image, about 16 GB, once).
 # OPPX_VERSION=1.2.3 installs a specific release instead of the latest.
 set -eu
 

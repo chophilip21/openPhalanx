@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::docker::DEFAULT_IMAGE;
+use crate::docker::default_image;
 use crate::paths;
 use crate::vram::ArchSpec;
 
@@ -67,7 +67,7 @@ fn path() -> PathBuf {
 
 impl Settings {
     pub fn image(&self) -> String {
-        self.image.clone().unwrap_or_else(|| DEFAULT_IMAGE.to_string())
+        self.image.clone().unwrap_or_else(default_image)
     }
 
     pub fn load() -> Settings {
