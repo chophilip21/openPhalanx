@@ -1,13 +1,12 @@
 # CLAUDE.md
 
-Working notes for developing this repo: architecture, operations, commands and conventions. End-user docs are in `README.md`; the roadmap and step-by-step progress are in `milestone.md`.
+Working notes for developing this repo: architecture, operations, commands and conventions. End-user docs are in `README.md`; the release history is in `CHANGELOG.md`.
 
 ## Conventions
 
 * **Docs:**
   * `README.md` is for end users only: what the project is, plus the minimum commands to run the server and a client. Keep it at 50–100 lines.
-  * Everything operational or developer-facing goes here.
-  * Roadmap status (phases, steps, checkboxes, verification notes) goes in `milestone.md`.
+  * Everything operational or developer-facing goes here, including what was measured and verified.
 * **Agents never commit directly:** any agent launcher or config (Aider, `oppx aider`, etc.) must use `--no-auto-commits --no-dirty-commits`. The user reviews with `git diff` and commits themselves.
 * **Commits:** never commit or push unless the user explicitly asks for that commit. Finish with an uncommitted diff and a summary.
 * **Model-agnostic:** everything that makes the experience seamless must work with any model SGLang serves. Use constrained decoding (regex or JSON schema) rather than per-model tool-call or reasoning parsers, put unavoidable per-model differences in catalog data, and check accuracy with probe sets against the loaded model rather than tuning prompts to one model.
@@ -222,7 +221,7 @@ oppx servers | oppx use NAME
   * **Model info:** `oppx` reads `GET /v1/info` at start-up and passes `OPPX_MODEL_ID` (shown in the welcome box, status bar and `/status`) and a `--model-settings-file` with the server's `edit_format` and `use_repo_map: true` (Aider otherwise assumes `whole` and no repo map for our model name). Reasoning output is hidden by `hide_reasoning`, and the spinner keeps going while the model reasons. That covers `<think>` spans, a lone `</think>`, Aider's "► THINKING / ► ANSWER" markers, and Aider's internal `<thinking-content-…>` tag: with SGLang's separate `reasoning_content`, Aider 0.86 opens with that tag but closes with the configured one. `OppxIO.ai_output` strips reasoning from the session file too, so `-c`/`-r` don't resend it.
   * **Memory:** `OPENPHALANX.md` (and `AGENTS.md` if present) in the repo root is loaded read-only every turn. `/init` asks the model to write it.
   * **Sessions:** one file per conversation in `~/.local/state/oppx/history/<repo>-<id>/<YYYYmmdd-HHMMSS>.md`, with a shared `input.history`. The old single per-repo file is migrated as session `00000000-000000`. `-c` and `-r` pass `--restore-chat-history`.
-  * **Prefix-cache friendliness** (`oppx_chat/cache.py`; measured with `scripts/bench_session.py`, milestone Step 5.2). SGLang only reuses an unchanged prompt prefix, and two things used to change near the start of every request, giving 3–7% cache hits over 10 turns:
+  * **Prefix-cache friendliness** (`oppx_chat/cache.py`; measured with `scripts/bench_session.py`). SGLang only reuses an unchanged prompt prefix, and two things used to change near the start of every request, giving 3–7% cache hits over 10 turns:
     * **Repo map:** Aider re-ranked it around the chat files and the names each message mentions. It's now ranked once for the whole repo and cached per (file list, map size). The context manager's map size only shrinks within a session (reset by `/clear`).
     * **System prompt:** questions ran in Aider's ask mode, which has its own prompts. `AskCoder` now gets the editing coder's prompts, and the question carries `ASK_NOTE`; ask mode never applies edits. The map heading's `{other}` word is fixed too.
 
@@ -242,7 +241,7 @@ oppx servers | oppx use NAME
 
 ## Cluster
 
-Servers on one network form a cluster: one **host** and its **members**. They don't share inference yet (see `milestone.md`, "Next version"). The service is `cluster::Cluster` in core. It runs inside the app, or headless as `openphalanx-server run` (`crates/openphalanx-server`); both use `~/.local/share/openphalanx/cluster/`, so run one per machine.
+Servers on one network form a cluster: one **host** and its **members**. With the split strategy they serve one model together (see **Split serving** below). The service is `cluster::Cluster` in core. It runs inside the app, or headless as `openphalanx-server run` (`crates/openphalanx-server`); both use `~/.local/share/openphalanx/cluster/`, so run one per machine.
 
 * **Discovery:** every server broadcasts a beacon (id, name, role, certificate fingerprint) on UDP `9093` every 3 s. A server is listed under **Servers on this network** only when its beacon is under 10 s old *and* a TLS health check, pinned to the fingerprint it announced, succeeds. Stopped or unreachable servers drop off within about 10 s. Broadcast only crosses one LAN segment, not Tailscale.
   * **Fast join:** a server that starts (app opened, or `openphalanx-server run`) sends a query beacon twice; the others answer by unicast at once and check it immediately, so it is listed in about 0.3 s (measured on the 4090) instead of waiting for the next 3 s round.
@@ -311,7 +310,7 @@ Servers on one network form a cluster: one **host** and its **members**. They do
     2. **Query:** only on `yes`, a call writes the search query (constrained JSON, or free text on reasoning models). It's told today's date, and `drop_invented_dates` removes dates and years the model added that the user didn't write. gpt-oss stamped queries with "2024-10-04" or today's date and found stale pages.
     3. **Results** say when they were retrieved, that they beat training data for things that change (versions, releases), and that links can't be opened. gpt-oss otherwise tried to browse and returned nothing.
   * **Speculative routing:** the answer starts at the same time as the router, and its response is held unread until the router decides. With no search, the router costs **about 27 ms** of time-to-first-token (68 ms against 39 ms measured). With a search, the speculative answer is closed (SGLang aborts it) and the request is resent with `<web_search_results>` appended to the end of the latest message, with an "untrusted" note.
-  * Native tool calling was tried and doesn't work with Qwen2.5-Coder-14B (see `milestone.md`, Step 4.5).
+  * Native tool calling was tried and doesn't work with Qwen2.5-Coder-14B.
 * **Client:** `oppx`, `oppx aider` and `oppx proxy` send the header by default; `--no-web` opts out (`--web` is accepted as a hidden no-op). `oppx search` calls `/v1/search`.
 * **Manual run (without the GUI):**
 
@@ -400,7 +399,7 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
   * sliding-window layers (Gemma 4, gpt-oss) × 0.8 of the context (`--swa-full-tokens-ratio`);
   * Gemma 4's full layers use their own shape (`global_head_dim`, `num_global_key_value_heads`);
   * hybrid linear-attention models (Qwen3-Next, Qwen3.6) × 1.9, for the recurrent-state pool (`--mamba-full-memory-ratio` 0.9).
-* **Validated on hardware:** Qwen2.5-Coder-14B-AWQ, and gpt-oss-20b (MXFP4 on the 3090, the whole Step 5.1 run). The rest is not yet validated. MXFP4 (gpt-oss) is counted at 4 bits, since SGLang's Marlin and Triton kernels keep it packed on Ampere. Milestone Step 5.3 runs the matrix.
+* **Validated on hardware:** Qwen2.5-Coder-14B-AWQ and gpt-oss-20b (MXFP4) on the 3090, and Qwen3.6-27B-AWQ split across the 3090 and the 4090 laptop. The rest is not yet validated; a model matrix run (routing probes, `scripts/eval_edits.py`, tokens/s) is still to do. MXFP4 (gpt-oss) is counted at 4 bits, since SGLang's Marlin and Triton kernels keep it packed on Ampere.
 
 ## Releasing
 
@@ -450,7 +449,6 @@ scripts/bench_session.py 10-turn prefix-cache benchmark through a real oppx sess
 scripts/bump_version.py  version bump from a PR title, plus the CHANGELOG.md entry
 scripts/gen_docs.py      docs site sources (README, CLI and API reference, CLAUDE.md, roadmap)
 scripts/install*.sh      client and server installers (attached to each release)
-milestone.md             roadmap and progress
 ```
 
 ## Design decision: agent on the client

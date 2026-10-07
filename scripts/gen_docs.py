@@ -14,7 +14,6 @@ Pages:
 * Gateway API reference: every route in docker/server/gateway.py with its
   method, authentication and docstring (read with `ast`; no imports needed).
 * Operations and development: CLAUDE.md.
-* Roadmap: milestone.md.
 * Changelog: CHANGELOG.md (written by scripts/bump_version.py).
 """
 
@@ -103,12 +102,11 @@ def main():
     (src / "cli.md").write_text(cli_reference(args.oppx))
     (src / "api.md").write_text(api_reference(ROOT / "docker/server/gateway.py"))
     copy("CLAUDE.md", "development.md", "Operations and development")
-    copy("milestone.md", "roadmap.md", "Roadmap")
     copy("CHANGELOG.md", "changelog.md", "Changelog")
     (src / "SUMMARY.md").write_text(
         "# Summary\n\n[Introduction](introduction.md)\n\n"
         "- [Client CLI reference](cli.md)\n- [Gateway API reference](api.md)\n"
-        "- [Operations and development](development.md)\n- [Roadmap](roadmap.md)\n- [Changelog](changelog.md)\n"
+        "- [Operations and development](development.md)\n- [Changelog](changelog.md)\n"
     )
     (out / "book.toml").write_text(
         '[book]\ntitle = "Openphalanx"\nauthors = ["Openphalanx contributors"]\nlanguage = "en"\nsrc = "src"\n\n'
