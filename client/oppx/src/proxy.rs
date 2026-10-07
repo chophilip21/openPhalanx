@@ -64,7 +64,10 @@ impl Proxy {
             .route("/v1/models", get(forward))
             .route("/v1/chat/completions", post(forward))
             .route("/v1/tokenize", post(forward))
-            .fallback(|| async { error(StatusCode::NOT_FOUND, "oppx proxy only serves /v1/models, /v1/chat/completions and /v1/tokenize") })
+            .route("/v1/search", post(forward)) // the agent's web_search tool
+            .fallback(|| async {
+                error(StatusCode::NOT_FOUND, "oppx proxy only serves /v1/models, /v1/chat/completions, /v1/tokenize and /v1/search")
+            })
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(state);
         Ok(Proxy { addr, local_key, listener, app })

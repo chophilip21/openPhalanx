@@ -33,6 +33,7 @@ LIST_FILES = 200
 RESULT_CHARS = 12_000  # a tool result is cut beyond this
 RUN_TIMEOUT = 120
 ANSWER_RESERVE = 4096  # tokens kept free for the model's reply
+FIT_LOW = 0.75  # once over budget, cut down to this share of it
 KEEP_RECENT = 6  # tool results never cut: the latest few
 
 TOOLS = ("list", "grep", "outline", "read", "edit", "create", "run", "web_search", "answer")
@@ -113,6 +114,26 @@ class Hooks:
 
 class ToolError(Exception):
     pass
+
+
+class ContextOverflow(RuntimeError):
+    """The server refused a request as longer than the model's window."""
+
+    def __init__(self, message: str, input_tokens: int):
+        super().__init__(message)
+        self.input_tokens = input_tokens
+
+
+# SGLang's refusals; the first number is the request's real input size.
+OVERFLOW = re.compile(r"(\d+) tokens from the input messages|The input \((\d+) tokens\) is longer"
+                      r"|Input length \((\d+) tokens\) exceeds")
+
+
+def server_error(status: int, text: str) -> RuntimeError:
+    m = OVERFLOW.search(text)
+    if status == 400 and m:
+        return ContextOverflow(f"server error {status}: {text[:300]}", int(next(g for g in m.groups() if g)))
+    return RuntimeError(f"server error {status}: {text[:300]}")
 
 
 class Workspace:
@@ -247,6 +268,21 @@ class Workspace:
         return f"exit code {out.returncode}\n{text}"
 
 
+def with_filename(reply: str, rel: str) -> str:
+    """Adds the filename line Aider's parser needs above each SEARCH block
+    that lacks one: the agent already knows the file, and Qwen3.6 dropped
+    the line on every try, so a 25-step edit turn changed nothing."""
+    out: list[str] = []
+    for line in reply.splitlines(keepends=True):
+        if line.strip().startswith("<<<<<<< SEARCH"):
+            at = len(out) - 1 if out and out[-1].strip().startswith(("```", "~~~")) else len(out)
+            named = at > 0 and out[at - 1].strip().strip("`*").endswith(rel)
+            if not named:
+                out.insert(at, rel + "\n")
+        out.append(line)
+    return "".join(out)
+
+
 def apply_edit(ws: Workspace, path: str, reply: str) -> tuple[str, str, str]:
     """Applies the SEARCH/REPLACE blocks in `reply` to `path` with Aider's
     matcher (exact, then whitespace-tolerant). Returns (rel, before, after)."""
@@ -258,7 +294,7 @@ def apply_edit(ws: Workspace, path: str, reply: str) -> tuple[str, str, str]:
     content = before
     blocks = 0
     try:
-        found = list(find_original_update_blocks(reply, valid_fnames=[rel]))
+        found = list(find_original_update_blocks(with_filename(reply, rel), valid_fnames=[rel]))
     except ValueError as e:
         raise ToolError(f"couldn't parse the edit: {str(e)[:400]}") from e
     for fname, search, replace in found:
@@ -356,6 +392,11 @@ class Agent:
     last_prompt_tokens: int = 0
     cached_tokens: int = 0
     computed_tokens: int = 0
+    completion_tokens: int = 0
+    # Real tokens per estimated token: the largest the server has shown this
+    # session (characters / 3 ran ~5% short on Qwen3.6 for code).
+    ratio: float = 1.0
+    _sent_raw: int = 0
 
     # ---- model calls ------------------------------------------------------
     def _system(self) -> str:
@@ -386,14 +427,18 @@ class Agent:
         body = {"model": MODEL, "messages": [{"role": "system", "content": self._system()}] + self._clean(),
                 "temperature": 0, "oppx_utility": True, **extra}
         if self.reasoning:
-            body.setdefault("chat_template_kwargs", {"reasoning_effort": "low"})
+            # Both spellings, like the router: gpt-oss reads the first, Qwen3
+            # the second. With only the first, Qwen3.6 wrote its whole action
+            # into reasoning_content and left the content empty.
+            body.setdefault("chat_template_kwargs", {"reasoning_effort": "low", "enable_thinking": False})
+        self._sent_raw = self._raw_estimate()
         return body
 
     def _post(self, body: dict) -> dict:
         r = httpx.post(f"{self.base}/chat/completions", headers={"Authorization": f"Bearer {self.key}"},
                        json=body, timeout=600)
         if r.status_code >= 400:
-            raise RuntimeError(f"server error {r.status_code}: {r.text[:300]}")
+            raise server_error(r.status_code, r.text)
         data = r.json()
         self._count(data.get("usage") or {})
         return data
@@ -402,17 +447,32 @@ class Agent:
         prompt = usage.get("prompt_tokens") or 0
         cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
         self.last_prompt_tokens = prompt
+        if prompt and self._sent_raw:
+            self.ratio = max(self.ratio, prompt / self._sent_raw * 1.02)
         self.cached_tokens += cached
         self.computed_tokens += max(0, prompt - cached)
+        self.completion_tokens += usage.get("completion_tokens") or 0
+
+    def _sized(self, send):
+        """Sends; if the server says the request doesn't fit, learns its real
+        size from the refusal, fits the conversation again and resends once."""
+        try:
+            return send()
+        except ContextOverflow as e:
+            self.ratio = max(self.ratio, e.input_tokens / max(1, self._sent_raw) * 1.05)
+            self._fit()
+            return send()
 
     def _action(self, tools: tuple[str, ...]) -> dict:
         schema = action_schema(tools)
-        data = self._post(self._body({
+        data = self._sized(lambda: self._post(self._body({
             "max_tokens": 400,
             "response_format": {"type": "json_schema", "json_schema": {"name": "action", "schema": schema}},
-        }))
-        text = data["choices"][0]["message"].get("content") or ""
-        m = re.search(r"\{.*\}", text, re.S)  # reasoning models may think first
+        })))
+        msg = data["choices"][0]["message"]
+        # Reasoning models may think first, or put the action in their reasoning.
+        text = msg.get("content") or msg.get("reasoning_content") or ""
+        m = re.search(r"\{.*\}", text, re.S)
         try:
             act = json.loads(m.group(0) if m else text)
         except json.JSONDecodeError:
@@ -427,6 +487,9 @@ class Agent:
         return max(256, min(want, self.context - used - 256))
 
     def _text(self, max_tokens: int, stream: bool) -> str:
+        return self._sized(lambda: self._text_once(max_tokens, stream))
+
+    def _text_once(self, max_tokens: int, stream: bool) -> str:
         self._fit()
         body = self._body({"max_tokens": self._room(max_tokens), "stream": stream})
         if not stream:
@@ -447,7 +510,7 @@ class Agent:
                           json=body, timeout=600) as r:
             if r.status_code >= 400:
                 r.read()
-                raise RuntimeError(f"server error {r.status_code}: {r.text[:300]}")
+                raise server_error(r.status_code, r.text)
             for line in r.iter_lines():
                 if not line.startswith("data: ") or line == "data: [DONE]":
                     continue
@@ -467,15 +530,21 @@ class Agent:
     # ---- context ----------------------------------------------------------
     def _fit(self):
         """Keeps the next request inside the window: cut old tool output first
-        (oldest first, never the latest few), then drop the oldest turns."""
+        (oldest first, never the latest few), then drop the oldest turns.
+
+        Each cut changes an early message, so the prefix cache misses from
+        there on; it cuts down to FIT_LOW of the budget, so the next steps only
+        append. Cutting just enough recomputed the whole ~28k-token prompt on
+        every step near the limit."""
         budget = self.context - ANSWER_RESERVE
         est = self._estimate()
         if est <= budget:
             return
+        budget = int(budget * FIT_LOW)
         results = [i for i, m in enumerate(self.messages) if m.get("_result") and not m.get("_cut")]
         for i in results[:-KEEP_RECENT]:
             m = self.messages[i]
-            saved = len(m["content"]) // 3
+            saved = int(len(m["content"]) // 3 * self.ratio)
             m["content"] = m["content"].split("\n", 1)[0] + "\n[output removed to save space; run the tool again if you need it]"
             m["_cut"] = True
             est -= saved
@@ -486,13 +555,23 @@ class Agent:
             drop = 1
             while drop < len(self.messages) and not self.messages[drop].get("_user"):
                 drop += 1
-            est -= sum(len(m["content"]) for m in self.messages[:drop]) // 3
+            est -= int(sum(len(m["content"]) for m in self.messages[:drop]) // 3 * self.ratio)
             del self.messages[:drop]
 
-    def _estimate(self) -> int:
-        """Prompt tokens of the next request: the system prompt and every
-        message, at ~3 characters a token (conservative for code)."""
+    def _raw_estimate(self) -> int:
+        """The system prompt and every message, at ~3 characters a token."""
         return (len(self._system()) + sum(len(m["content"]) + 8 for m in self.messages)) // 3
+
+    def _estimate(self) -> int:
+        """Prompt tokens of the next request, corrected by what the server counted."""
+        return int(self._raw_estimate() * self.ratio)
+
+    def context_parts(self) -> list[tuple[str, int]]:
+        """What the next request holds, estimated like `_fit` does (/context)."""
+        tool = sum(len(m["content"]) + 8 for m in self.messages if m.get("_result"))
+        talk = sum(len(m["content"]) + 8 for m in self.messages if not m.get("_result"))
+        return [(name, int(n // 3 * self.ratio))
+                for name, n in (("Instructions", len(self._system())), ("Conversation", talk), ("Tool output", tool))]
 
     def _clean(self) -> list:
         return [{"role": m["role"], "content": m["content"]} for m in self.messages]
@@ -533,7 +612,7 @@ class Agent:
         tools = tuple(t for t in TOOLS if (can_edit or t not in EDIT_TOOLS) and (self.web or t != "web_search"))
         done: dict[str, int] = {}  # action -> step it was taken, to stop loops
         reads: dict[str, list] = {}  # path -> [(first, last, step)] shown this turn
-        repeats = 0
+        repeats = search_errors = 0
         searched = opened = changed = 0  # grep/list, read/outline, edit/create steps this turn
         nudged = edit_nudged = checked = False
         changed_files: list[str] = []
@@ -599,6 +678,13 @@ class Agent:
             else:
                 done[sig] = n
                 result = self._do(act)
+                if tool == "web_search" and result.startswith("Error:"):
+                    # A failing search fails the same way rephrased; small
+                    # models kept rewording the query until the steps ran out.
+                    search_errors += 1
+                    if search_errors >= 2:
+                        tools = tuple(t for t in tools if t != "web_search")
+                        result += "\n\nWeb search isn't working right now; carry on without it."
                 if tool == "read":
                     result = self._note_read(act, result, reads, n)
             left = MAX_STEPS - n

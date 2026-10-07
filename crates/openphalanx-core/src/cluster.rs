@@ -138,6 +138,9 @@ pub struct ModelSync {
     pub error: Option<String>,
 }
 
+/// As host: the orders of the split run in progress, kept across app restarts.
+const WORKERS_FILE: &str = "workers.json";
+
 /// As host: what a member should run for a model split across servers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerOrder {
@@ -550,6 +553,12 @@ pub struct Cluster {
     /// As member: the order it runs, and how that is going.
     worker: Mutex<Option<WorkerOrder>>,
     worker_status: Mutex<Option<WorkerStatus>>,
+    /// One worker start at a time; a start the host has replaced meanwhile
+    /// cleans up after itself before the next one runs.
+    worker_start: tokio::sync::Mutex<()>,
+    /// When this service started: a member not heard from since is given
+    /// until its first report before it counts as dropped.
+    started_at: u64,
 }
 
 /// One controller per cluster: the host. Checked and set under one lock, so
@@ -583,6 +592,12 @@ impl Cluster {
             Ok(bytes) => serde_json::from_slice(&bytes).context("members.json is not valid")?,
             Err(_) => Vec::new(),
         };
+        // The split run in progress, so reopening the app doesn't withdraw the
+        // members' shares (the host's backend outlives the app).
+        let workers = std::fs::read(dir.join(WORKERS_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         let c = Arc::new(Cluster {
             dir: dir.to_path_buf(),
             fingerprint: pinned_tls::fingerprint(&der),
@@ -606,9 +621,11 @@ impl Cluster {
             check_now: tokio::sync::Notify::new(),
             control: Mutex::new(Control::default()),
             host_serving: Mutex::new(false),
-            workers: Mutex::new(HashMap::new()),
+            workers: Mutex::new(workers),
             worker: Mutex::new(None),
             worker_status: Mutex::new(None),
+            worker_start: tokio::sync::Mutex::new(()),
+            started_at: now(),
         });
         c.save_state()?;
         Ok(c)
@@ -810,7 +827,10 @@ impl Cluster {
             .iter()
             .filter(|m| {
                 let l = live.get(&m.peer.id);
-                let seen = l.and_then(|l| l.last_seen).unwrap_or(m.joined_at);
+                // Not heard from since this service started (the app reopened
+                // on a running split): count from the start, not from joining,
+                // or the split pauses before the member's first report.
+                let seen = l.and_then(|l| l.last_seen).unwrap_or(m.joined_at.max(self.started_at));
                 l.is_some_and(|l| l.gone) || t.saturating_sub(seen) > after_secs
             })
             .map(|m| m.peer.name.clone())
@@ -1671,18 +1691,44 @@ impl Cluster {
             *self.worker_status.lock().unwrap() = None;
             return;
         };
-        let status = |state: &str, message: Option<String>| WorkerStatus { run_id: order.run_id.clone(), state: state.into(), message };
-        *self.worker_status.lock().unwrap() = Some(status("starting", None));
+        *self.worker_status.lock().unwrap() =
+            Some(WorkerStatus { run_id: order.run_id.clone(), state: "starting".into(), message: None });
+        if current.is_none() {
+            // This service restarted while its worker kept running: adopt it
+            // (recreating it would break the host's running model).
+            if let Ok(Some((run, st))) = crate::docker::worker_state().await {
+                if run == order.run_id && st.running {
+                    self.log("Rejoined this machine's running share of the split model.".to_string());
+                    return;
+                }
+            }
+        }
         self.log(format!(
             "Starting this machine's share of {}: rank {} of {}, {} layers.",
             order.model.label, order.rank.rank, order.rank.nnodes, order.stage.layers
         ));
-        let result = start_worker(&order).await;
-        if let Err(e) = result {
-            let message = format!("{e:#}");
-            self.log(format!("Couldn't start the split-model worker: {message}"));
-            *self.worker_status.lock().unwrap() = Some(status("failed", Some(message)));
-        }
+        // In its own task: the first start builds the image (a ~16 GB download
+        // the first time), and the report loop must keep reporting meanwhile,
+        // or the host takes this machine for gone after 12 s and pauses.
+        tokio::spawn(async move {
+            let _one = self.worker_start.lock().await;
+            let current = |c: &Cluster| c.worker.lock().unwrap().as_ref().map(|o| o.run_id.clone());
+            if current(&self).as_ref() != Some(&order.run_id) {
+                return; // replaced or cancelled before it began
+            }
+            let result = start_worker(&order).await;
+            if current(&self).as_ref() != Some(&order.run_id) {
+                // Replaced or cancelled while starting: don't leave it running.
+                let _ = crate::docker::remove_worker().await;
+                return;
+            }
+            if let Err(e) = result {
+                let message = format!("{e:#}");
+                self.log(format!("Couldn't start the split-model worker: {message}"));
+                *self.worker_status.lock().unwrap() =
+                    Some(WorkerStatus { run_id: order.run_id.clone(), state: "failed".into(), message: Some(message) });
+            }
+        });
     }
 
     /// As member: the worker's state for the next report.
@@ -1706,13 +1752,48 @@ impl Cluster {
                 status.message = Some(format!("{e:#}"));
             }
         }
-        *self.worker_status.lock().unwrap() = Some(status.clone());
+        let mut stored = self.worker_status.lock().unwrap();
+        match stored.as_ref() {
+            // The start task failed or a new order came while Docker answered: keep that.
+            Some(s) if s.run_id != status.run_id || s.state == "failed" => return stored.clone(),
+            None => return None,
+            _ => *stored = Some(status.clone()),
+        }
         Some(status)
     }
 
     /// As host: the shares members should run for this start (empty to stop).
     pub fn set_workers(&self, orders: HashMap<String, WorkerOrder>) {
+        let path = self.dir.join(WORKERS_FILE);
+        let saved = if orders.is_empty() {
+            std::fs::remove_file(&path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+                .map_err(anyhow::Error::from)
+        } else {
+            serde_json::to_vec_pretty(&orders).map_err(anyhow::Error::from).and_then(|b| write_private(&path, &b))
+        };
+        if let Err(e) = saved {
+            eprintln!("cluster: couldn't save the split orders: {e:#}");
+        }
         *self.workers.lock().unwrap() = orders;
+    }
+
+    /// As host: whether members have orders for a split run.
+    pub fn has_workers(&self) -> bool {
+        !self.workers.lock().unwrap().is_empty()
+    }
+
+    /// As host: the split run's plan, like `split::describe`, rebuilt from
+    /// the orders (after the app reopens on a running split model).
+    pub fn split_summary(&self) -> Option<String> {
+        let workers = self.workers.lock().unwrap();
+        let host_layers = workers.values().next()?.rank.partition.split(',').next()?.to_string();
+        let mut stages: Vec<&crate::split::Stage> = workers.values().map(|o| &o.stage).collect();
+        stages.sort_by_key(|s| s.rank);
+        let mut parts = vec![format!("{}: {host_layers} layers", self.name())];
+        parts.extend(stages.iter().map(|s| {
+            format!("{}: {} layers ({})", s.name, s.layers, crate::vram::fmt_gib(s.requirement.total_bytes))
+        }));
+        Some(parts.join(" · "))
     }
 
     /// As host: each member's worker state for the run in progress.

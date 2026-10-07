@@ -4,7 +4,7 @@
 
 **A private AI coding agent on your own GPU**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/chophilip21/openPhalanx?logo=github)](https://github.com/chophilip21/openPhalanx/releases)
 ![Status: early development](https://img.shields.io/badge/Status-Early%20development-informational.svg)
 

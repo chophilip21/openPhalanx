@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-turn prefix-cache benchmark (milestone Step 5.2).
+"""Multi-turn prefix-cache benchmark.
 
 Drives a real `oppx` chat session in a pseudo-terminal through a fixed mix of
 questions and edits, and reads SGLang's own log for each turn: how many prompt

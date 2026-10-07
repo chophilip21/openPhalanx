@@ -69,6 +69,9 @@ struct Inner {
     want_pairing: bool,
     /// Free VRAM per GPU, last measured while our container was not running.
     idle_free_vram: HashMap<u32, u64>,
+    /// The same for each cluster member's best GPU (by member id): while a
+    /// split model runs, its worker holds that memory.
+    idle_member_free: HashMap<String, u64>,
     downloads: HashMap<String, DownloadView>,
     cancels: HashMap<String, download::Cancel>,
     log_follower: bool,
@@ -201,6 +204,12 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
         for g in &gpus {
             inner.idle_free_vram.insert(g.index, g.free_bytes);
         }
+        for m in st.cluster.as_ref().map(|c| c.members()).unwrap_or_default() {
+            let best = m.report.as_ref().and_then(|r| r.inventory.gpus.iter().map(|g| g.free_bytes).max());
+            if let (true, Some(free)) = (m.online, best) {
+                inner.idle_member_free.insert(m.id, free);
+            }
+        }
     } else if managed && matches!(inner.phase, Phase::Idle) && inner.stop_epoch == epoch {
         inner.expect_running = true; // adopt a container from a previous session
     }
@@ -210,6 +219,15 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
     }
 
     if let Some(c) = st.cluster.as_ref().filter(|c| !c.is_member()) {
+        // Split orders are kept across app restarts: pick a running split
+        // back up, and drop orders left from a run that is gone.
+        if c.has_workers() && matches!(inner.phase, Phase::Idle) {
+            if running && managed && inner.split.is_none() {
+                inner.split = c.split_summary();
+            } else if !running && !inner.expect_running {
+                c.set_workers(HashMap::new());
+            }
+        }
         // Split model: every server holds part of it, so one dropping out
         // (or its worker failing) breaks inference. Stop instead of failing
         // requests, and say why.
@@ -426,7 +444,7 @@ fn plan_split(state: &AppState, settings: &Settings, pf: &mut server::Preflight)
         return None;
     }
     let c = state.cluster.as_ref()?;
-    let pool = cluster_pool(state, pf.gpu.as_ref(), Some(fit.free_bytes))?;
+    let pool = cluster_pool(state, pf.gpu.as_ref(), Some(fit.free_bytes), pf.running)?;
     let names = pool.iter().filter(|n| !n.this).map(|n| n.name.clone()).collect::<Vec<_>>().join(", ");
 
     let result = (|| -> Result<SplitPlan, String> {
@@ -799,7 +817,8 @@ fn is_app_managed(dir: &Path) -> bool {
 /// members, so it can use their VRAM too (one GPU per machine, the one with
 /// the most free memory, as reported every 5 s). `None` unless this is a
 /// split cluster's host with an online member.
-fn cluster_pool(state: &AppState, gpu: Option<&gpu::GpuInfo>, available: Option<u64>) -> Option<Vec<PoolNode>> {
+fn cluster_pool(state: &AppState, gpu: Option<&gpu::GpuInfo>, available: Option<u64>, running: bool) -> Option<Vec<PoolNode>> {
+    let idle = state.inner.lock().unwrap().idle_member_free.clone();
     state
         .cluster
         .as_ref()
@@ -816,12 +835,14 @@ fn cluster_pool(state: &AppState, gpu: Option<&gpu::GpuInfo>, available: Option<
             for m in c.members().into_iter().filter(|m| m.online) {
                 let best = m.report.as_ref().and_then(|r| r.inventory.gpus.iter().max_by_key(|g| g.free_bytes).cloned());
                 if let Some(g) = best {
+                    // While serving, what it had before its worker started.
+                    let available = if running { idle.get(&m.id).copied().unwrap_or(g.free_bytes) } else { g.free_bytes };
                     nodes.push(PoolNode {
                         id: m.id,
                         name: m.name,
                         this: false,
                         gpu: Some(g.name),
-                        available_bytes: g.free_bytes,
+                        available_bytes: available,
                         total_bytes: g.total_bytes,
                     });
                 }
@@ -846,7 +867,7 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
         None => (None, "no GPU detected"),
     };
 
-    let pool = cluster_pool(&state, gpu.as_ref(), available);
+    let pool = cluster_pool(&state, gpu.as_ref(), available, running);
     let servers = pool.as_ref().map_or(1, |p| p.len() as u32);
     let (available, basis) = match &pool {
         Some(p) => (Some(p.iter().map(|n| n.available_bytes).sum()), "pooled across the cluster (split)"),

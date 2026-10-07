@@ -15,6 +15,7 @@ from .context import CONTEXT_MGR, MAP_MAX, PRI_EDITED, PRI_MODEL, PRI_USER, _ori
 from .oppx_io import show_shortcuts
 from .routing import wants_edit
 from .cache import ASK_NOTE
+from .agent import ANSWER_RESERVE as AGENT_RESERVE
 
 
 # ---------------------------------------------------------------------------
@@ -84,8 +85,32 @@ def show_status(coder):
         step(f"[bold]{k:<14}[/] {escape(v)}")
 
 
+def _show_agent_context(agent):
+    """/context for the agent engine: it sends no repo map or whole files,
+    only its instructions, the conversation and the tool output it asked for."""
+    parts = agent.context_parts()
+    total = sum(n for _, n in parts)
+    budget = CONTEXT - AGENT_RESERVE
+    width = 40
+    filled = min(width, round(width * total / CONTEXT))
+    mark = min(width - 1, round(width * budget / CONTEXT))
+    bar = "".join("█" if i < filled else ("│" if i == mark else "░") for i in range(width))
+    color = GREEN if total <= budget * 0.8 else (YELLOW if total <= budget else RED)
+    headline(f"[bold]Context[/] [{MUTED}]· about {total:,} of {CONTEXT:,} tokens[/]")
+    out(f"  [{color}]{bar}[/] [{MUTED}]{100 * total // CONTEXT}% used · │ = budget ({budget:,}), "
+        f"the rest is kept for the answer[/]")
+    for name, n in parts:
+        out(f"    [{MUTED}]{name:<16}[/] {n:>7,}")
+    if agent.last_prompt_tokens:
+        out(f"  [{MUTED}]Last request, counted by the server: {agent.last_prompt_tokens:,} tokens.[/]")
+    out(f"  [{MUTED}]Near the limit, OpenPhalanx cuts old tool output first (the latest few are kept), "
+        f"then the oldest turns.[/]")
+
+
 def show_context(coder):
     """Claude-style context view: what fills the window and how much room is left."""
+    if UI.agent is not None:
+        return _show_agent_context(UI.agent)
     chunks = _orig_format_messages(coder)
     count = coder.main_model.token_count
     parts = [
@@ -123,8 +148,14 @@ def show_context(coder):
 
 def show_cost(coder):
     sent, recv = coder.total_tokens_sent, coder.total_tokens_received
+    if UI.agent is not None:  # the agent engine talks to the server itself
+        a = UI.agent
+        sent, recv = a.computed_tokens + a.cached_tokens, a.completion_tokens
     headline("[bold]Session usage[/]")
     step(f"{sent:,} tokens sent · {recv:,} received · runs on your own server, so $0.00")
+    if UI.agent is not None and sent:
+        step(f"[{MUTED}]{UI.agent.cached_tokens:,} of the tokens sent were served from the server's prefix cache "
+             f"({100 * UI.agent.cached_tokens // sent}%)[/]")
 
 
 def compact(coder, instructions: str):
