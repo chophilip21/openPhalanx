@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.5.1 (2026-10-07)
+
+### Fixes
+
+- Fix split serving, agent context and client defects found in end-to-end testing (#6)
+
 ## v0.5.0 (2026-10-07)
 
 ### Features
