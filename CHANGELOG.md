@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.5.0 (2026-10-07)
+
+### Features
+
+- Agent engine that reads files on demand; backend image built locally (#5)
+
 ## v0.4.1 (2026-10-05)
 
 ### Fixes
