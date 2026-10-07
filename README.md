@@ -29,7 +29,7 @@ Run a coding model on your own Linux GPU machine and use it from any laptop on y
 
 ### Server (Linux x86-64 + NVIDIA GPU)
 
-You need a working `nvidia-smi` (24 GB of VRAM recommended), Docker with your user in the `docker` group, and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Install the app (Debian/Ubuntu; the installer checks these first):
+You need a working `nvidia-smi` (24 GB or above VRAM recommended, 8GB absolute minimum), Docker with your user in the `docker` group, and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Install the app (Debian/Ubuntu; the installer checks these first):
 
 ```bash
 curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/install-server.sh | sh
@@ -93,6 +93,25 @@ cd openPhalanx
 (cd app && npm install && npx tauri dev)    # server app
 cargo install --path client/oppx            # client
 ```
+
+## Contributing
+
+Contributions are welcome! Please follow these guidelines when submitting changes to this repository.
+
+### Pull Request Workflow
+
+1. **Create a Branch or Fork**: Direct pushes to `main` are disabled. Create a separate feature/bugfix branch on your fork or repository.
+2. **Format Your PR Title**: All PR titles **must** begin with a version tag so our release automation can track changes:
+   - `[bug]` – for bug fixes (patch release)
+   - `[feature]` – for new features (minor release)
+   - `[major]` – for breaking changes (major release)
+   - `[docs]` or `[ci]` – for documentation or internal tooling (no release)
+3. **Review Process**: Every PR requires an explicit review and sign-off from `@chophilip21` before merging.
+4. **Automated Checks**: Ensure all CI status checks (linting, tests, and PR title validation) pass cleanly on your pull request.
+
+### License
+
+By contributing to this repository, you agree that your contributions will be licensed under the project's **GNU General Public License v3.0 (GPLv3)**.
 
 ## Learn more
 
