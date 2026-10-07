@@ -118,7 +118,7 @@ Open **Models**:
 
 On **Server**, check that the pre-flight list is green, then press the power button:
 
-* The first start downloads the backend image (about 16 GB). Loading the model then takes about 3–4 minutes.
+* The first start builds the backend image: Docker downloads the official SGLang image (about 16 GB, once) and the app adds its gateway on top (about a minute). Loading the model then takes about 3–4 minutes.
 * The running model (name, quantization, context) shows under the headline with a lock, and as **Running** on Models; it's fixed until the server stops (the tooltip says so). The context comes from the container's `CONTEXT_LENGTH`.
 * The button turns green when SGLang is ready, and a **pairing code** appears. Use it to pair a client. Codes are single-use and expire after 10 minutes, but paired devices stay paired.
 * **Logs** shows live SGLang output. **Devices** lists paired clients and lets you revoke them.
@@ -127,9 +127,10 @@ Start is disabled whenever free VRAM is below what the selected model needs. Clo
 
 ## Run the backend without the GUI
 
-Useful on a headless machine or while developing the backend. The container serves the model in `MODEL_PATH` (a Hugging Face repo id or a path inside the container):
+Useful on a headless machine or while developing the backend. Build the image from the repo (the app does the same from the copy it carries), then run it; the container serves the model in `MODEL_PATH` (a Hugging Face repo id or a path inside the container):
 
 ```bash
+docker build -f docker/Dockerfile.server -t openphalanx-backend:dev docker/
 export ADMIN_TOKEN=$(openssl rand -hex 32)
 mkdir -p ~/.local/share/openphalanx/backend-state
 
@@ -138,7 +139,7 @@ docker run -d --name openphalanx-backend --gpus all --ipc=host \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v ~/.local/share/openphalanx/backend-state:/state \
   -e ADMIN_TOKEN \
-  ghcr.io/chophilip21/openphalanx-backend:0.3.0
+  openphalanx-backend:dev
 
 # When the admin API answers, issue a pairing code:
 curl -s -X POST -H "x-admin-token: $ADMIN_TOKEN" http://127.0.0.1:9091/admin/pairing
@@ -173,7 +174,13 @@ oppx servers | oppx use NAME
   * Output is plain when stdout or stderr isn't a terminal, or when `NO_COLOR` is set. This matters because `/run oppx search` output goes into Aider's chat. Keep it that way.
   * To preview in a pty, use `script -qec "stty rows 40 cols 120; oppx status" /dev/null`. The rows matter: a pty with 0 rows reports no size, so the compact banner is used.
 * **Chat frontend** (`client/oppx/frontend/`: the `oppx_chat` package plus `run.py`, embedded with `include_str!` via `agent::FRONTEND`):
-  * **Modules**, lowest layer first; each imports only from the ones above it (the map is in `oppx_chat/__init__.py`): `config` (environment from oppx), `term` (output, spinner, Esc), `render` (streamed answers, diffs), `context` (`ContextManager`), `oppx_io` (Aider's IO, prompt, keys), `routing` (ask/edit check), `cache` (prefix-cache patches), `commands` (slash commands, memory), `app` (Aider patches, turn loop, `main`). A new module must also be listed in `agent::FRONTEND`; a unit test checks this.
+  * **Modules**, lowest layer first; each imports only from the ones above it (the map is in `oppx_chat/__init__.py`): `config` (environment from oppx), `term` (output, spinner, Esc), `render` (streamed answers, diffs), `context` (`ContextManager`), `agent` (the agent engine; no UI imports), `oppx_io` (Aider's IO, prompt, keys), `routing` (ask/edit check), `cache` (prefix-cache patches), `commands` (slash commands, memory), `app` (Aider patches, turn loop, `main`). A new module must also be listed in `agent::FRONTEND`; a unit test checks this.
+  * **Engines** (`oppx --engine agent|aider`, `OPPX_ENGINE`; default `agent`):
+    * **`agent`** (`oppx_chat/agent.py`, no UI code; `app.make_agent`/`agent_turn` connect it): the model reads the repository on demand, like Claude Code, instead of being sent whole files and a repo map with every request. Each step it picks one action as **JSON constrained by a schema** (model-agnostic, no tool-call parser): `list`, `grep` (`git grep`), `outline` (Aider's tree-sitter tags, regex fallback), `read` (line ranges; files up to 300 lines whole, ±6 lines around a range), `edit`, `create`, `run` (asks y/N), `web_search` (`/v1/search`), `answer`. Text payloads are then written free-form in a second call: edits as Aider SEARCH/REPLACE blocks applied with Aider's fuzzy `do_replace`, the reply streamed. Calls carry `oppx_utility`, so the gateway's search router stays out.
+    * **Guards for small models** (each found in the evaluation): exact repeats and re-reads of lines already shown are refused, and after two only `answer` is allowed; reading a big file page by page gets a "grep instead" hint; answering from grep hits alone, or ending a change request with nothing changed, gets one nudge; before answering a change, the model is told which files it actually changed (it claimed edits it never made); a file must be read before it can be edited; an ambiguous SEARCH (matching several places) is refused with the line numbers; a failed SEARCH returns the closest real lines; an edit that changes the `{}()[]` balance gets a warning; an empty edit from a reasoning model is recovered from `reasoning_content`. Files named in the message are opened up front (small whole, big as an outline); `/add` and `@file` files are listed for the model.
+    * **Context:** the conversation only grows by appending, so SGLang's prefix cache serves most of each request; near the limit, old tool output is cut first (the latest 6 kept), then the oldest turns. The system prompt (rules, top-level folders, `OPENPHALANX.md`/`AGENTS.md`) is built once per session.
+    * **`aider`**: Aider's own loop, with everything below (context manager, cache patches, ask/edit routing). Slash commands, `/undo`, sessions, the status bar and Esc work in both.
+    * **Measured** (RTX 3090, this repo at v0.4.1): a typical Aider request was ~25k tokens, ~60% whole files the model had mentioned and ~30% repo map, with 8–19 s to the first answer and a 42% cache hit rate. The agent's questions use 2–14k-token requests with 76–93% served from cache, answering in 2–6 s. Edits (`scripts/eval_edits.py`, 6 tasks checked by compiling and testing, 3 runs): Qwen2.5-Coder-14B-AWQ **agent 18/18, Aider 15/18** (Aider can't do the multi-file rename); gpt-oss-20b **agent 5/6 three times, Aider 4/6**.
   * **How it runs:** `oppx` writes the package to `~/.cache/oppx/frontend-<version>-<hash>/` and runs `run.py` with the Python of the Aider venv (the `python` next to the real launcher, or its shebang), so `aider`, `prompt_toolkit` and `rich` are importable.
   * **How it hooks into Aider:** it sets `aider.main.InputOutput` to its own `OppxIO`, and `base_coder.WaitingSpinner` to its `Thinking` spinner. It calls `aider.main.main(argv, return_coder=True)`, then loops over `coder.run_one()` itself, handling `SwitchCoder` the way Aider's main loop does.
   * **What it changes on screen:**
@@ -369,11 +376,13 @@ cargo run -p openphalanx-core --example catalog -- 32768       # catalog VRAM es
 cargo run -p openphalanx-core --example lifecycle               # full start → pair → token check → revoke run
 cargo run -p openphalanx-core --example download -- <repo> <dir>  # verified, resumable HF download
 
-docker build -f docker/Dockerfile.server -t ghcr.io/chophilip21/openphalanx-backend:0.3.0 docker/
-scripts/publish-image.sh                                        # build and push to GHCR (needs write:packages); refuses an existing tag (OPPX_REPUSH=1 forces)
+docker build -f docker/Dockerfile.server -t openphalanx-backend:dev docker/   # the backend image by hand (the app builds its own; see below)
 scripts/bench_session.py --oppx target/debug/oppx               # prefix-cache benchmark (in a scratch copy of a repo)
 scripts/gen_docs.py --oppx target/debug/oppx --out target/docs  # docs sources; then: mdbook build target/docs
 OPENAI_API_BASE=… OPENAI_API_KEY=… scripts/probe_routing.py     # via `oppx proxy --no-web`; run after any model change
+OPENAI_API_BASE=… OPENAI_API_KEY=… scripts/probe_kv.py          # long-context recall + coding tasks run against tests (e.g. KV dtype checks)
+scripts/eval_edits.py --oppx target/debug/oppx --engine agent   # 6 edit tasks in fresh clones, checked by compiling/testing; compare engines
+~/.local/share/oppx/engine/tools/aider-chat/bin/python scripts/bench_agent.py --repo <scratch clone>   # agent turns headless, steps and tokens
 ```
 
 The backend image tag follows the version in the root `Cargo.toml`, so bump both together when changing `docker/`. The base SGLang image is pinned by digest in `docker/Dockerfile.server`.
@@ -383,6 +392,7 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
 * **Adding models:** write a spec (id, name, family, params, quant, and `quantized_by` for community builds), run `scripts/catalog_entry.py specs.json`, and paste the entries into `catalog.json`. `scripts/catalog_entry.py --check` verifies every entry's weight size, attention shape and context against Hugging Face.
 * **Release date** (`released`, shown as a year on the Models page): the repo's creation date on Hugging Face; community quantizations take their base model's date (`base_model` in the spec).
 * **`dtype`** (optional, passed as SGLang `--dtype` to every rank): for checkpoints whose declared dtype SGLang can't run. The 4-bit Qwen3.6 builds (cyankiwi 27B, QuantTrio 35B-A3B) declare float16, but SGLang keeps the Gated-DeltaNet state in bfloat16 and the first prefill failed with "Index put requires the source and destination dtypes match"; they use `bfloat16` (verified on the 27B; the 35B-A3B by analogy).
+* **FP8 KV cache** (`--kv-cache-dtype`), measured with `scripts/probe_kv.py`: not enabled for any model. On the 3090 (Ampere) only `fp8_e5m2` runs (`fp8_e4m3` fails to compile in Triton on sm_86). It gives gpt-oss-20b a 128k context on one card (199k KV tokens), but costs accuracy: recall at 24k tokens 1/3 against 3/3 with 16-bit KV, coding 4/5 against 5/5. Qwen2.5-Coder-14B gains nothing: its native window is 32k. Worth re-checking `fp8_e4m3` on Ada (4090) and on Qwen3.6, as a per-model catalog field only if it passes.
 * **Check the architecture first:** the pinned SGLang must have the model class (`sglang/srt/models/` in the image). All current entries were checked against SGLang 0.5.21.
 * **Weights counted:** only root-level `.safetensors` (subfolders like gpt-oss's `original/` and `metal/` are skipped), and Mistral's duplicate `consolidated*.safetensors` are dropped when HF shards exist. The downloader applies the same rule.
 * **KV cache** (`vram::ArchSpec`), as SGLang allocates it:
@@ -400,9 +410,9 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
   1. `oppx` for `x86_64`/`aarch64-unknown-linux-musl` (static) and `aarch64`/`x86_64-apple-darwin`, with `OPPX_RELEASE_TARGET` set; the app as `.deb` and AppImage.
   2. A GitHub release with the archives, `SHA256SUMS`, `install.sh`, `install-server.sh`, and notes from `main`'s `CHANGELOG.md`.
   3. The docs (`scripts/gen_docs.py` + mdBook) on GitHub Pages.
-  4. The backend image (about 50 GB, too big for GitHub's runners) only when the repository variable `IMAGE_RUNNER` names a self-hosted runner (e.g. `["self-hosted","gpu"]`). Otherwise run `scripts/publish-image.sh <version>` on the server node after the release. It refuses to overwrite a tag that's already on GHCR, since every app of that version pulls it (`OPPX_REPUSH=1` forces), so a Publish re-run fails at that step once the image is out.
+* **No backend image is published.** The app carries the build files (`docker::BUILD_FILES`: the Dockerfile, `gateway.py`, `start-sglang.sh`, `supervisord.conf`, embedded with `include_str!`) and builds `openphalanx-backend:<version>-<hash of those files>` on the first start (`docker::ensure_image`): Docker pulls the official SGLang image, pinned by digest in the Dockerfile, and adds ~45 MB on top. A changed gateway or Dockerfile gets a new tag and is rebuilt, so neither users nor developers run a stale image; older tags of ours are removed after a build. Cluster members build the same way when a split worker starts. A custom `image` setting is pulled instead.
 * **Why two workflows:** a tag pushed with `GITHUB_TOKEN` starts no workflow, but a dispatch does. A `pull_request` run can't deploy Pages, because its ref is the PR's merge ref, not `main`.
-* **One-time repository settings:** Actions → workflow permissions "Read and write"; if `main` is protected, allow GitHub Actions to push to it; Pages → source "GitHub Actions"; make the GHCR package public.
+* **One-time repository settings:** Actions → workflow permissions "Read and write"; if `main` is protected, allow GitHub Actions to push to it; Pages → source "GitHub Actions".
 * Lint the workflows locally with `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest`.
 
 ## Troubleshooting
@@ -413,7 +423,7 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
 | "Docker has no nvidia runtime" | Install NVIDIA Container Toolkit, then `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` |
 | "Port 9090 is already in use" | Another program, or an old backend container, holds the port: `docker ps`, then `docker rm -f openphalanx-backend` |
 | Start disabled with "Needs X but only Y of VRAM is free" | Close other GPU programs (`nvidia-smi` lists them), or choose a smaller model or context |
-| Image download fails with "denied" or "unauthorized" | The GHCR package is private: make it public, or `docker login ghcr.io`. From a source checkout, the GUI builds the image locally instead |
+| Backend image build fails | The first start pulls `lmsysorg/sglang` from Docker Hub: check the network and disk space (about 55 GB free). Docker Hub allows 100 anonymous pulls per 6 hours per IP; `docker login` raises that. The full build output is in the app's start error and `docker build` can be rerun by hand (see "Run the backend without the GUI") |
 | `oppx aider` crashes with `No module named 'audioop'` / `'pyaudioop'` | An `aider` on `PATH` was installed with Python 3.13, which removed `audioop`. `oppx` only uses a `PATH` Aider at the pinned version; otherwise it uses its private 3.12 engine. Run `oppx --update`, or remove the old Aider |
 | Backend stops during start-up | The GUI shows the reason; the full output is on **Logs** or in `docker logs openphalanx-backend` |
 
@@ -434,7 +444,6 @@ client/oppx/             client CLI: config.rs (paired servers, 0600 file), tls.
                          api.rs (gateway calls), engine.rs (private Aider), update.rs, main.rs (clap commands)
   frontend/              chat frontend: oppx_chat/ package + run.py (embedded in the binary)
 .github/workflows/       ci.yml (every PR/push), release.yml (merged PR into main -> release)
-scripts/publish-image.sh build and push the backend image to GHCR
 scripts/probe_routing.py score the search router and ask/edit check against the loaded model
 scripts/catalog_entry.py catalog entries from Hugging Face (pinned commit, weight size, attention shape); --check re-verifies
 scripts/bench_session.py 10-turn prefix-cache benchmark through a real oppx session

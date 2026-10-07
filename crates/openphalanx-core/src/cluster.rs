@@ -1739,9 +1739,9 @@ async fn start_worker(order: &WorkerOrder) -> Result<()> {
     order.check()?;
     let dir = crate::model::find_installed(&order.model.repo, Some(&order.model.revision))
         .with_context(|| format!("{} isn't on this machine yet", order.model.label))?;
-    if !crate::docker::image_exists(&order.image).await? {
-        bail!("the backend image {} isn't on this machine", order.image);
-    }
+    // Built here like on the host (the first time this downloads the SGLang
+    // base image, ~16 GB); the host shows the worker as starting meanwhile.
+    crate::docker::ensure_image(&order.image, |_| {}).await?;
     let gpu = crate::gpu::query()
         .await?
         .into_iter()
@@ -2252,7 +2252,7 @@ mod tests {
                 revision: "0123456789abcdef0123456789abcdef01234567".into(),
                 weight_bytes: 0,
             },
-            image: crate::docker::DEFAULT_IMAGE.into(),
+            image: crate::docker::default_image(),
             context_len: 32768,
             dtype: Some("bfloat16".into()),
             rank: crate::docker::SplitRank {

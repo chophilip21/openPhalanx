@@ -13,9 +13,12 @@ from aider.repomap import RepoMap
 from rich.markup import escape
 from rich.text import Text
 
-from .config import ACCENT, CONTEXT, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, PRINT_MODE, RED, SERVER, TESTED_AIDER, WEB, YELLOW
+from .config import (ACCENT, CONTEXT, ENGINE, EXTRA_MEMORY, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, PRINT_MODE,
+                     REASONING, RED, SERVER, TESTED_AIDER, WEB, YELLOW)
 from .term import EscWatcher, SESSION, SPIN, Thinking, UI, out, step
-from .render import show_edits, snapshot
+from .render import BulletStream, hide_reasoning, show_diff, show_edits, snapshot
+from .agent import Agent, Hooks, Workspace
+from .routing import wants_edit
 from .context import CONTEXT_MGR, PRI_EDITED, _check_tokens, _fitted_format_messages
 from .oppx_io import OppxIO
 from .cache import _ask_file_mentions, _ask_init, _coder_init, _dump_requests, _stable_ranked_map
@@ -132,9 +135,131 @@ def _drop_refused(coder):
         msgs.pop()
 
 
+# ---------------------------------------------------------------------------
+# The agent engine: the model reads the repository through tools (agent.py)
+# ---------------------------------------------------------------------------
+
+
+def make_agent(coder) -> Agent:
+    """One agent per session, over the coder's repository. Aider's coder still
+    provides the prompt, commands, sessions and the outline parser."""
+    stream = {"md": None}
+
+    def on_step(title: str, detail: str):
+        if title.startswith(("Update(", "Create(")) and not detail.startswith("Error"):
+            return  # the diff is already on screen (on_edited)
+        SPIN.stop()
+        out(f"\n[{GREEN}]⏺[/] {escape(title)}")
+        step(escape(detail))
+        SPIN.start()
+
+    def on_stream(text: str, final: bool):
+        if stream["md"] is None:
+            if not hide_reasoning(text).strip() and not final:
+                return
+            SPIN.stop()
+            stream["md"] = BulletStream()
+        stream["md"].update(text, final=final)
+        if final:
+            stream["md"] = None
+
+    def on_edited(rel: str, before, after: str):
+        key = str((Path(coder.root) / rel).resolve())
+        UI.before.setdefault(key, before or "")
+        UI.originals.setdefault(key, before)  # None: created this turn (for /undo)
+        SPIN.stop()
+        show_diff(rel, before or "", after)
+        SPIN.start()
+
+    def on_confirm(command: str) -> bool:
+        SPIN.stop()
+        if SESSION.watcher:
+            SESSION.watcher.pause()
+        try:
+            return coder.io.confirm_ask("Run this command?", subject=command, explicit_yes_required=True)
+        finally:
+            if SESSION.watcher:
+                SESSION.watcher.resume()
+            SPIN.start()
+
+    hooks = Hooks(step=on_step, stream=on_stream, edited=on_edited, confirm_run=on_confirm,
+                  waiting=lambda label: SPIN.start(label), interrupted=lambda: UI.interrupted)
+    agent = Agent(ws=Workspace(coder.root, getattr(coder, "repo_map", None), coder.io.encoding),
+                  hooks=hooks, context=CONTEXT, reasoning=REASONING, web=WEB, memory=_memory(coder))
+    # -c / -r: continue from the restored conversation (questions and answers).
+    for m in coder.done_messages or []:
+        if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str):
+            agent.messages.append({"role": m["role"], "content": m["content"], "_user": m["role"] == "user"})
+    return agent
+
+
+def _memory(coder) -> str:
+    parts = []
+    for name in (MEMORY_FILE, *EXTRA_MEMORY):
+        p = Path(coder.root) / name
+        if p.is_file():
+            try:
+                parts.append(p.read_text(encoding="utf-8"))
+            except OSError:
+                pass
+    return "\n\n".join(parts)
+
+
+def agent_turn(coder, text: str):
+    """A message for the agent: a question (no edits) or a task."""
+    can_edit = not UI.plan_mode
+    if text.startswith("/ask "):
+        text, can_edit = text[5:].strip(), False
+    elif can_edit:
+        can_edit = wants_edit(text)
+    agent = UI.agent
+    if agent.memory != _memory(coder):  # # notes and /init change it
+        agent.memory = _memory(coder)
+        agent.reset_system()
+    UI.interrupted = False
+    UI.server_error = ""
+    UI.before = {}
+    UI.originals = {}
+    coder.io.user_input(text, log_only=True)  # the session file, for -c / -r
+    # Files the user pointed at (/add, @file): the agent reads them as needed.
+    pointed = sorted(coder.get_rel_fname(f) for f in coder.abs_fnames)
+    if pointed:
+        text += "\n\n(Files the user added to the chat: " + ", ".join(pointed) + ")"
+    reply = ""
+    try:
+        with EscWatcher() as w:
+            SESSION.watcher = w
+            SPIN.start()
+            reply = agent.turn(text, can_edit=can_edit)
+    except KeyboardInterrupt:
+        UI.interrupted = True
+        agent.messages.append({"role": "assistant", "content": "(Interrupted by the user.)"})
+    except Exception as e:  # noqa: BLE001 - shown, and the session goes on
+        SPIN.stop()
+        msg = str(e)
+        if "401" in msg or "403" in msg:
+            step("This device is no longer paired with the server (revoked or expired). Pair again: "
+                 "oppx pair <server> <code> --force", RED)
+        else:
+            step(f"The request failed: {escape(msg[:300])}", RED)
+    finally:
+        SESSION.watcher = None
+        SPIN.stop()
+    if UI.interrupted:
+        step("Interrupted by user", YELLOW)
+    if reply:
+        coder.io.ai_output(reply)
+    if UI.originals:
+        UI.undo = dict(UI.originals)
+    CONTEXT_MGR.used = agent.last_prompt_tokens
+    return coder
+
+
 def run_turn(coder, text: str):
     """Runs one message; returns the coder to continue with (a new one after
     a mode switch such as /ask, which runs in its own temporary coder)."""
+    if UI.agent is not None and (not text.startswith("/") or text.startswith("/ask ")):
+        return agent_turn(coder, text)
     coder.io._retry_shown = False
     UI.interrupted = False
     UI.server_error = ""
@@ -196,6 +321,8 @@ def run(argv) -> int:
         out(f"[{YELLOW}]warning:[/] this frontend was tested with engine {TESTED_AIDER}.x; found {aider.__version__}.")
     coder = build_coder(argv)
     load_memory(coder)
+    if ENGINE == "agent":
+        UI.agent = make_agent(coder)
     initial = os.environ.get("OPPX_INITIAL", "").strip()
 
     if PRINT_MODE:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from rich.markup import escape
 
-from .config import ACCENT, CONTEXT, EXTRA_MEMORY, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, OPPX_BIN, RED, SERVER, VERSION, WEB, YELLOW
+from .config import ACCENT, CONTEXT, ENGINE, EXTRA_MEMORY, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, OPPX_BIN, RED, SERVER, VERSION, WEB, YELLOW
 from .term import Thinking, UI, headline, out, step
 from .context import CONTEXT_MGR, MAP_MAX, PRI_EDITED, PRI_MODEL, PRI_USER, _orig_format_messages, _raw_tokens
 from .oppx_io import show_shortcuts
@@ -247,6 +247,8 @@ def translate(coder, text: str):
             if p.is_file():
                 coder.commands.cmd_add(path)
         text = re.sub(r"(?<!\S)@(\S+)", r"\1", text)
+        if ENGINE == "agent":
+            return text  # the agent turn decides ask or edit (app.agent_turn)
         if UI.plan_mode or not wants_edit(text):
             return f"/ask {text}\n\n{ASK_NOTE}"
         return text
@@ -260,6 +262,8 @@ def translate(coder, text: str):
     elif name == "/clear":
         coder.commands.cmd_clear("")
         CONTEXT_MGR.map_tokens = MAP_MAX
+        if UI.agent is not None:
+            UI.agent.reset()
         step("Started a new conversation (files and memory kept)", GREEN)
     elif name == "/compact":
         compact(coder, arg)

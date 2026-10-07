@@ -607,7 +607,17 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
             let detail = match &p {
                 StartProgress::Checking => "Checking GPU memory…".to_string(),
                 StartProgress::PullingImage { line } => format!("Downloading backend image… {line}"),
-                StartProgress::BuildingImage { .. } => "Building backend image…".to_string(),
+                StartProgress::BuildingImage { line } => {
+                    // Docker reports each layer of the base download as "1.05GB / 3.29GB".
+                    let size = line
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .windows(3)
+                        .find(|w| w[1] == "/" && w[0].ends_with('B') && w[2].ends_with('B'))
+                        .map(|w| format!(" · layer {} / {}", w[0], w[2]))
+                        .unwrap_or_default();
+                    format!("Building the backend image (first start: downloads the SGLang base, about 16 GB, once){size}…")
+                }
                 StartProgress::Launching => "Launching the backend…".to_string(),
             };
             let _ = progress_app.emit("start-progress", &p);

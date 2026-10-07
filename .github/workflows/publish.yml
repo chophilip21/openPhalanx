@@ -9,10 +9,8 @@
 # 2. Publish a GitHub release with the binaries, SHA256SUMS, installers and
 #    notes from CHANGELOG.md.
 # 3. Generate the docs and deploy them to GitHub Pages.
-# 4. Backend image: GitHub's runners are too small for the ~50 GB image, so it
-#    is built on a self-hosted runner when the repository variable
-#    IMAGE_RUNNER is set (e.g. ["self-hosted","gpu"]); otherwise run
-#    scripts/publish-image.sh on the server node after the release.
+# No backend image is published: the server app builds it on first start from
+# the official SGLang image (pinned by digest) plus the files it carries.
 name: Publish
 
 on:
@@ -152,7 +150,7 @@ jobs:
           curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install-server.sh | OPPX_VERSION=$VERSION sh
           \`\`\`
 
-          Backend image: \`ghcr.io/chophilip21/openphalanx-backend:$VERSION\`
+          The server app builds its backend on the first start, from the official SGLang image (about 16 GB, downloaded once by Docker).
           EOF
       - name: Publish
         env:
@@ -191,16 +189,3 @@ jobs:
       - id: deploy
         uses: actions/deploy-pages@v4
 
-  image:
-    needs: [meta, release]
-    if: vars.IMAGE_RUNNER != ''
-    runs-on: ${{ fromJSON(vars.IMAGE_RUNNER) }}
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag }}
-      - run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - run: scripts/publish-image.sh "${{ needs.meta.outputs.version }}"

@@ -24,5 +24,8 @@ REASONING = os.environ.get("OPPX_REASONING") == "1"
 MODEL_LABEL = "openphalanx-coder"  # the name the gateway serves any model under
 # What the server actually runs (a Hugging Face id or a path); shown to the user.
 MODEL_NAME = os.environ.get("OPPX_MODEL_ID", "").rstrip("/").rsplit("/", 1)[-1] or MODEL_LABEL
+# "agent": the model reads the repository on demand through tools (agent.py).
+# "aider": Aider's own loop (whole files and a repo map in every request).
+ENGINE = os.environ.get("OPPX_ENGINE", "agent")
 MEMORY_FILE = "OPENPHALANX.md"  # our CLAUDE.md
 EXTRA_MEMORY = ("AGENTS.md",)  # read too when present

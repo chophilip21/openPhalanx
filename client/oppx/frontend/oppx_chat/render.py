@@ -107,25 +107,30 @@ def show_edits(coder, before: dict, max_lines: int = 40, edited=None) -> None:
             new = Path(abs_path).read_text(encoding=coder.io.encoding)
         except (OSError, UnicodeDecodeError):
             continue
-        diff = list(difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=1))[2:]
-        adds = sum(1 for d in diff if d.startswith("+"))
-        dels = sum(1 for d in diff if d.startswith("-"))
-        verb = "Create" if not old else "Update"
-        out(f"\n[{GREEN}]{BULLET}[/] [bold]{verb}[/]({escape(rel)})")
-        step(f"{'Created' if not old else 'Updated'} [bold]{escape(rel)}[/] with "
-             f"[{GREEN}]{adds} addition{'s' if adds != 1 else ''}[/] and "
-             f"[{RED}]{dels} removal{'s' if dels != 1 else ''}[/]")
-        shown = 0
-        for d in diff:
-            if shown >= max_lines:
-                out(f"       [{MUTED}]… {len(diff) - shown} more lines (git diff {escape(rel)})[/]")
-                break
-            if d.startswith("@@"):
-                out(f"       [{MUTED}]{escape(d)}[/]")
-            elif d.startswith("+"):
-                console.print(Text("       " + d, style=f"{GREEN} on #0f2a20"))
-            elif d.startswith("-"):
-                console.print(Text("       " + d, style=f"{RED} on #2a1215"))
-            else:
-                console.print(Text("       " + d, style=MUTED))
-            shown += 1
+        show_diff(rel, old, new, max_lines)
+
+
+def show_diff(rel: str, old: str, new: str, max_lines: int = 40) -> None:
+    """One file's change, Claude style: ⏺ Update(file), a summary, colored lines."""
+    diff = list(difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=1))[2:]
+    adds = sum(1 for d in diff if d.startswith("+"))
+    dels = sum(1 for d in diff if d.startswith("-"))
+    verb = "Create" if not old else "Update"
+    out(f"\n[{GREEN}]{BULLET}[/] [bold]{verb}[/]({escape(rel)})")
+    step(f"{'Created' if not old else 'Updated'} [bold]{escape(rel)}[/] with "
+         f"[{GREEN}]{adds} addition{'s' if adds != 1 else ''}[/] and "
+         f"[{RED}]{dels} removal{'s' if dels != 1 else ''}[/]")
+    shown = 0
+    for d in diff:
+        if shown >= max_lines:
+            out(f"       [{MUTED}]… {len(diff) - shown} more lines (git diff {escape(rel)})[/]")
+            break
+        if d.startswith("@@"):
+            out(f"       [{MUTED}]{escape(d)}[/]")
+        elif d.startswith("+"):
+            console.print(Text("       " + d, style=f"{GREEN} on #0f2a20"))
+        elif d.startswith("-"):
+            console.print(Text("       " + d, style=f"{RED} on #2a1215"))
+        else:
+            console.print(Text("       " + d, style=MUTED))
+        shown += 1

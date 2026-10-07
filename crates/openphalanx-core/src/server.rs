@@ -178,7 +178,13 @@ pub async fn preflight(settings: &Settings) -> Preflight {
         checks.push(if image_present {
             Check::new("image", "Backend image", Pass, settings.image())
         } else {
-            Check::new("image", "Backend image", Warn, format!("{} will be downloaded on start (about 16 GB).", settings.image()))
+            Check::new("image", "Backend image", Warn, if settings.image().starts_with(&format!("{}:", docker::IMAGE_NAME)) {
+                "Built on the first start: Docker downloads the official SGLang image (about 16 GB, once) and adds \
+                 OpenPhalanx's gateway."
+                    .to_string()
+            } else {
+                format!("{} will be downloaded on start.", settings.image())
+            })
         });
         if settings.web_search {
             let present = docker::image_exists(docker::SEARXNG_IMAGE).await.unwrap_or(false);
@@ -285,17 +291,18 @@ pub async fn start(
     }
 
     if !pf.image_present {
-        let pulled = docker::pull(&settings.image(), |line| {
-            on_progress(StartProgress::PullingImage { line })
+        // First start (or a new app version): build the backend from the
+        // official SGLang image; a custom image setting is pulled instead.
+        let image = settings.image();
+        let building = image.starts_with(&format!("{}:", docker::IMAGE_NAME));
+        docker::ensure_image(&image, |line| {
+            on_progress(if building {
+                StartProgress::BuildingImage { line }
+            } else {
+                StartProgress::PullingImage { line }
+            })
         })
-        .await;
-        if let Err(pull_err) = pulled {
-            let Some(ctx) = docker::local_build_context() else {
-                bail!("Could not download the backend image: {pull_err}");
-            };
-            docker::build(&ctx, &settings.image(), |line| on_progress(StartProgress::BuildingImage { line }))
-                .await?;
-        }
+        .await?;
     }
 
     // The pull can take minutes; re-measure VRAM right before launching.
