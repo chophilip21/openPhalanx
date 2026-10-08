@@ -128,6 +128,9 @@ input:focus, select:focus { border-color: var(--link); }
   color: var(--muted);
   font-weight: 600;
 }
+/* A card's title with its icon (Model, Pre-flight checks, Cluster, …). */
+.eyebrow.titled { display: inline-flex; align-items: center; gap: 7px; }
+.eyebrow.titled svg { color: var(--on); flex: none; }
 
 .mono { font-family: var(--mono); user-select: text; }
 .muted { color: var(--muted); }

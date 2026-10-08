@@ -34,6 +34,9 @@ pub struct CatalogEntry {
     /// Verified end to end on real hardware.
     #[serde(default)]
     pub tested: bool,
+    /// Specialized for code by its publisher (Qwen Coder, Devstral, DeepSeek Coder).
+    #[serde(default)]
+    pub coding: bool,
     #[serde(default)]
     pub min_compute_capability: Option<f32>,
     #[serde(default)]
@@ -51,16 +54,72 @@ pub struct CatalogEntry {
     /// fails on the mix.
     #[serde(default)]
     pub dtype: Option<String>,
+    /// The publisher's long-context mode (YaRN), turned on only when the
+    /// server starts with a context above the native window.
+    #[serde(default)]
+    pub yarn: Option<Yarn>,
 }
 
 impl CatalogEntry {
     /// Total parameters in billions, parsed from e.g. "30.5B (3.3B active)".
+    /// The leading size in billions: "14.7B" → 14.7, "1T (32B active)" → 1000.
     pub fn params_billions(&self) -> Option<f32> {
-        self.params.split('B').next()?.trim().parse().ok()
+        let s = self.params.trim();
+        let end = s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len());
+        let n: f32 = s[..end].parse().ok()?;
+        match s[end..].chars().next() {
+            Some('T') => Some(n * 1000.0),
+            Some('B') => Some(n),
+            _ => None,
+        }
     }
 
     pub fn source_url(&self) -> String {
         format!("https://huggingface.co/{}/tree/{}", self.id, self.revision)
+    }
+}
+
+/// YaRN rope scaling as a publisher documents it ("add this to config.json
+/// for contexts beyond 32k"): the model then reaches `factor` × its native
+/// window. Static YaRN can slightly lower quality on short inputs, so it is
+/// used only when the chosen context needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Yarn {
+    pub factor: f32,
+    #[serde(rename = "original_max_position_embeddings")]
+    pub original_max: u32,
+}
+
+impl Yarn {
+    /// The longest context with YaRN on.
+    pub fn max_context(&self) -> u32 {
+        (self.original_max as f64 * self.factor as f64) as u32
+    }
+
+    /// Sane bounds; a cluster member checks the host's numbers with this.
+    pub fn check(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.factor.is_finite() && (1.0..=16.0).contains(&self.factor), "invalid YaRN factor {}", self.factor);
+        anyhow::ensure!((1024..=1 << 20).contains(&self.original_max), "invalid YaRN native window {}", self.original_max);
+        Ok(())
+    }
+
+    /// SGLang's `--json-model-override-args`, built here from the two numbers
+    /// (never from text a host or a catalog could slip flags into).
+    ///
+    /// `max_position_embeddings` is raised too: SGLang 0.5.21 takes the context
+    /// limit from it and ignores the factor when `original_max_position_embeddings`
+    /// is present (`get_context_length`), so Qwen's snippet alone still capped
+    /// at 32k. The YaRN math reads only `factor` and the original window.
+    pub fn override_json(&self) -> String {
+        serde_json::json!({
+          "max_position_embeddings": self.max_context(),
+          "rope_scaling": {
+            "rope_type": "yarn",
+            "type": "yarn",
+            "factor": self.factor,
+            "original_max_position_embeddings": self.original_max,
+        } })
+        .to_string()
     }
 }
 
@@ -81,10 +140,14 @@ mod tests {
         let entries = catalog();
         assert!(!entries.is_empty());
         assert!(entries.iter().any(|e| e.tested));
+        let with = |p: &str| CatalogEntry { params: p.into(), ..entries[0].clone() };
+        assert_eq!(with("14.7B").params_billions(), Some(14.7));
+        assert_eq!(with("1T (32B active)").params_billions(), Some(1000.0));
+        assert_eq!(with("2.8T MoE").params_billions(), Some(2800.0));
         for e in &entries {
             assert_eq!(e.revision.len(), 40, "{} revision must be a full commit sha", e.id);
             assert!(e.id.contains('/'), "{}", e.id);
-            assert!(e.weight_bytes > 1_000_000_000, "{}", e.id);
+            assert!(e.weight_bytes > 100_000_000, "{}", e.id); // Qwen2.5-Coder 0.5B AWQ is 0.7 GB
             assert!(e.arch.kv_layers > 0 && e.arch.kv_heads > 0 && e.arch.head_dim > 0);
             assert!(e.params_billions().is_some_and(|p| p > 0.0), "{} params", e.id);
             assert!(!e.family.is_empty(), "{} family", e.id);

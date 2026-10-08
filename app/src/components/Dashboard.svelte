@@ -6,6 +6,7 @@
   import Chart from "./Chart.svelte";
   import ClusterPanel from "./ClusterPanel.svelte";
   import Icon from "./Icon.svelte";
+  import Notice from "./Notice.svelte";
   import { api, errorText } from "../lib/api";
   import { LOCAL_NODE, nodeSeries, nodesOf, WINDOW_SECONDS } from "../lib/metrics.svelte";
   import { gib, pct, rate } from "../lib/format";
@@ -91,14 +92,14 @@
 <section class="dash">
   <div class="dash-head">
     <div>
-      <span class="eyebrow">Cluster</span>
+      <span class="eyebrow titled"><Icon name="server" size={14} /> Cluster</span>
       <h2>{nodes.length} server{nodes.length === 1 ? "" : "s"} · {online} online · {serving} serving</h2>
     </div>
     <span class="muted small">Live · updates every 2 s · last {WINDOW_SECONDS / 60} min</span>
   </div>
 
   {#if cluster}<ClusterPanel {cluster} />{/if}
-  {#if nodeError}<div class="error-banner"><Icon name="alert" size={16} /><span>{nodeError}</span></div>{/if}
+  {#if nodeError}<Notice onclose={() => (nodeError = "")}>{nodeError}</Notice>{/if}
 
   <div class="tiles">
     <div class="tile"><span class="k">Servers online</span><span class="v">{online}<small>/{nodes.length}</small></span></div>
@@ -114,7 +115,7 @@
   </div>
 
   <div class="card table-card">
-    <div class="table-head"><span class="eyebrow">Machines</span></div>
+    <div class="table-head"><span class="eyebrow titled"><Icon name="list" size={14} /> Machines</span></div>
     <div class="table-scroll">
       <table>
         <thead>
@@ -199,7 +200,7 @@
   </div>
 
   <div class="charts-head">
-    <span class="eyebrow">Charts</span>
+    <span class="eyebrow titled"><Icon name="activity" size={14} /> Charts</span>
     <label class="picker">
       <span class="muted small">Machine</span>
       <select bind:value={chosen}>

@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-76 -20 480 480" width="1024" height="1024" role="img" aria-labelledby="title desc">
+  <title id="title">Green shield and arrow logo</title>
+  <desc id="desc">An outlined shield divided by radial spokes, with a right-pointing arrow passing through its center.</desc>
+  <g fill="none" stroke="#218A4B" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Shield outline, opened where the arrow exits -->
+    <path d="M31 96 L164 45 L297 96 L297 184"/>
+    <path d="M297 236 C296 306 253 359 164 399 C75 359 31 306 31 227 L31 96"/>
+
+    <!-- Internal shield structure -->
+    <path d="M38 103 L164 213 L164 53"/>
+    <path d="M290 103 L164 213"/>
+    <path d="M164 391 L164 213"/>
+    <path d="M62 319 L164 213 L267 319"/>
+    <path d="M31 213 L126 213"/>
+
+    <!-- Arrow shaft and head -->
+    <path d="M202 213 H376"/>
+    <path d="M337 173 L377 213 L337 253"/>
+
+    <!-- Central hub -->
+    <circle cx="164" cy="213" r="32" fill="#FFFFFF"/>
+  </g>
+</svg>

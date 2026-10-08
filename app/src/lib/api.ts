@@ -239,7 +239,11 @@ export type ModelRow = {
   /** Year the model was published, e.g. "2025". */
   released: string | null;
   notes: string | null;
+  /** Full release date (YYYY-MM-DD), for sorting. */
+  released_on: string | null;
   tested: boolean;
+  /** Specialized for code by its publisher. */
+  coding: boolean;
   best_fit: boolean;
   custom: boolean;
   weight_bytes: number;
@@ -295,8 +299,38 @@ export type Device = {
   expires_at: number | null;
 };
 
+/** The app's own update (GitHub releases). */
+export type UpdateCheck = {
+  current: string;
+  latest: string;
+  available: boolean;
+  install: { kind: "app_image"; path: string } | { kind: "deb" } | { kind: "source" };
+  can_install: boolean;
+  note: string | null;
+  url: string;
+};
+export type UpdateProgress = { stage: "downloading" | "installing" | "restarting"; done: number; total: number };
+
+/** The selected model's context ceiling for the VRAM free now (or pooled). */
+export type ContextLimit = {
+  model: string | null;
+  /** Longest context that fits; null: not even 2k fits, or no GPU. */
+  max_fit: number | null;
+  model_max: number | null;
+  /** The cap is the model's own maximum context, not the VRAM. */
+  by_model: boolean;
+  /** Above this the model runs in its long-context mode (YaRN); null: it has none. */
+  native_max: number | null;
+  available_bytes: number | null;
+  basis: string;
+  servers: number;
+};
+
 export const api = {
+  contextLimit: () => invoke<ContextLimit>("get_context_limit"),
   snapshot: () => invoke<Snapshot>("get_snapshot"),
+  checkUpdate: () => invoke<UpdateCheck>("check_update"),
+  installUpdate: () => invoke<void>("install_update"),
   preflight: () => invoke<Preflight>("get_preflight"),
   start: () => invoke<void>("start_server"),
   stop: () => invoke<void>("stop_server"),
@@ -337,6 +371,8 @@ export const events = {
   snapshot: (cb: (s: Snapshot) => void): Promise<UnlistenFn> => listen<Snapshot>("snapshot", (e) => cb(e.payload)),
   download: (cb: (d: DownloadView) => void): Promise<UnlistenFn> => listen<DownloadView>("download", (e) => cb(e.payload)),
   log: (cb: (lines: string[]) => void): Promise<UnlistenFn> => listen<string[]>("log", (e) => cb(e.payload)),
+  updateProgress: (cb: (p: UpdateProgress) => void): Promise<UnlistenFn> =>
+    listen<UpdateProgress>("update-progress", (e) => cb(e.payload)),
 };
 
 /** Tauri rejects with the Rust error string. */

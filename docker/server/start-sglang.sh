@@ -23,6 +23,11 @@ args=(
 if [[ -n "${CONTEXT_LENGTH:-}" ]]; then
   args+=(--context-length "${CONTEXT_LENGTH}")
 fi
+# Config overrides as one JSON argument (e.g. YaRN rope scaling for contexts
+# beyond a model's native window). Quoted: it must reach SGLang as one word.
+if [[ -n "${JSON_MODEL_OVERRIDE_ARGS:-}" ]]; then
+  args+=(--json-model-override-args "${JSON_MODEL_OVERRIDE_ARGS}")
+fi
 
 # SGLANG_EXTRA_ARGS allows ad-hoc flags (e.g. "--quantization awq_marlin").
 # shellcheck disable=SC2086

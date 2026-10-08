@@ -14,7 +14,8 @@
       "kv_layers": 28,
       "kv_heads": 4,
       "head_dim": 128
-    }
+    },
+    "coding": true
   },
   {
     "id": "Qwen/Qwen2.5-Coder-7B-Instruct",
@@ -31,7 +32,8 @@
       "kv_layers": 28,
       "kv_heads": 4,
       "head_dim": 128
-    }
+    },
+    "coding": true
   },
   {
     "id": "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ",
@@ -50,7 +52,8 @@
       "head_dim": 128
     },
     "tested": true,
-    "notes": "Tested end to end on an RTX 3090 (24 GB)."
+    "notes": "Tested end to end on an RTX 3090 (24 GB).",
+    "coding": true
   },
   {
     "id": "Qwen/Qwen2.5-Coder-14B-Instruct",
@@ -67,7 +70,8 @@
       "kv_layers": 48,
       "kv_heads": 8,
       "head_dim": 128
-    }
+    },
+    "coding": true
   },
   {
     "id": "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ",
@@ -84,7 +88,8 @@
       "kv_layers": 64,
       "kv_heads": 8,
       "head_dim": 128
-    }
+    },
+    "coding": true
   },
   {
     "id": "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
@@ -103,7 +108,8 @@
       "head_dim": 128
     },
     "min_compute_capability": 8.9,
-    "notes": "Mixture-of-experts. FP8 runs natively on Ada/Hopper (compute capability 8.9 or higher)."
+    "notes": "Mixture-of-experts. FP8 runs natively on Ada/Hopper (compute capability 8.9 or higher).",
+    "coding": true
   },
   {
     "id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
@@ -121,7 +127,8 @@
       "kv_heads": 4,
       "head_dim": 128
     },
-    "notes": "Mixture-of-experts."
+    "notes": "Mixture-of-experts.",
+    "coding": true
   },
   {
     "id": "Qwen/Qwen3-Coder-Next-FP8",
@@ -141,7 +148,8 @@
       "linear_layers": 36
     },
     "min_compute_capability": 8.9,
-    "notes": "Hybrid attention: only 1 in 4 layers keeps a KV cache."
+    "notes": "Hybrid attention: only 1 in 4 layers keeps a KV cache.",
+    "coding": true
   },
   {
     "id": "Qwen/Qwen3-Coder-Next",
@@ -159,7 +167,8 @@
       "kv_heads": 2,
       "head_dim": 256,
       "linear_layers": 36
-    }
+    },
+    "coding": true
   },
   {
     "id": "Qwen/Qwen3.6-27B",
@@ -493,7 +502,8 @@
       "kv_layers": 40,
       "kv_heads": 8,
       "head_dim": 128
-    }
+    },
+    "coding": true
   },
   {
     "id": "mistralai/Devstral-Small-2-24B-Instruct-2512",
@@ -510,7 +520,8 @@
       "kv_layers": 40,
       "kv_heads": 8,
       "head_dim": 128
-    }
+    },
+    "coding": true
   },
   {
     "id": "cyankiwi/Devstral-Small-2-24B-Instruct-2512-AWQ-4bit",
@@ -528,7 +539,8 @@
       "kv_heads": 8,
       "head_dim": 128
     },
-    "quantized_by": "cyankiwi"
+    "quantized_by": "cyankiwi",
+    "coding": true
   },
   {
     "id": "mistralai/Devstral-2-123B-Instruct-2512",
@@ -545,6 +557,1261 @@
       "kv_layers": 88,
       "kv_heads": 8,
       "head_dim": 128
-    }
+    },
+    "coding": true
+  },
+  {
+    "id": "Qwen/Qwen3-8B-AWQ",
+    "revision": "4da05a8edb55c6046cce958586c33b61da07bb79",
+    "name": "Qwen3 8B",
+    "family": "Qwen",
+    "params": "8.2B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 6098581864,
+    "max_context": 40960,
+    "license": "apache-2.0",
+    "released": "2025-05-03",
+    "arch": {
+      "kv_layers": 36,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "reasoning_parser": "qwen3"
+  },
+  {
+    "id": "cyankiwi/Qwen3.5-9B-AWQ-4bit",
+    "revision": "156edc4bbeb8d1910ee7be9196bafaf1bc052156",
+    "name": "Qwen3.5 9B",
+    "family": "Qwen",
+    "params": "9.7B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 9068588904,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-02-27",
+    "arch": {
+      "kv_layers": 8,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "linear_layers": 24
+    },
+    "quantized_by": "cyankiwi",
+    "reasoning_parser": "qwen3",
+    "notes": "Hybrid attention: only 1 in 4 layers keeps a KV cache."
+  },
+  {
+    "id": "ibm-granite/granite-4.2-3b-fp8",
+    "revision": "579eab44700093cf415d70534060b653dc4d6b45",
+    "name": "Granite 4.2 3B",
+    "family": "Granite",
+    "params": "3.7B",
+    "quant": "FP8",
+    "weight_bytes": 4175830448,
+    "max_context": 131072,
+    "license": "apache-2.0",
+    "released": "2026-08-13",
+    "arch": {
+      "kv_layers": 40,
+      "kv_heads": 8,
+      "head_dim": 64
+    },
+    "notes": "FP8: native on Ada (RTX 40) and newer; Ampere (RTX 30) runs it as 8-bit weights through Marlin."
+  },
+  {
+    "id": "ibm-granite/granite-4.2-8b-fp8",
+    "revision": "6eb3735036ce2010f4ec8319820172a1c06508d7",
+    "name": "Granite 4.2 8B",
+    "family": "Granite",
+    "params": "8.8B",
+    "quant": "FP8",
+    "weight_bytes": 9617279064,
+    "max_context": 131072,
+    "license": "apache-2.0",
+    "released": "2026-08-13",
+    "arch": {
+      "kv_layers": 40,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "notes": "FP8: native on Ada (RTX 40) and newer; Ampere (RTX 30) runs it as 8-bit weights through Marlin."
+  },
+  {
+    "id": "ibm-granite/granite-4.2-30b-fp8",
+    "revision": "bee6d7463fd7064455f59ac480a3fcdcae5cb801",
+    "name": "Granite 4.2 30B",
+    "family": "Granite",
+    "params": "29.3B",
+    "quant": "FP8",
+    "weight_bytes": 30109724784,
+    "max_context": 131072,
+    "license": "apache-2.0",
+    "released": "2026-08-13",
+    "arch": {
+      "kv_layers": 64,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "notes": "FP8: native on Ada (RTX 40) and newer; Ampere (RTX 30) runs it as 8-bit weights through Marlin."
+  },
+  {
+    "id": "casperhansen/deepseek-r1-distill-qwen-7b-awq",
+    "revision": "305e6f12907dc78ae61a1f0bb7a19faa2b25e8a3",
+    "name": "DeepSeek R1 Distill Qwen 7B",
+    "family": "DeepSeek",
+    "params": "7.6B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 5570829936,
+    "max_context": 131072,
+    "license": "mit",
+    "released": "2025-01-20",
+    "arch": {
+      "kv_layers": 28,
+      "kv_heads": 4,
+      "head_dim": 128
+    },
+    "quantized_by": "casperhansen",
+    "reasoning_parser": "deepseek-r1"
+  },
+  {
+    "id": "hxac/DeepSeek-R1-0528-Qwen3-8B-AWQ-4bit",
+    "revision": "1b943a59d44eefb39140cfbc529de03d29a4ade9",
+    "name": "DeepSeek R1 0528 Qwen3 8B",
+    "family": "DeepSeek",
+    "params": "8.2B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 6098581608,
+    "max_context": 131072,
+    "license": "mit",
+    "released": "2025-05-29",
+    "arch": {
+      "kv_layers": 36,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "hxac",
+    "reasoning_parser": "deepseek-r1"
+  },
+  {
+    "id": "casperhansen/deepseek-r1-distill-qwen-14b-awq",
+    "revision": "bc43ec1bbf08de53452630806d5989208b4186db",
+    "name": "DeepSeek R1 Distill Qwen 14B",
+    "family": "DeepSeek",
+    "params": "14.8B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 9980170752,
+    "max_context": 131072,
+    "license": "mit",
+    "released": "2025-01-20",
+    "arch": {
+      "kv_layers": 48,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "casperhansen",
+    "reasoning_parser": "deepseek-r1"
+  },
+  {
+    "id": "TechxGenus/DeepSeek-Coder-V2-Lite-Instruct-AWQ",
+    "revision": "7cf1b67809a5bcc7b9ba9f854ccdf2858298484d",
+    "name": "DeepSeek Coder V2 Lite",
+    "family": "DeepSeek",
+    "params": "15.7B (2.4B active)",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 9086606872,
+    "max_context": 163840,
+    "license": "other",
+    "released": "2024-06-14",
+    "arch": {
+      "kv_layers": 27,
+      "kv_heads": 1,
+      "head_dim": 288
+    },
+    "quantized_by": "TechxGenus",
+    "notes": "Mixture-of-experts with MLA attention (a small KV cache).",
+    "coding": true
+  },
+  {
+    "id": "casperhansen/deepseek-r1-distill-qwen-32b-awq",
+    "revision": "e20a4933e66aa5eccc8270489f5aeab17f90b888",
+    "name": "DeepSeek R1 Distill Qwen 32B",
+    "family": "DeepSeek",
+    "params": "32.8B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 19328994120,
+    "max_context": 131072,
+    "license": "mit",
+    "released": "2025-01-20",
+    "arch": {
+      "kv_layers": 64,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "casperhansen",
+    "reasoning_parser": "deepseek-r1"
+  },
+  {
+    "id": "casperhansen/deepseek-r1-distill-llama-70b-awq",
+    "revision": "a1ab7653aae77fbabc536cbcbac5bb2e2fb5354f",
+    "name": "DeepSeek R1 Distill Llama 70B",
+    "family": "DeepSeek",
+    "params": "70.6B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 39767996432,
+    "max_context": 131072,
+    "license": "mit",
+    "released": "2025-01-20",
+    "arch": {
+      "kv_layers": 80,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "casperhansen",
+    "reasoning_parser": "deepseek-r1"
+  },
+  {
+    "id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+    "name": "DeepSeek V4 Flash",
+    "family": "DeepSeek",
+    "params": "304B MoE",
+    "quant": "FP8 + FP4 experts",
+    "weight_bytes": 166886535336,
+    "max_context": 1048576,
+    "license": "mit",
+    "released": "2026-07-31",
+    "arch": {
+      "kv_layers": 43,
+      "kv_heads": 1,
+      "head_dim": 512
+    },
+    "reasoning_parser": "deepseek-v4",
+    "notes": "Mixture-of-experts, released by DeepSeek in FP8 with FP4 experts. Needs a large split cluster."
+  },
+  {
+    "id": "cyankiwi/Ministral-3-3B-Instruct-2512-AWQ-4bit",
+    "revision": "0e45c853d95614d0a2b5915efde0bb38e616d570",
+    "name": "Ministral 3 3B",
+    "family": "Mistral",
+    "params": "3.8B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 4153448192,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2025-10-31",
+    "arch": {
+      "kv_layers": 26,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "cyankiwi"
+  },
+  {
+    "id": "cyankiwi/Ministral-3-8B-Instruct-2512-AWQ-4bit",
+    "revision": "e3a799844ba08f27fddbf118e154057eb0105889",
+    "name": "Ministral 3 8B",
+    "family": "Mistral",
+    "params": "8.9B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 7176364152,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2025-10-31",
+    "arch": {
+      "kv_layers": 34,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "cyankiwi"
+  },
+  {
+    "id": "cyankiwi/Ministral-3-14B-Instruct-2512-AWQ-4bit",
+    "revision": "d4401438aba6c4e523b929c1a8878d3fe8cc0bca",
+    "name": "Ministral 3 14B",
+    "family": "Mistral",
+    "params": "13.9B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 10405212328,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2025-10-31",
+    "arch": {
+      "kv_layers": 40,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "cyankiwi"
+  },
+  {
+    "id": "jeffcookio/Mistral-Small-3.2-24B-Instruct-2506-awq-sym",
+    "revision": "49ec31ec0975e46a1aeef24186a45f11be3042b8",
+    "name": "Mistral Small 3.2 24B",
+    "family": "Mistral",
+    "params": "24B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 15025500320,
+    "max_context": 131072,
+    "license": "see repo",
+    "released": "2025-06-19",
+    "arch": {
+      "kv_layers": 40,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "jeffcookio"
+  },
+  {
+    "id": "cyankiwi/Mistral-Small-4-119B-2603-AWQ-4bit",
+    "revision": "fa531bc4cb04fb88108ccb4ff50c189ab5a1c6b0",
+    "name": "Mistral Small 4 119B",
+    "family": "Mistral",
+    "params": "119B MoE",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 70943596656,
+    "max_context": 1048576,
+    "license": "apache-2.0",
+    "released": "2026-01-23",
+    "arch": {
+      "kv_layers": 36,
+      "kv_heads": 1,
+      "head_dim": 160
+    },
+    "quantized_by": "cyankiwi",
+    "reasoning_parser": "mistral",
+    "notes": "Mixture-of-experts with MLA attention."
+  },
+  {
+    "id": "cyankiwi/Mistral-Medium-3.5-128B-AWQ-INT4",
+    "revision": "93da4cff4a071e13a5f84b016d45ed4e8b168b96",
+    "name": "Mistral Medium 3.5 128B",
+    "family": "Mistral",
+    "params": "128B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 82220785656,
+    "max_context": 262144,
+    "license": "other",
+    "released": "2026-03-31",
+    "arch": {
+      "kv_layers": 88,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "cyankiwi",
+    "reasoning_parser": "mistral"
+  },
+  {
+    "id": "QuantTrio/GLM-4.7-Flash-AWQ",
+    "revision": "88e3d3d913c0d97c8f505cdc03433c48226bedc3",
+    "name": "GLM-4.7 Flash",
+    "family": "GLM",
+    "params": "31B (3B active)",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 19763594088,
+    "max_context": 202752,
+    "license": "mit",
+    "released": "2026-01-19",
+    "arch": {
+      "kv_layers": 47,
+      "kv_heads": 1,
+      "head_dim": 288
+    },
+    "quantized_by": "QuantTrio",
+    "reasoning_parser": "glm45",
+    "notes": "Mixture-of-experts with MLA attention (a small KV cache)."
+  },
+  {
+    "id": "cyankiwi/GLM-4.5-Air-AWQ-4bit",
+    "revision": "a22f274db2cd5907e7ad7954a82c5abc882c3964",
+    "name": "GLM-4.5 Air",
+    "family": "GLM",
+    "params": "110B (12B active)",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 63400571960,
+    "max_context": 131072,
+    "license": "mit",
+    "released": "2025-07-20",
+    "arch": {
+      "kv_layers": 46,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "cyankiwi",
+    "reasoning_parser": "glm45",
+    "notes": "Mixture-of-experts."
+  },
+  {
+    "id": "QuantTrio/GLM-4.7-AWQ",
+    "revision": "ed9496bd930f4c89663de6f9fa2a6215002a3b4d",
+    "name": "GLM-4.7",
+    "family": "GLM",
+    "params": "358B (32B active)",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 194112705456,
+    "max_context": 202752,
+    "license": "mit",
+    "released": "2025-12-22",
+    "arch": {
+      "kv_layers": 92,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "QuantTrio",
+    "reasoning_parser": "glm45",
+    "notes": "Mixture-of-experts. Needs a large split cluster."
+  },
+  {
+    "id": "wtdcode/GLM-5.3-Flash-AWQ-W4A16",
+    "revision": "abd7b07719111f137e1de8a0c1b7e01c11b74d1a",
+    "name": "GLM-5.3 Flash",
+    "family": "GLM",
+    "params": "321B MoE",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 190810457040,
+    "max_context": 1048576,
+    "license": "see repo",
+    "released": "2026-08-25",
+    "arch": {
+      "kv_layers": 11,
+      "kv_heads": 1,
+      "head_dim": 256,
+      "linear_layers": 34
+    },
+    "quantized_by": "wtdcode",
+    "reasoning_parser": "glm45",
+    "notes": "Mixture-of-experts with hybrid attention: 11 of 45 layers keep a KV cache."
+  },
+  {
+    "id": "zai-org/GLM-5.3",
+    "revision": "aca966e4e02791568aa6a4ced368624b3d897f42",
+    "name": "GLM-5.3",
+    "family": "GLM",
+    "params": "753B MoE",
+    "quant": "FP8",
+    "weight_bytes": 755632050320,
+    "max_context": 1048576,
+    "license": "other",
+    "released": "2026-08-25",
+    "arch": {
+      "kv_layers": 78,
+      "kv_heads": 1,
+      "head_dim": 288
+    },
+    "reasoning_parser": "glm45",
+    "notes": "Mixture-of-experts. Needs a large split cluster. FP8: native on Ada (RTX 40) and newer; Ampere (RTX 30) runs it as 8-bit weights through Marlin."
+  },
+  {
+    "id": "shuyuej/Llama-3.2-1B-Instruct-GPTQ",
+    "revision": "4024c85b42b0a970040e96fb9f97987ab4adbd1c",
+    "name": "Llama 3.2 1B",
+    "family": "Llama",
+    "params": "1.2B",
+    "quant": "GPTQ 4-bit",
+    "weight_bytes": 1032380416,
+    "max_context": 131072,
+    "license": "apache-2.0",
+    "released": "2024-09-18",
+    "arch": {
+      "kv_layers": 16,
+      "kv_heads": 8,
+      "head_dim": 64
+    },
+    "quantized_by": "shuyuej"
+  },
+  {
+    "id": "casperhansen/llama-3.2-3b-instruct-awq",
+    "revision": "272b3bde867b606760447deb9a4d2719fbdfd3ae",
+    "name": "Llama 3.2 3B",
+    "family": "Llama",
+    "params": "3.2B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 2252764384,
+    "max_context": 131072,
+    "license": "see repo",
+    "released": "2024-09-18",
+    "arch": {
+      "kv_layers": 28,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "casperhansen"
+  },
+  {
+    "id": "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+    "revision": "db1f81ad4b8c7e39777509fac66c652eb0a52f91",
+    "name": "Llama 3.1 8B",
+    "family": "Llama",
+    "params": "8B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 5727938576,
+    "max_context": 131072,
+    "license": "llama3.1",
+    "released": "2024-07-18",
+    "arch": {
+      "kv_layers": 32,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "hugging-quants"
+  },
+  {
+    "id": "casperhansen/llama-3.3-70b-instruct-awq",
+    "revision": "64d255621f40b42adaf6d1f32a47e1d4534c0f14",
+    "name": "Llama 3.3 70B",
+    "family": "Llama",
+    "params": "70.6B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 39767996256,
+    "max_context": 131072,
+    "license": "llama3.3",
+    "released": "2024-11-26",
+    "arch": {
+      "kv_layers": 80,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "casperhansen"
+  },
+  {
+    "id": "RedHatAI/Llama-4-Scout-17B-16E-Instruct-quantized.w4a16",
+    "revision": "e8b8a7ca92e62e476ae2e7d3169bf11c7caba485",
+    "name": "Llama 4 Scout",
+    "family": "Llama",
+    "params": "109B (17B active)",
+    "quant": "W4A16",
+    "weight_bytes": 64874294440,
+    "max_context": 10485760,
+    "license": "llama4",
+    "released": "2025-04-02",
+    "arch": {
+      "kv_layers": 48,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "Red Hat AI",
+    "notes": "Mixture-of-experts."
+  },
+  {
+    "id": "RedHatAI/Llama-4-Maverick-17B-128E-Instruct-quantized.w4a16",
+    "revision": "b26390e93d51850e5874bb093244f3e11dcbe158",
+    "name": "Llama 4 Maverick",
+    "family": "Llama",
+    "params": "402B (17B active)",
+    "quant": "W4A16",
+    "weight_bytes": 215943177048,
+    "max_context": 1048576,
+    "license": "other",
+    "released": "2025-04-01",
+    "arch": {
+      "kv_layers": 48,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "Red Hat AI",
+    "notes": "Mixture-of-experts. Needs a large split cluster."
+  },
+  {
+    "id": "hugging-quants/Meta-Llama-3.1-405B-Instruct-AWQ-INT4",
+    "revision": "1954fc5977cde8271bd7fd3e9bbb827a7bdd3bcd",
+    "name": "Llama 3.1 405B",
+    "family": "Llama",
+    "params": "405B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 219278451608,
+    "max_context": 131072,
+    "license": "llama3.1",
+    "released": "2024-07-16",
+    "arch": {
+      "kv_layers": 126,
+      "kv_heads": 16,
+      "head_dim": 128
+    },
+    "quantized_by": "hugging-quants",
+    "notes": "Needs a large split cluster."
+  },
+  {
+    "id": "drawais/Phi-4-mini-instruct-AWQ-INT4",
+    "revision": "572b359ecc040798c7e6ae5b5db1b9da7e9d0648",
+    "name": "Phi-4 mini",
+    "family": "Phi",
+    "params": "3.8B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 2890590792,
+    "max_context": 131072,
+    "license": "mit",
+    "released": "2025-02-19",
+    "arch": {
+      "kv_layers": 32,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "drawais"
+  },
+  {
+    "id": "RedHatAI/phi-4-quantized.w4a16",
+    "revision": "e05cd2e17a849b824c85d6acdec3f62be9cd24c1",
+    "name": "Phi-4",
+    "family": "Phi",
+    "params": "14.7B",
+    "quant": "W4A16",
+    "weight_bytes": 9084841856,
+    "max_context": 16384,
+    "license": "mit",
+    "released": "2024-12-11",
+    "arch": {
+      "kv_layers": 40,
+      "kv_heads": 10,
+      "head_dim": 128
+    },
+    "quantized_by": "Red Hat AI"
+  },
+  {
+    "id": "danieldk/Phi-3.5-MoE-instruct-AWQ-INT4",
+    "revision": "073f3696a8a67b0a8793be2829d50b4474a12c5d",
+    "name": "Phi-3.5 MoE",
+    "family": "Phi",
+    "params": "42B (6.6B active)",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 22148376816,
+    "max_context": 131072,
+    "license": "mit",
+    "released": "2024-08-17",
+    "arch": {
+      "kv_layers": 32,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "danieldk",
+    "notes": "Mixture-of-experts."
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-0.5B-Instruct-AWQ",
+    "revision": "dfc71c16d1dcccdccceef7773a5f5ab26a5149f1",
+    "name": "Qwen2.5 Coder 0.5B Instruct",
+    "family": "Qwen",
+    "params": "0.5B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 730652248,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "released": "2024-11-09",
+    "arch": {
+      "kv_layers": 24,
+      "kv_heads": 2,
+      "head_dim": 64
+    },
+    "coding": true
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-1.5B-Instruct-AWQ",
+    "revision": "867d050da8a1af36b04fde627402656b3f918511",
+    "name": "Qwen2.5 Coder 1.5B Instruct",
+    "family": "Qwen",
+    "params": "1.5B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 1614553840,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "released": "2024-09-20",
+    "arch": {
+      "kv_layers": 28,
+      "kv_heads": 2,
+      "head_dim": 128
+    },
+    "coding": true
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-3B-Instruct-AWQ",
+    "revision": "5d2659311fbbae1ec6ccc83e0fae9778bb469494",
+    "name": "Qwen2.5 Coder 3B Instruct",
+    "family": "Qwen",
+    "params": "3.1B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 2686704624,
+    "max_context": 32768,
+    "license": "other",
+    "released": "2024-11-09",
+    "arch": {
+      "kv_layers": 36,
+      "kv_heads": 2,
+      "head_dim": 128
+    },
+    "coding": true
+  },
+  {
+    "id": "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ",
+    "revision": "9ce3eaa67fe88609afec235117e97eb03d9b3cda",
+    "name": "Qwen3 Coder 480B-A35B Instruct",
+    "family": "Qwen",
+    "params": "480B (35B active)",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 252321934880,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2025-07-22",
+    "arch": {
+      "kv_layers": 62,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "QuantTrio",
+    "coding": true,
+    "notes": "Mixture-of-experts. Needs a large split cluster."
+  },
+  {
+    "id": "TheBloke/CodeLlama-7B-Instruct-AWQ",
+    "revision": "c43ad1e18f527de1d070e1441cc5f6a00200eedb",
+    "name": "Code Llama 7B Instruct",
+    "family": "Llama",
+    "params": "6.7B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 3889653656,
+    "max_context": 16384,
+    "license": "llama2",
+    "released": "2023-08-24",
+    "arch": {
+      "kv_layers": 32,
+      "kv_heads": 32,
+      "head_dim": 128
+    },
+    "quantized_by": "TheBloke",
+    "coding": true
+  },
+  {
+    "id": "TheBloke/CodeLlama-13B-Instruct-AWQ",
+    "revision": "025fac20ebfbfb8041fa38eb47700b84361cea32",
+    "name": "Code Llama 13B Instruct",
+    "family": "Llama",
+    "params": "13B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 7248314992,
+    "max_context": 16384,
+    "license": "llama2",
+    "released": "2023-08-24",
+    "arch": {
+      "kv_layers": 40,
+      "kv_heads": 40,
+      "head_dim": 128
+    },
+    "quantized_by": "TheBloke",
+    "coding": true
+  },
+  {
+    "id": "TheBloke/CodeLlama-34B-Instruct-AWQ",
+    "revision": "75dcee870739fa6a49b98dfb7176613f5e512763",
+    "name": "Code Llama 34B Instruct",
+    "family": "Llama",
+    "params": "33.7B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 18308541944,
+    "max_context": 16384,
+    "license": "llama2",
+    "released": "2023-08-24",
+    "arch": {
+      "kv_layers": 48,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "TheBloke",
+    "coding": true
+  },
+  {
+    "id": "TheBloke/CodeLlama-70B-Instruct-AWQ",
+    "revision": "120b7068c3e2f17f9c678ad732390aae6ad508ba",
+    "name": "Code Llama 70B Instruct",
+    "family": "Llama",
+    "params": "69B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 36614403944,
+    "max_context": 4096,
+    "license": "llama2",
+    "released": "2024-01-29",
+    "arch": {
+      "kv_layers": 80,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "TheBloke",
+    "coding": true
+  },
+  {
+    "id": "TheBloke/deepseek-coder-6.7B-instruct-AWQ",
+    "revision": "502ae3e19e57ae78dc30a791ba33c565da72dc62",
+    "name": "DeepSeek Coder 6.7B Instruct",
+    "family": "DeepSeek",
+    "params": "6.7B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 3893585816,
+    "max_context": 16384,
+    "license": "other",
+    "released": "2023-10-29",
+    "arch": {
+      "kv_layers": 32,
+      "kv_heads": 32,
+      "head_dim": 128
+    },
+    "quantized_by": "TheBloke",
+    "coding": true
+  },
+  {
+    "id": "TheBloke/deepseek-coder-33B-instruct-GPTQ",
+    "revision": "08372729d98dfc248f9531a412fe69e14e607027",
+    "name": "DeepSeek Coder 33B Instruct",
+    "family": "DeepSeek",
+    "params": "33.3B",
+    "quant": "GPTQ 4-bit",
+    "weight_bytes": 17399444712,
+    "max_context": 16384,
+    "license": "other",
+    "released": "2023-11-01",
+    "arch": {
+      "kv_layers": 62,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "TheBloke",
+    "coding": true
+  },
+  {
+    "id": "casperhansen/deepseek-coder-v2-instruct-awq",
+    "revision": "3918bbb36a12d2a64e1f11a8079d71b0310f728c",
+    "name": "DeepSeek Coder V2 Instruct",
+    "family": "DeepSeek",
+    "params": "236B (21B active)",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 128693584992,
+    "max_context": 163840,
+    "license": "other",
+    "released": "2024-06-14",
+    "arch": {
+      "kv_layers": 60,
+      "kv_heads": 1,
+      "head_dim": 288
+    },
+    "quantized_by": "casperhansen",
+    "coding": true,
+    "notes": "Mixture-of-experts with MLA attention. Needs a large split cluster."
+  },
+  {
+    "id": "TechxGenus/starcoder2-15b-instruct-v0.1-AWQ",
+    "revision": "403c42e654a4f3ead370a4cd65c37a67c87a085e",
+    "name": "StarCoder2 15B Instruct",
+    "family": "StarCoder",
+    "params": "16B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 9190971912,
+    "max_context": 16384,
+    "license": "see repo",
+    "released": "2024-04-23",
+    "arch": {
+      "kv_layers": 40,
+      "kv_heads": 4,
+      "head_dim": 128
+    },
+    "quantized_by": "TechxGenus",
+    "coding": true
+  },
+  {
+    "id": "TechxGenus/Codestral-22B-v0.1-AWQ",
+    "revision": "a45d426d2752b0325e5b74d31c15c929be94c5ae",
+    "name": "Codestral 22B",
+    "family": "Mistral",
+    "params": "22.2B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 12155448872,
+    "max_context": 32768,
+    "license": "see repo",
+    "released": "2024-05-29",
+    "arch": {
+      "kv_layers": 56,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "TechxGenus",
+    "coding": true,
+    "notes": "Mistral Non-Production License: not for commercial use."
+  },
+  {
+    "id": "ibm-granite/granite-3b-code-instruct-128k",
+    "revision": "69509a1713811c7a6d2da1579241770f47cc85a2",
+    "name": "Granite Code 3B",
+    "family": "Granite",
+    "params": "3.5B",
+    "quant": "BF16",
+    "weight_bytes": 6965065400,
+    "max_context": 128000,
+    "license": "apache-2.0",
+    "released": "2024-07-12",
+    "arch": {
+      "kv_layers": 32,
+      "kv_heads": 32,
+      "head_dim": 80
+    },
+    "coding": true
+  },
+  {
+    "id": "ibm-granite/granite-8b-code-instruct-128k",
+    "revision": "bed93d8de15bb9bb55cb1da10ae860e2883f4254",
+    "name": "Granite Code 8B",
+    "family": "Granite",
+    "params": "8.1B",
+    "quant": "BF16",
+    "weight_bytes": 16109887328,
+    "max_context": 128000,
+    "license": "apache-2.0",
+    "released": "2024-07-12",
+    "arch": {
+      "kv_layers": 36,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "coding": true
+  },
+  {
+    "id": "ibm-granite/granite-34b-code-instruct-8k",
+    "revision": "4bdfb589ebd261be0942a00dd239175d9d65bc47",
+    "name": "Granite Code 34B",
+    "family": "Granite",
+    "params": "33.7B",
+    "quant": "BF16",
+    "weight_bytes": 67431319960,
+    "max_context": 32768,
+    "license": "apache-2.0",
+    "released": "2024-04-26",
+    "arch": {
+      "kv_layers": 88,
+      "kv_heads": 1,
+      "head_dim": 128
+    },
+    "coding": true
+  },
+  {
+    "id": "ByteDance-Seed/Seed-Coder-8B-Instruct",
+    "revision": "1c5af72afa21c22c9272a0b60a3a404195e88fcd",
+    "name": "Seed-Coder 8B Instruct",
+    "family": "Seed-Coder",
+    "params": "8.3B",
+    "quant": "BF16",
+    "weight_bytes": 16500958280,
+    "max_context": 32768,
+    "license": "mit",
+    "released": "2025-04-27",
+    "arch": {
+      "kv_layers": 32,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "coding": true
+  },
+  {
+    "id": "stelterlab/Yi-Coder-9B-Chat-AWQ",
+    "revision": "6f0693400ed30c4ab558023ebcd400a6a61196df",
+    "name": "Yi-Coder 9B Chat",
+    "family": "Yi-Coder",
+    "params": "8.8B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 5364058776,
+    "max_context": 131072,
+    "license": "apache-2.0",
+    "released": "2024-08-21",
+    "arch": {
+      "kv_layers": 48,
+      "kv_heads": 4,
+      "head_dim": 128
+    },
+    "quantized_by": "stelterlab",
+    "coding": true
+  },
+  {
+    "id": "infly/OpenCoder-8B-Instruct",
+    "revision": "01badbbf10c2dfd7e2a0b5f570065ef44548576c",
+    "name": "OpenCoder 8B Instruct",
+    "family": "OpenCoder",
+    "params": "7.8B",
+    "quant": "BF16",
+    "weight_bytes": 15542559816,
+    "max_context": 8192,
+    "license": "other",
+    "released": "2024-11-07",
+    "arch": {
+      "kv_layers": 32,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "coding": true
+  },
+  {
+    "id": "JetBrains/Mellum2-12B-A2.5B-Instruct",
+    "revision": "273d9c1c6882ac8e1562e5b7e043857d35a787b6",
+    "name": "Mellum2 12B-A2.5B Instruct",
+    "family": "Mellum",
+    "params": "12.1B (2.5B active)",
+    "quant": "BF16",
+    "weight_bytes": 24300538808,
+    "max_context": 131072,
+    "license": "apache-2.0",
+    "released": "2026-05-26",
+    "arch": {
+      "kv_layers": 7,
+      "kv_heads": 4,
+      "head_dim": 128,
+      "swa_layers": 21,
+      "swa_kv_heads": 4,
+      "swa_head_dim": 128,
+      "swa_window": 1024
+    },
+    "coding": true,
+    "notes": "Mixture-of-experts, by JetBrains."
+  },
+  {
+    "id": "IQuestLab/IQuest-Coder-V1-7B-Instruct",
+    "revision": "4b9526e2a61b234d3182d0a0909659d668d3b233",
+    "name": "IQuest-Coder V1 7B",
+    "family": "IQuest-Coder",
+    "params": "7.6B",
+    "quant": "BF16",
+    "weight_bytes": 15225635472,
+    "max_context": 131072,
+    "license": "other",
+    "released": "2025-12-30",
+    "arch": {
+      "kv_layers": 14,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "coding": true
+  },
+  {
+    "id": "IQuestLab/IQuest-Coder-V1-14B-Instruct",
+    "revision": "0bc1aa1e441d73f4010e3c162581e2daf1296bfd",
+    "name": "IQuest-Coder V1 14B",
+    "family": "IQuest-Coder",
+    "params": "14.4B",
+    "quant": "BF16",
+    "weight_bytes": 28878396456,
+    "max_context": 131072,
+    "license": "other",
+    "released": "2026-02-14",
+    "arch": {
+      "kv_layers": 28,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "coding": true
+  },
+  {
+    "id": "IQuestLab/IQuest-Coder-V1-40B-Instruct",
+    "revision": "265a7cba7dc0a9cec7a9e8f3f1f7dc873acee206",
+    "name": "IQuest-Coder V1 40B",
+    "family": "IQuest-Coder",
+    "params": "39.8B",
+    "quant": "BF16",
+    "weight_bytes": 79588652440,
+    "max_context": 131072,
+    "license": "other",
+    "released": "2025-12-30",
+    "arch": {
+      "kv_layers": 80,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "coding": true
+  },
+  {
+    "id": "cyankiwi/KAT-Coder-V2.5-Dev-AWQ-INT4",
+    "revision": "3828763ec44cfa594311d68bedf81553500c5b24",
+    "name": "KAT-Coder V2.5 Dev",
+    "family": "KAT-Coder",
+    "params": "35B MoE",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 24430408136,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-07-23",
+    "arch": {
+      "kv_layers": 10,
+      "kv_heads": 2,
+      "head_dim": 256,
+      "linear_layers": 30
+    },
+    "quantized_by": "cyankiwi",
+    "coding": true,
+    "reasoning_parser": "qwen3",
+    "notes": "Mixture-of-experts, by Kwaipilot."
+  },
+  {
+    "id": "stelterlab/openhands-lm-32b-v0.1-AWQ",
+    "revision": "5d7873e43b0a6db95a00dc8e3e9e89c3e0bca601",
+    "name": "OpenHands LM 32B",
+    "family": "OpenHands",
+    "params": "32.8B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 19328994120,
+    "max_context": 32768,
+    "license": "mit",
+    "released": "2025-03-26",
+    "arch": {
+      "kv_layers": 64,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "stelterlab",
+    "coding": true,
+    "notes": "Tuned for agentic software engineering."
+  },
+  {
+    "id": "moonshotai/Moonlight-16B-A3B-Instruct",
+    "revision": "4e735b07a89f73647dfab71ab91b840f362ede5b",
+    "name": "Moonlight 16B-A3B",
+    "family": "Kimi",
+    "params": "16B (3B active)",
+    "quant": "BF16",
+    "weight_bytes": 31920879456,
+    "max_context": 8192,
+    "license": "mit",
+    "released": "2025-02-22",
+    "arch": {
+      "kv_layers": 27,
+      "kv_heads": 1,
+      "head_dim": 288
+    },
+    "notes": "Mixture-of-experts with MLA attention."
+  },
+  {
+    "id": "cyankiwi/Kimi-Linear-48B-A3B-Instruct-AWQ-4bit",
+    "revision": "5d029d1844aa64ec302e14466be7d0353c6e697f",
+    "name": "Kimi Linear 48B-A3B",
+    "family": "Kimi",
+    "params": "48B (3B active)",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 30532500512,
+    "max_context": 32768,
+    "license": "mit",
+    "released": "2025-10-30",
+    "arch": {
+      "kv_layers": 7,
+      "kv_heads": 1,
+      "head_dim": 288,
+      "linear_layers": 20
+    },
+    "quantized_by": "cyankiwi",
+    "notes": "Hybrid attention: 7 of 27 layers keep a KV cache."
+  },
+  {
+    "id": "cyankiwi/Kimi-Dev-72B-AWQ-4bit",
+    "revision": "2b6c810d3cb9bdce73362c1283a5a8e146980e7d",
+    "name": "Kimi-Dev 72B",
+    "family": "Kimi",
+    "params": "72.7B",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 44481971344,
+    "max_context": 131072,
+    "license": "mit",
+    "released": "2025-06-16",
+    "arch": {
+      "kv_layers": 80,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "cyankiwi",
+    "coding": true,
+    "notes": "Tuned for software-engineering tasks."
+  },
+  {
+    "id": "moonshotai/Kimi-K2.7-Code",
+    "revision": "74797c9c62378b951a1f6fcf5c4631024e9b8bef",
+    "name": "Kimi K2.7 Code",
+    "family": "Kimi",
+    "params": "1T (32B active)",
+    "quant": "INT4",
+    "weight_bytes": 595177988208,
+    "max_context": 262144,
+    "license": "other",
+    "released": "2026-06-11",
+    "arch": {
+      "kv_layers": 61,
+      "kv_heads": 1,
+      "head_dim": 288
+    },
+    "coding": true,
+    "reasoning_parser": "kimi_k2",
+    "notes": "Mixture-of-experts, released by Moonshot in INT4. Needs a large split cluster."
+  },
+  {
+    "id": "moonshotai/Kimi-K2.6",
+    "revision": "7eb5002f6aadc958aed6a9177b7ed26bb94011bb",
+    "name": "Kimi K2.6",
+    "family": "Kimi",
+    "params": "1T (32B active)",
+    "quant": "INT4",
+    "weight_bytes": 595177988208,
+    "max_context": 262144,
+    "license": "other",
+    "released": "2026-04-14",
+    "arch": {
+      "kv_layers": 61,
+      "kv_heads": 1,
+      "head_dim": 288
+    },
+    "reasoning_parser": "kimi_k2",
+    "notes": "Mixture-of-experts, released by Moonshot in INT4. Needs a large split cluster."
+  },
+  {
+    "id": "moonshotai/Kimi-K3",
+    "revision": "f831ab66814297da540d832a5235f8e904f29d06",
+    "name": "Kimi K3",
+    "family": "Kimi",
+    "params": "2.8T MoE",
+    "quant": "4-bit",
+    "weight_bytes": 1560936091448,
+    "max_context": 1048576,
+    "license": "other",
+    "released": "2026-06-13",
+    "arch": {
+      "kv_layers": 24,
+      "kv_heads": 1,
+      "head_dim": 288,
+      "linear_layers": 69
+    },
+    "reasoning_parser": "kimi_k3",
+    "notes": "Mixture-of-experts with hybrid attention. Needs a very large split cluster."
+  },
+  {
+    "id": "cyankiwi/MiniMax-M2.7-AWQ-4bit",
+    "revision": "70ed6a57bdb0627d96386f26c70636f892477e88",
+    "name": "MiniMax M2.7",
+    "family": "MiniMax",
+    "params": "229B (10B active)",
+    "quant": "AWQ 4-bit",
+    "weight_bytes": 130495823656,
+    "max_context": 196608,
+    "license": "other",
+    "released": "2026-04-09",
+    "arch": {
+      "kv_layers": 62,
+      "kv_heads": 8,
+      "head_dim": 128
+    },
+    "quantized_by": "cyankiwi",
+    "reasoning_parser": "minimax",
+    "notes": "Mixture-of-experts. Needs a split cluster."
+  },
+  {
+    "id": "EmbeddedLLM/MiniMax-M3-FP8-dynamic",
+    "revision": "c6b5d622cc84823db127482a5ffafddc03acad5a",
+    "name": "MiniMax M3",
+    "family": "MiniMax",
+    "params": "427B MoE",
+    "quant": "FP8",
+    "weight_bytes": 430691899048,
+    "max_context": 1048576,
+    "license": "other",
+    "released": "2026-06-02",
+    "arch": {
+      "kv_layers": 60,
+      "kv_heads": 4,
+      "head_dim": 128
+    },
+    "quantized_by": "EmbeddedLLM",
+    "reasoning_parser": "minimax-m3",
+    "notes": "Mixture-of-experts with sparse attention. Needs a large split cluster."
   }
 ]

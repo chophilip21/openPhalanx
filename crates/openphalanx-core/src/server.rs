@@ -31,6 +31,8 @@ pub struct ResolvedModel {
     pub reasoning_parser: Option<String>,
     /// SGLang `--dtype` override (catalog data).
     pub dtype: Option<String>,
+    /// Long-context mode; `max_context` already counts it.
+    pub yarn: Option<catalog::Yarn>,
 }
 
 /// Edit format when the catalog doesn't name one.
@@ -39,6 +41,12 @@ pub const DEFAULT_EDIT_FORMAT: &str = "diff";
 impl ResolvedModel {
     pub fn context_len(&self, wanted: u32) -> u32 {
         wanted.min(self.max_context)
+    }
+
+    /// YaRN for this context: only above the native window (it can slightly
+    /// lower quality on short inputs, so it stays off when not needed).
+    pub fn rope_override(&self, context_len: u32) -> Option<catalog::Yarn> {
+        self.yarn.filter(|y| context_len > y.original_max)
     }
 
     /// Conservative VRAM need on a GPU with the given compute capability.
@@ -50,6 +58,25 @@ impl ResolvedModel {
             self.context_len(wanted_context),
             compute_capability,
         )
+    }
+}
+
+#[cfg(test)]
+mod yarn_tests {
+    use super::*;
+
+    #[test]
+    fn yarn_only_above_the_native_window() {
+        let settings = Settings::default();
+        // No catalog entry uses YaRN today (it broke recall in SGLang 0.5.21; see
+        // CLAUDE.md), so set it by hand to check the plumbing.
+        let mut m = resolve(&settings, "catalog:Qwen/Qwen2.5-Coder-14B-Instruct-AWQ").unwrap();
+        assert_eq!(m.max_context, 32_768, "native window only");
+        m.yarn = Some(catalog::Yarn { factor: 4.0, original_max: 32_768 });
+        assert!(m.rope_override(32_768).is_none(), "off at the native window");
+        assert_eq!(m.rope_override(36_864).map(|y| y.factor), Some(4.0));
+        let plain = resolve(&settings, "catalog:openai/gpt-oss-20b").unwrap();
+        assert!(plain.yarn.is_none() && plain.rope_override(131_072).is_none());
     }
 }
 
@@ -71,12 +98,13 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
             installed_dir,
             weight_bytes: e.weight_bytes,
             arch: e.arch,
-            max_context: e.max_context,
+            max_context: e.yarn.map_or(e.max_context, |y| y.max_context().max(e.max_context)),
             min_compute_capability: e.min_compute_capability,
             model_id: e.id.clone(),
             edit_format: e.edit_format.clone(),
             reasoning_parser: e.reasoning_parser.clone(),
             dtype: e.dtype.clone(),
+            yarn: e.yarn,
         });
     }
     let c = settings.custom_models.iter().find(|c| c.key == key)?;
@@ -99,6 +127,7 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
         edit_format: None,
         reasoning_parser: None,
         dtype: None,
+        yarn: None,
     })
 }
 
@@ -356,6 +385,7 @@ pub async fn start(
         edit_format: model.edit_format.clone().unwrap_or_else(|| DEFAULT_EDIT_FORMAT.to_string()),
         reasoning_parser: model.reasoning_parser.clone(),
         dtype: model.dtype.clone(),
+        yarn: model.rope_override(req.context_len),
         pairing_ttl_days: settings.pairing_ttl_days,
         split: split.map(|s| s.rank),
     })

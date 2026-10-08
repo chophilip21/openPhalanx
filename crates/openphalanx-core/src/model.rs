@@ -100,12 +100,14 @@ pub fn arch_from_config(config: &Value) -> Result<(ArchSpec, u32, Option<String>
     // Multimodal configs nest the language model.
     let c = config.get("text_config").unwrap_or(config);
     let num = |k: &str| c.get(k).and_then(Value::as_u64);
-    let layers = num("num_hidden_layers").context("config.json lacks num_hidden_layers")?;
-    let heads = num("num_attention_heads").context("config.json lacks num_attention_heads")?;
-    let kv_heads = num("num_key_value_heads").unwrap_or(heads);
+    // GPTBigCode (StarCoder 1, Granite Code 20B/34B) names these differently.
+    let layers = num("num_hidden_layers").or_else(|| num("n_layer")).context("config.json lacks num_hidden_layers")?;
+    let heads = num("num_attention_heads").or_else(|| num("n_head")).context("config.json lacks num_attention_heads")?;
+    let multi_query = c.get("multi_query").and_then(Value::as_bool).unwrap_or(false);
+    let kv_heads = num("num_key_value_heads").unwrap_or(if multi_query { 1 } else { heads });
     let head_dim = match num("head_dim") {
         Some(d) => d,
-        None => num("hidden_size").context("config.json lacks hidden_size")? / heads.max(1),
+        None => num("hidden_size").or_else(|| num("n_embd")).context("config.json lacks hidden_size")? / heads.max(1),
     };
     // Mixed attention: count full, sliding-window and linear layers apart.
     let types: Vec<&str> = c
@@ -114,8 +116,20 @@ pub fn arch_from_config(config: &Value) -> Result<(ArchSpec, u32, Option<String>
         .map(|t| t.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
     let count = |kind: &str| types.iter().filter(|t| **t == kind).count() as u64;
-    let (full, swa, linear) = if !types.is_empty() {
-        (count("full_attention"), count("sliding_attention"), count("linear_attention"))
+    // Kimi-Linear / K3: the listed layers keep a KV cache, the rest are linear.
+    let kimi_full = c
+        .get("linear_attn_config")
+        .and_then(|l| l.get("full_attn_layers"))
+        .and_then(Value::as_array)
+        .map(|a| a.len() as u64)
+        .filter(|n| *n > 0);
+    let (full, swa, linear) = if let Some(n) = kimi_full {
+        (n, 0, layers.saturating_sub(n))
+    } else if !types.is_empty() {
+        // Any other attention kind caches every token too ("full_attention",
+        // GLM-5's "deepseek_sparse_attention").
+        let other = types.iter().filter(|t| t.contains("attention") && !matches!(**t, "sliding_attention" | "linear_attention"));
+        (other.count() as u64, count("sliding_attention"), count("linear_attention"))
     } else if let Some(interval) = num("full_attention_interval").filter(|i| *i > 0) {
         (layers / interval, 0, layers - layers / interval)
     } else {
@@ -125,6 +139,13 @@ pub fn arch_from_config(config: &Value) -> Result<(ArchSpec, u32, Option<String>
     let full_heads = num("num_global_key_value_heads").unwrap_or(kv_heads);
     let full_dim = num("global_head_dim").unwrap_or(head_dim);
     let window = num("sliding_window").unwrap_or(0);
+    // MLA (DeepSeek V2/V3, GLM-4.7-Flash, GLM-5) caches one latent of
+    // kv_lora_rank + qk_rope_head_dim per token and layer, not K and V per
+    // head: as one head of half that width, the K+V formula gives exactly it.
+    let (full_heads, full_dim) = match num("kv_lora_rank").filter(|r| *r > 0) {
+        Some(rank) => (1, (rank + num("qk_rope_head_dim").unwrap_or(0)).div_ceil(2)),
+        None => (full_heads, full_dim),
+    };
     let spec = ArchSpec {
         kv_layers: full as u32,
         kv_heads: full_heads as u32,
@@ -281,6 +302,29 @@ pub fn mount_for(model_dir: &Path) -> Result<ModelMount> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reads_gptbigcode_and_kimi_linear_configs() {
+        // Granite Code 34B: multi-query attention, GPT-2 style names.
+        let config = json!({"n_layer": 88, "n_head": 48, "n_embd": 6144, "multi_query": true});
+        let (spec, ..) = arch_from_config(&config).unwrap();
+        assert_eq!((spec.kv_layers, spec.kv_heads, spec.head_dim), (88, 1, 128));
+        // Kimi-Linear: 7 of 27 layers keep an MLA cache, the rest are linear.
+        let config = json!({"num_hidden_layers": 27, "num_attention_heads": 32, "hidden_size": 2304, "kv_lora_rank": 512,
+                            "qk_rope_head_dim": 64, "linear_attn_config": {"full_attn_layers": [4, 8, 12, 16, 20, 24, 27]}});
+        let (spec, ..) = arch_from_config(&config).unwrap();
+        assert_eq!((spec.kv_layers, spec.kv_heads, spec.head_dim, spec.linear_layers), (7, 1, 288, 20));
+    }
+
+    #[test]
+    fn mla_caches_one_latent_per_token() {
+        // DeepSeek-V2-Lite: 16 heads of 192, but SGLang caches 512 + 64 per layer.
+        let config = json!({"num_hidden_layers": 27, "num_attention_heads": 16, "num_key_value_heads": 16,
+                            "hidden_size": 2048, "kv_lora_rank": 512, "qk_rope_head_dim": 64});
+        let (spec, ..) = arch_from_config(&config).unwrap();
+        assert_eq!((spec.kv_layers, spec.kv_heads, spec.head_dim), (27, 1, 288));
+        assert_eq!(spec.kv_bytes_per_token(), 27 * 576 * 2);
+    }
 
     #[test]
     fn parses_sources() {

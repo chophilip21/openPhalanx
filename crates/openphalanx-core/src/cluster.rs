@@ -152,6 +152,10 @@ pub struct WorkerOrder {
     /// SGLang `--dtype` override; every rank must use rank 0's.
     #[serde(default)]
     pub dtype: Option<String>,
+    /// YaRN rope scaling, as rank 0 runs it (two numbers; the member builds
+    /// the SGLang argument itself).
+    #[serde(default)]
+    pub yarn: Option<crate::catalog::Yarn>,
     /// Its rank; the member fills in its own network interface.
     pub rank: crate::docker::SplitRank,
     pub stage: crate::split::Stage,
@@ -178,6 +182,9 @@ impl WorkerOrder {
             if !["auto", "half", "float16", "bfloat16", "float", "float32"].contains(&d.as_str()) {
                 bail!("the host asked for an unknown dtype \"{d}\"");
             }
+        }
+        if let Some(y) = &self.yarn {
+            y.check().map_err(|e| anyhow::anyhow!("the host sent {e:#}"))?;
         }
         let p = &self.rank.partition;
         if p.is_empty() || !p.split(',').all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
@@ -1848,6 +1855,7 @@ async fn start_worker(order: &WorkerOrder) -> Result<()> {
         context_len: order.context_len,
         split: rank,
         dtype: order.dtype.clone(),
+        yarn: order.yarn,
         run_id: order.run_id.clone(),
     })
     .await
@@ -2335,6 +2343,7 @@ mod tests {
             },
             image: crate::docker::default_image(),
             context_len: 32768,
+            yarn: None,
             dtype: Some("bfloat16".into()),
             rank: crate::docker::SplitRank {
                 rank: 1,
@@ -2367,6 +2376,8 @@ mod tests {
             o.check().is_err()
         };
         assert!(bad(|o| o.dtype = Some("bfloat16 --trust-remote-code".into())), "flag smuggled in dtype");
+        assert!(bad(|o| o.yarn = Some(crate::catalog::Yarn { factor: 1e9, original_max: 32768 })), "absurd YaRN factor");
+        assert!(bad(|o| o.yarn = Some(crate::catalog::Yarn { factor: f32::NAN, original_max: 32768 })));
         assert!(bad(|o| o.rank.partition = "40,24 --trust-remote-code".into()));
         assert!(bad(|o| o.rank.partition = String::new()));
         assert!(bad(|o| o.rank.dist_init_addr = "1.2.3.4:9100 --enable-x".into()));

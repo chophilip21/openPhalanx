@@ -107,10 +107,11 @@ sudo apt install ../target/release/bundle/deb/Openphalanx_0.3.0_amd64.deb
 
 Open **Models**:
 
-* **Context window** (slider at the top) is a server setting: the most tokens one request can use, passed to SGLang when the server starts. It doesn't filter models; it changes each model's KV-cache need, so the VRAM column and badges follow it. The panel shows how far the selected model can go on this GPU.
-* The table lists Qwen (2.5 Coder, 3 Coder, 3.6), Gemma 4, gpt-oss and Devstral, filterable by family or by "only models that fit". Official repos, plus a few widely used 4-bit **Community** quantizations (labelled with who made them) where the publisher ships no build that fits 24 GB.
+* **Context window** (slider at the top) is a server setting: the most tokens one request can use, passed to SGLang when the server starts. It doesn't filter models; it changes each model's KV-cache need, so the VRAM column and badges follow it. The panel shows how far the selected model can go on this GPU. The same slider (`ContextSlider.svelte`) sits in the Server page's model card; both write `settings.context_len`. It's locked while a backend is starting, running or stopping (and `set_context_len` refuses then), since the running model keeps the context it started with. It also can't go past the selected model's **maximum for the VRAM free now** (`get_context_limit`: the same `vram_budget` as the Fits badges, this GPU or the split pool, re-read every 5 s): dragging stops at that exact value, the track beyond it is hatched red, and `set_context_len` refuses anything longer. A saved context above the limit (after switching models, or when another program took VRAM) shows a warning and **Use <max>**.
+* The table lists Qwen, Gemma 4, gpt-oss, Devstral and Mistral, Granite, DeepSeek, GLM, Llama, Phi, Kimi and MiniMax, each from its smallest to its largest size, plus coding models (StarCoder2, Code Llama, Codestral, Seed-Coder, Yi-Coder, OpenCoder, Mellum, IQuest-Coder, KAT-Coder, OpenHands LM) with a **Coding** badge, filterable by family or by "only models that fit", sorted by release date or download size (either direction; newest first by default), 15 per page. Official repos, plus widely used 4-bit **Community** quantizations (labelled with who made them) where the publisher ships none.
 * The table shows each model's VRAM need at the chosen context window, with a **Fits / Tight / Won't fit** badge measured against your GPU's free memory, and the longest context that would fit. The need is deliberately conservative and much larger than the download size. It covers weights as loaded, KV cache for the full context plus 25%, and runtime memory. **Best fit for this GPU** marks the largest model that fits with headroom.
-* Click **Download** on a model that fits. The default, Qwen2.5-Coder-14B-Instruct-AWQ, is already selected, and it is reused if it is in `~/.cache/huggingface`.
+* Every downloaded model has a delete button (except the one the server is running). A copy the app downloaded is removed from its models folder; one found in the Hugging Face cache is removed from that cache (its whole `models--org--name` folder, every revision), after a warning that other tools may share it. Anything outside those two places is refused.
+* Click **Download** on a model that fits. Progress shows at once (a progress bar; it pulses until the size is known), then each phase: listing files, checking files already on disk (a resumed `.part` file is re-hashed first, which takes a while for big shards), and the transfer with its speed; the size is reported as soon as the file list is in, and until then the empty bar pulses (no moving fill, which read as progress resetting). A second click while it runs is harmless. Every message banner in the app has an (X) to close it (`Notice.svelte`). The default, Qwen2.5-Coder-14B-Instruct-AWQ, is already selected, and it is reused if it is in `~/.cache/huggingface`.
 * To use your own model, enter a local folder (with `config.json` and `.safetensors`) or a Hugging Face URL under **Add your own model**. Its VRAM need is checked before anything downloads.
 
 ### 3. Start
@@ -120,9 +121,21 @@ On **Server**, check that the pre-flight list is green, then press the power but
 * The first start builds the backend image: Docker downloads the official SGLang image (about 16 GB, once) and the app adds its gateway on top (about a minute). Loading the model then takes about 3–4 minutes.
 * The running model (name, quantization, context) shows under the headline with a lock, and as **Running** on Models; it's fixed until the server stops (the tooltip says so). The context comes from the container's `CONTEXT_LENGTH`.
 * The button turns green when SGLang is ready, and a **pairing code** appears. Use it to pair a client. Codes are single-use and expire after 10 minutes, but paired devices stay paired.
-* **Logs** shows live SGLang output. **Devices** lists paired clients and lets you revoke them.
+* **Logs** shows live SGLang output (before the first start it says so, instead of Docker's "No such container"). **Devices** lists paired clients and lets you revoke them.
 
 Start is disabled whenever free VRAM is below what the selected model needs. Close other GPU programs, or choose a smaller model or context length.
+
+### 4. Updates
+
+At launch the app asks GitHub for the latest release (`app_update.rs` in core; quiet when offline). If it's newer, a dialog offers to download it; **Check for updates** under the version in the sidebar asks again.
+
+* **How it installs** depends on how the app was installed (`Install::detect`):
+  * AppImage (`$APPIMAGE`): the new AppImage is downloaded next to it and renamed over it.
+  * .deb (the binary belongs to a package, `dpkg-query -S`): `pkexec apt-get install` on the downloaded file, so the system asks for the password.
+  * Built from source or `tauri dev`: the dialog says to `git pull` and rebuild, with no install button.
+* **Checked before anything changes:** the download must match its line in the release's `SHA256SUMS` (the same trust model as `oppx --update`: GitHub over TLS). Tauri's updater plugin would add signatures, but needs a signing key in CI and a `latest.json` per release.
+* **Relaunch:** a detached `sh -c 'sleep 2; exec <app>'` starts the new copy after this one exits (Tauri's `restart()` starts it first, and both would bind the cluster port). The backend container keeps running and the new app adopts it, a split run included (`workers.json`).
+* **To test:** build an AppImage from a copy with the version lowered (`Cargo.toml`, `tauri.conf.json`, `package.json`), run it, and update to the latest release.
 
 ## Run the backend without the GUI
 
@@ -388,8 +401,10 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
 
 ## Model catalog and VRAM estimate
 
+* **Which build:** for each size, the smallest build the pinned SGLang runs on Ampere and Ada: official 4-bit (AWQ, GPTQ, W4A16) first, then a community 4-bit build, then FP8, then the publisher's 16-bit build. A community build must come from a known quantizer (TheBloke, casperhansen, cyankiwi, QuantTrio, Red Hat AI, TechxGenus, stelterlab, hugging-quants) or be widely downloaded; the smallest wins when several qualify. Code Llama comes from the ungated `codellama` org (the `meta-llama` copies are gated). Not used: NVFP4 (refused on the 3090: "Current platform does not support w4a4 nvfp4"), dense MXFP4 in compressed-tensors ("CompressedTensorsW4A16Sparse24 is not supported"), bitsandbytes, GGUF, and gated repos (the downloader has no Hugging Face token, and every official Llama is gated). Left out for now: Mistral Large 3 (NVFP4, or Mistral's own format without `config.json`), DeepSeek V4.1 (`DeepseekV41ForCausalLM` isn't in SGLang 0.5.21) and the 1.5B R1 distill (no usable 4-bit build).
 * **Adding models:** write a spec (id, name, family, params, quant, and `quantized_by` for community builds), run `scripts/catalog_entry.py specs.json`, and paste the entries into `catalog.json`. `scripts/catalog_entry.py --check` verifies every entry's weight size, attention shape and context against Hugging Face.
-* **Release date** (`released`, shown as a year on the Models page): the repo's creation date on Hugging Face; community quantizations take their base model's date (`base_model` in the spec).
+* **`coding`** (optional, shown as a **Coding** badge): set by hand for models their publisher specializes for code (Qwen Coder, Devstral, DeepSeek Coder); general models that also code well don't get it.
+* **Release date** (`released`, shown as a year on the Models page; the full date orders "Newest first"): the repo's creation date on Hugging Face; community quantizations take their base model's date (`base_model` in the spec).
 * **`dtype`** (optional, passed as SGLang `--dtype` to every rank): for checkpoints whose declared dtype SGLang can't run. The 4-bit Qwen3.6 builds (cyankiwi 27B, QuantTrio 35B-A3B) declare float16, but SGLang keeps the Gated-DeltaNet state in bfloat16 and the first prefill failed with "Index put requires the source and destination dtypes match"; they use `bfloat16` (verified on the 27B; the 35B-A3B by analogy).
 * **FP8 KV cache** (`--kv-cache-dtype`), measured with `scripts/probe_kv.py`: not enabled for any model. On the 3090 (Ampere) only `fp8_e5m2` runs (`fp8_e4m3` fails to compile in Triton on sm_86). It gives gpt-oss-20b a 128k context on one card (199k KV tokens), but costs accuracy: recall at 24k tokens 1/3 against 3/3 with 16-bit KV, coding 4/5 against 5/5. Qwen2.5-Coder-14B gains nothing: its native window is 32k. Worth re-checking `fp8_e4m3` on Ada (4090) and on Qwen3.6, as a per-model catalog field only if it passes.
 * **Check the architecture first:** the pinned SGLang must have the model class (`sglang/srt/models/` in the image). All current entries were checked against SGLang 0.5.21.
@@ -398,7 +413,12 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
   * full-attention layers × context;
   * sliding-window layers (Gemma 4, gpt-oss) × 0.8 of the context (`--swa-full-tokens-ratio`);
   * Gemma 4's full layers use their own shape (`global_head_dim`, `num_global_key_value_heads`);
-  * hybrid linear-attention models (Qwen3-Next, Qwen3.6) × 1.9, for the recurrent-state pool (`--mamba-full-memory-ratio` 0.9).
+  * hybrid linear-attention models (Qwen3-Next, Qwen3.6) × 1.9, for the recurrent-state pool (`--mamba-full-memory-ratio` 0.9);
+  * MLA (DeepSeek V2/V3, GLM-4.7-Flash, GLM-5, Mistral Small 4): one latent of `kv_lora_rank + qk_rope_head_dim` per token and layer, stored as one head of half that width (`catalog_entry.py` and `model::arch_from_config` do the same);
+  * Kimi-Linear and K3 list their KV-cache layers in `linear_attn_config.full_attn_layers` (the rest are linear); GPTBigCode configs (Granite Code 20B/34B) use `n_layer`/`n_head`/`n_embd`, and `multi_query` means one KV head;
+  * every `layer_types` attention kind other than sliding-window and linear counts as full (GLM-5's `deepseek_sparse_attention`). DeepSeek V4's compressed attention is counted as one 512-wide KV head on every layer, an overestimate.
+* **YaRN (`yarn` catalog field) is wired but used by no entry.** It would raise a model's maximum to native × factor and pass `--json-model-override-args` (rope scaling plus `max_position_embeddings`, which SGLang 0.5.21 derives the limit from) only above the native window, to every split rank. Measured on Qwen2.5-Coder-7B-AWQ (3090, needle recall, `start-sglang.sh` as the app runs it): without YaRN 3/3 at 26k tokens; with YaRN 3/3 at 3k, 2/3 at 8k, 0/3 at 26k and 44k (Qwen's own snippet alone the same). Re-test after an SGLang upgrade before adding `"yarn": {"factor": 4.0, "original_max_position_embeddings": 32768}` to Qwen2.5-Coder 7B+ or Qwen3-8B (0.5B–3B are 32k models).
+* **FP8 on Ampere** is counted at 16-bit size (`fp8_upcast`), but SGLang 0.5.21 switches FP8 to Marlin on SM 8.0–8.8 (`can_auto_enable_marlin_fp8`), which keeps 8-bit weights. Worth measuring on the 3090 (dense and MoE) and dropping the upcast if it holds.
 * **Validated on hardware:** Qwen2.5-Coder-14B-AWQ and gpt-oss-20b (MXFP4) on the 3090, and Qwen3.6-27B-AWQ split across the 3090 and the 4090 laptop. The rest is not yet validated; a model matrix run (routing probes, `scripts/eval_edits.py`, tokens/s) is still to do. MXFP4 (gpt-oss) is counted at 4 bits, since SGLang's Marlin and Triton kernels keep it packed on Ampere.
 
 ## Releasing
@@ -429,10 +449,14 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
 ## Repository layout
 
 ```
-app/                     Tauri 2 + Svelte 5 server GUI (Linux)
+app/                     Tauri 2 + Svelte 5 server GUI (Linux); src-tauri/icons/ from icon.svg (assets/openphalanx-shield-green.svg,
+                         on a square canvas centred on the shield, not the arrow): npx tauri icon src-tauri/icons/icon.svg -p 32,64,128,256,512, then rename
+                         256 to 128x128@2x.png and 512 to icon.png. On Wayland the dock icon never comes from the binary
+                         (GTK3 sends only the app id, `openphalanx`): it's the icon of the installed .desktop entry, so
+                         `tauri dev` shows the installed package's icon
   src/                   frontend: pages, components, typed command bindings
   src-tauri/             Rust shell: Tauri commands, 2 s status monitor, log streaming
-crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight, cluster, split plan (no Tauri, unit-tested)
+crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight, cluster, split plan, app updates (no Tauri, unit-tested)
 crates/openphalanx-server/ openphalanx-server: headless server (cluster service + command-line control)
 crates/pinned-tls/       TLS pinned to a certificate fingerprint (shared by oppx and the cluster)
   catalog.json           curated models pinned to Hugging Face commits (built with scripts/catalog_entry.py); optional per-model

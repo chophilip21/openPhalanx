@@ -1,6 +1,6 @@
 //! Where Openphalanx keeps its files (XDG locations on Linux).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -39,4 +39,27 @@ pub fn hf_hub_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| home().join(".cache/huggingface"))
         .join("hub")
+}
+
+/// The Hugging Face cache folder of the model `dir` belongs to
+/// (`<hub>/models--org--name`), when `dir` is a snapshot inside `hub`.
+pub fn hf_cache_repo_dir(dir: &Path, hub: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|a| a.parent() == Some(hub) && a.file_name().is_some_and(|n| n.to_string_lossy().starts_with("models--")))
+        .map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_cache_folder_of_a_snapshot() {
+        let hub = Path::new("/home/u/.cache/huggingface/hub");
+        let snap = hub.join("models--Qwen--Qwen3-8B-AWQ/snapshots/abc123");
+        assert_eq!(hf_cache_repo_dir(&snap, hub), Some(hub.join("models--Qwen--Qwen3-8B-AWQ")));
+        assert_eq!(hf_cache_repo_dir(Path::new("/home/u/models/x"), hub), None);
+        assert_eq!(hf_cache_repo_dir(&hub.join("datasets--x/snapshots/1"), hub), None);
+        assert_eq!(hf_cache_repo_dir(hub, hub), None);
+    }
 }

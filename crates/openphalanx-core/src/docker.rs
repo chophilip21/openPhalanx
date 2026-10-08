@@ -250,6 +250,8 @@ pub struct RunSpec {
     pub reasoning_parser: Option<String>,
     /// SGLang `--dtype` override.
     pub dtype: Option<String>,
+    /// YaRN rope scaling, when the context is above the model's native window.
+    pub yarn: Option<crate::catalog::Yarn>,
     /// Days a client pairing lasts (`None`: never).
     pub pairing_ttl_days: Option<u32>,
     /// Rank 0 of a model split across servers.
@@ -376,6 +378,12 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
     if let Some(dtype) = &spec.dtype {
         extra.push(format!("--dtype {dtype}"));
     }
+    // JSON, so not in SGLANG_EXTRA_ARGS (split on spaces): its own variable,
+    // which start-sglang.sh quotes into --json-model-override-args.
+    if let Some(yarn) = &spec.yarn {
+        a.push("-e".into());
+        a.push(format!("{JSON_OVERRIDE_ENV}={}", yarn.override_json()));
+    }
     if let Some(parser) = &spec.reasoning_parser {
         extra.push(format!("--reasoning-parser {parser}"));
         // The gateway drives reasoning models differently (see gateway.classify).
@@ -403,10 +411,15 @@ pub struct WorkerSpec {
     pub split: SplitRank,
     /// Must match rank 0's.
     pub dtype: Option<String>,
+    /// Must match rank 0's (every rank computes the same rotary embedding).
+    pub yarn: Option<crate::catalog::Yarn>,
     pub run_id: String,
 }
 
 pub const RUN_LABEL: &str = "io.openphalanx.run";
+
+/// start-sglang.sh passes it, quoted, as SGLang's `--json-model-override-args`.
+pub const JSON_OVERRIDE_ENV: &str = "JSON_MODEL_OVERRIDE_ARGS";
 
 pub fn worker_run_args(spec: &WorkerSpec) -> Vec<String> {
     let mut a: Vec<String> = vec![
@@ -448,6 +461,9 @@ pub fn worker_run_args(spec: &WorkerSpec) -> Vec<String> {
         ),
     ];
     env.extend(spec.split.env());
+    if let Some(yarn) = &spec.yarn {
+        env.push((JSON_OVERRIDE_ENV, yarn.override_json()));
+    }
     for (k, v) in env {
         a.push("-e".into());
         a.push(format!("{k}={v}"));
@@ -568,6 +584,10 @@ pub async fn run_searxng(settings_file: &Path, secret: &str, loopback: bool) -> 
 
 pub async fn logs_tail(lines: u32) -> Result<String> {
     let out = docker(&["logs", "--tail", &lines.to_string(), CONTAINER_NAME]).await?;
+    if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("No such container") {
+        // Not started yet: no output, rather than Docker's error as a log line.
+        return Ok(String::new());
+    }
     Ok(format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -631,9 +651,25 @@ mod tests {
             edit_format: "diff".into(),
             reasoning_parser: Some("qwen3".into()),
             dtype: None,
+            yarn: None,
             pairing_ttl_days: Some(7),
             split: None,
         }
+    }
+
+    #[test]
+    fn yarn_reaches_sglang_as_one_argument() {
+        let yarn = crate::catalog::Yarn { factor: 4.0, original_max: 32768 };
+        let a = run_args(&RunSpec { yarn: Some(yarn), ..spec() });
+        // One docker argument (no shell, no splitting), not in SGLANG_EXTRA_ARGS.
+        let arg = a.iter().find(|x| x.starts_with("JSON_MODEL_OVERRIDE_ARGS=")).expect("override passed");
+        let json: serde_json::Value = serde_json::from_str(arg.split_once('=').unwrap().1).unwrap();
+        assert_eq!(json["rope_scaling"]["factor"], 4.0);
+        assert_eq!(json["rope_scaling"]["original_max_position_embeddings"], 32768);
+        assert_eq!(json["rope_scaling"]["rope_type"], "yarn");
+        assert_eq!(json["max_position_embeddings"], 131_072, "SGLang derives the limit from it");
+        assert!(!a.iter().any(|x| x.starts_with("SGLANG_EXTRA_ARGS=") && x.contains("rope")));
+        assert!(!run_args(&spec()).iter().any(|x| x.starts_with("JSON_MODEL_OVERRIDE_ARGS")), "off by default");
     }
 
     fn split_rank(rank: u32) -> SplitRank {
@@ -688,8 +724,10 @@ mod tests {
             context_len: 32768,
             split: split_rank(1),
             dtype: Some("bfloat16".into()),
+            yarn: Some(crate::catalog::Yarn { factor: 4.0, original_max: 32768 }),
             run_id: "r1".into(),
         };
+        assert!(worker_run_args(&w).iter().any(|x| x.starts_with("JSON_MODEL_OVERRIDE_ARGS={")), "same YaRN as rank 0");
         let a = worker_run_args(&w).join(" ");
         assert!(a.contains("--name openphalanx-worker") && a.contains("--network host"));
         assert!(a.contains("--entrypoint /opt/openphalanx/start-sglang.sh"), "no gateway on a worker");

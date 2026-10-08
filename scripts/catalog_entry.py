@@ -53,13 +53,21 @@ def runtime_weight_bytes(siblings) -> int:
 
 def arch(config: dict) -> tuple[dict, int]:
     c = config.get("text_config", config)
-    layers = c["num_hidden_layers"]
-    heads = c["num_attention_heads"]
-    kv_heads = c.get("num_key_value_heads") or heads
-    head_dim = c.get("head_dim") or c["hidden_size"] // heads
+    # GPTBigCode (StarCoder 1, Granite Code 20B/34B) names these differently.
+    layers = c.get("num_hidden_layers") or c["n_layer"]
+    heads = c.get("num_attention_heads") or c["n_head"]
+    kv_heads = c.get("num_key_value_heads") or (1 if c.get("multi_query") else heads)
+    head_dim = c.get("head_dim") or (c.get("hidden_size") or c["n_embd"]) // heads
     types = c.get("layer_types") or []
-    if types:
-        full, swa, linear = (types.count(k) for k in ("full_attention", "sliding_attention", "linear_attention"))
+    kimi_full = (c.get("linear_attn_config") or {}).get("full_attn_layers")
+    if kimi_full:
+        # Kimi-Linear / K3: the listed layers keep a KV cache, the rest are linear.
+        full, swa, linear = len(kimi_full), 0, layers - len(kimi_full)
+    elif types:
+        swa, linear = types.count("sliding_attention"), types.count("linear_attention")
+        # Any other attention kind caches every token too ("full_attention",
+        # GLM-5's "deepseek_sparse_attention").
+        full = sum(1 for t in types if "attention" in t and t not in ("sliding_attention", "linear_attention"))
     elif c.get("full_attention_interval"):
         full = layers // c["full_attention_interval"]
         swa, linear = 0, layers - full
@@ -70,6 +78,12 @@ def arch(config: dict) -> tuple[dict, int]:
         "kv_heads": c.get("num_global_key_value_heads") or kv_heads,
         "head_dim": c.get("global_head_dim") or head_dim,
     }
+    if c.get("kv_lora_rank"):
+        # MLA (DeepSeek V2/V3, GLM-4.7-Flash, GLM-5): SGLang caches one latent of
+        # kv_lora_rank + qk_rope_head_dim per token and layer, not K and V per
+        # head; as one head of half that width, the K+V formula gives exactly it.
+        spec["kv_heads"] = 1
+        spec["head_dim"] = -(-(c["kv_lora_rank"] + c.get("qk_rope_head_dim", 0)) // 2)
     if swa:
         spec.update(swa_layers=swa, swa_kv_heads=kv_heads, swa_head_dim=head_dim, swa_window=c.get("sliding_window", 0))
     if linear:

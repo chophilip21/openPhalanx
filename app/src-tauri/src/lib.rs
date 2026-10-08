@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openphalanx_core::admin::{self, AdminClient};
+use openphalanx_core::app_update::{self, Install};
 use openphalanx_core::cluster::{self, Cluster, ClusterView, Role, Strategy};
 use openphalanx_core::server::{self, CheckStatus, StartProgress};
 use openphalanx_core::settings::{CustomModel, Settings};
@@ -410,6 +411,8 @@ struct SplitPlan {
     stages: Vec<split::Stage>,
     model: cluster::ModelSpec,
     dtype: Option<String>,
+    /// Rank 0's YaRN setting; every rank must use it.
+    yarn: Option<openphalanx_core::catalog::Yarn>,
 }
 
 /// The model members are asked to keep on disk (repo and pinned commit).
@@ -493,7 +496,7 @@ fn plan_split(state: &AppState, settings: &Settings, pf: &mut server::Preflight)
             .map(|n| split::Capacity { id: n.id.clone(), name: n.name.clone(), free_bytes: n.available_bytes })
             .collect();
         let stages = split::plan(&req, &shape, &caps)?;
-        Ok(SplitPlan { stages, model: spec, dtype: model.dtype.clone() })
+        Ok(SplitPlan { stages, model: spec, dtype: model.dtype.clone(), yarn: model.rope_override(req.context_len) })
     })();
 
     let check = pf.checks.iter_mut().find(|c| c.id == "vram")?;
@@ -604,6 +607,7 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
                         image: settings.image(),
                         context_len: settings.context_len,
                         dtype: plan.dtype.clone(),
+                        yarn: plan.yarn,
                         rank: rank(stage.rank, None),
                         stage: stage.clone(),
                     })
@@ -702,6 +706,64 @@ async fn get_logs(tail: u32) -> CmdResult<String> {
 }
 
 // --------------------------------------------------------------------------
+// Commands: app updates
+// --------------------------------------------------------------------------
+
+#[tauri::command]
+async fn check_update() -> CmdResult<app_update::Check> {
+    app_update::check(env!("CARGO_PKG_VERSION")).await.map_err(err)
+}
+
+#[derive(Clone, Serialize)]
+struct UpdateProgress {
+    stage: &'static str,
+    done: u64,
+    total: u64,
+}
+
+/// Downloads and installs the latest release, then relaunches the app. The
+/// backend container keeps running meanwhile; the new app adopts it.
+#[tauri::command]
+async fn install_update(app: AppHandle) -> CmdResult<()> {
+    let install = Install::detect();
+    let emit = |stage: &'static str, done: u64, total: u64| {
+        let _ = app.emit("update-progress", UpdateProgress { stage, done, total });
+    };
+    let last_pct = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let (_, file) = app_update::download(&install, |done, total| {
+        let pct = (done * 100).checked_div(total).unwrap_or(0);
+        if last_pct.swap(pct, Ordering::Relaxed) != pct {
+            emit("downloading", done, total);
+        }
+    })
+    .await
+    .map_err(err)?;
+    emit("installing", 0, 0);
+    app_update::install(&install, &file).await.map_err(err)?;
+    emit("restarting", 0, 0);
+    // The new copy starts once this one has exited and freed its ports
+    // (Tauri's restart() starts it first, and both would bind 9092).
+    let exe = match &install {
+        Install::AppImage { path } => path.clone(),
+        _ => {
+            let exe = std::env::current_exe().map_err(err)?;
+            // apt replaced the file this process runs from.
+            std::path::PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)").to_string())
+        }
+    };
+    std::process::Command::new("sh")
+        .args(["-c", "sleep 2; exec \"$0\""])
+        .arg(&exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(err)?;
+    app.exit(0);
+    Ok(())
+}
+
+// --------------------------------------------------------------------------
 // Commands: pairing and devices
 // --------------------------------------------------------------------------
 
@@ -770,8 +832,12 @@ struct ModelRow {
     /// Year the model was published (catalog), e.g. "2025".
     released: Option<String>,
     notes: Option<String>,
+    /// The full release date, for sorting (`released` is the year shown).
+    released_on: Option<String>,
     /// Verified end to end on real hardware (catalog flag).
     tested: bool,
+    /// Specialized for code (catalog flag).
+    coding: bool,
     /// Largest installed-or-downloadable model that fits comfortably right now.
     best_fit: bool,
     custom: bool,
@@ -852,9 +918,18 @@ fn cluster_pool(state: &AppState, gpu: Option<&gpu::GpuInfo>, available: Option<
         .filter(|nodes| nodes.len() > 1)
 }
 
-#[tauri::command]
-async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
-    let settings = state.settings();
+/// The VRAM a model can use: this GPU's free memory (as it was before the
+/// backend started, while it runs), or the cluster's pool on a split host
+/// with online members. Fits, the context cap and `set_context_len` all use it.
+struct VramBudget {
+    gpu: Option<gpu::GpuInfo>,
+    available: Option<u64>,
+    basis: &'static str,
+    pool: Option<Vec<PoolNode>>,
+    servers: u32,
+}
+
+async fn vram_budget(state: &AppState, settings: &Settings) -> VramBudget {
     let gpus = gpu::query().await.unwrap_or_default();
     let gpu = gpus.into_iter().find(|g| g.index == settings.gpu_index);
     let running = docker::inspect().await.ok().flatten().is_some_and(|c| c.state.running);
@@ -866,13 +941,67 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
         Some(g) => (Some(g.free_bytes), "free right now"),
         None => (None, "no GPU detected"),
     };
-
-    let pool = cluster_pool(&state, gpu.as_ref(), available, running);
+    let pool = cluster_pool(state, gpu.as_ref(), available, running);
     let servers = pool.as_ref().map_or(1, |p| p.len() as u32);
     let (available, basis) = match &pool {
         Some(p) => (Some(p.iter().map(|n| n.available_bytes).sum()), "pooled across the cluster (split)"),
         None => (available, basis),
     };
+    VramBudget { gpu, available, basis, pool, servers }
+}
+
+impl VramBudget {
+    /// The longest context `m` fits in, or `None` when not even the minimum does.
+    fn max_fit(&self, m: &server::ResolvedModel) -> Option<u32> {
+        let cc = self.gpu.as_ref().and_then(|g| g.compute_capability);
+        let need = |c: u32| vram::split_across(&m.requirement(c, cc), self.servers);
+        self.available.and_then(|free| vram::max_fitting_context(m.max_context, free, need))
+    }
+}
+
+/// The selected model's context ceiling, for the slider.
+#[derive(Debug, Clone, Serialize)]
+struct ContextLimit {
+    model: Option<String>,
+    /// The longest context that fits the VRAM; `None`: not even 2k fits (or no GPU).
+    max_fit: Option<u32>,
+    model_max: Option<u32>,
+    /// The cap is the model's own maximum context, not the VRAM (which allows more).
+    by_model: bool,
+    /// Above this the model runs in its long-context mode (YaRN); `None`: it has none.
+    native_max: Option<u32>,
+    available_bytes: Option<u64>,
+    basis: &'static str,
+    servers: u32,
+}
+
+async fn context_limit(state: &AppState, settings: &Settings) -> ContextLimit {
+    let budget = vram_budget(state, settings).await;
+    let model = settings.selected_model.as_deref().and_then(|k| server::resolve(settings, k));
+    let max_fit = model.as_ref().and_then(|m| budget.max_fit(m));
+    let model_max = model.as_ref().map(|m| m.max_context);
+    ContextLimit {
+        model: model.as_ref().map(|m| m.label.clone()),
+        max_fit,
+        model_max,
+        by_model: matches!((max_fit, model_max), (Some(f), Some(m)) if f >= m),
+        native_max: model.as_ref().and_then(|m| m.yarn).map(|y| y.original_max),
+        available_bytes: budget.available,
+        basis: budget.basis,
+        servers: budget.servers,
+    }
+}
+
+#[tauri::command]
+async fn get_context_limit(state: State<'_, AppState>) -> CmdResult<ContextLimit> {
+    let settings = state.settings();
+    Ok(context_limit(&state, &settings).await)
+}
+
+#[tauri::command]
+async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
+    let settings = state.settings();
+    let VramBudget { gpu, available, basis, pool, servers } = vram_budget(&state, &settings).await;
 
     let mut keys: Vec<String> = catalog::catalog().iter().map(|e| server::catalog_key(&e.id)).collect();
     keys.extend(settings.custom_models.iter().map(|c| c.key.clone()));
@@ -901,7 +1030,9 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
                 license: entry.as_ref().map(|e| e.license.clone()),
                 released: entry.as_ref().and_then(|e| e.released.as_ref()).map(|d| d.chars().take(4).collect()),
                 notes: entry.as_ref().and_then(|e| e.notes.clone()),
+                released_on: entry.as_ref().and_then(|e| e.released.clone()),
                 tested: entry.as_ref().is_some_and(|e| e.tested),
+                coding: entry.as_ref().is_some_and(|e| e.coding),
                 best_fit: false,
                 custom: entry.is_none(),
                 weight_bytes: m.weight_bytes,
@@ -948,10 +1079,33 @@ fn select_model(state: State<'_, AppState>, key: String) -> CmdResult<Settings> 
     Ok(settings)
 }
 
+/// Locked while the server starts or runs: the running model keeps the context
+/// it started with, and the setting must say what it serves.
 #[tauri::command]
-fn set_context_len(state: State<'_, AppState>, context_len: u32) -> CmdResult<Settings> {
+async fn set_context_len(state: State<'_, AppState>, context_len: u32) -> CmdResult<Settings> {
     if !(2048..=262_144).contains(&context_len) {
         return Err("Context length must be between 2,048 and 262,144 tokens.".into());
+    }
+    let starting = matches!(state.inner.lock().unwrap().phase, Phase::Starting { .. } | Phase::Stopping);
+    let running = docker::inspect().await.ok().flatten().is_some_and(|c| c.state.running);
+    if starting || running {
+        return Err("Stop the server to change the context window; it applies at the next start.".into());
+    }
+    // Never above what the selected model fits in the VRAM free right now
+    // (or pooled across the cluster): a longer context runs out of memory.
+    let limit = context_limit(&state, &state.settings()).await;
+    if let (Some(max), Some(model)) = (limit.max_fit, &limit.model) {
+        if context_len > max && limit.by_model {
+            return Err(format!("{model} supports up to {max} tokens of context; that's the model's own maximum."));
+        }
+        if context_len > max {
+            return Err(format!(
+                "{model} fits up to {} tokens of context in the VRAM {} ({}). A longer context would run out of GPU memory.",
+                max,
+                if limit.servers > 1 { "pooled across the cluster" } else { "free on this GPU" },
+                vram::fmt_gib(limit.available_bytes.unwrap_or(0)),
+            ));
+        }
     }
     state.update_settings(|s| s.context_len = context_len)
 }
@@ -990,22 +1144,23 @@ fn download_model(app: AppHandle, state: State<'_, AppState>, key: String) -> Cm
     let cancel: download::Cancel = Arc::new(AtomicBool::new(false));
     {
         let mut inner = state.inner.lock().unwrap();
+        // A second click while it runs is harmless: the download keeps going.
         if inner.downloads.get(&key).is_some_and(|d| !d.finished && d.error.is_none()) {
-            return Err("Already downloading.".into());
+            return Ok(());
         }
         inner.cancels.insert(key.clone(), cancel.clone());
-        inner.downloads.insert(
-            key.clone(),
-            DownloadView {
-                key: key.clone(),
-                done_bytes: 0,
-                total_bytes: 0,
-                bytes_per_sec: 0.0,
-                current_file: "Listing files…".into(),
-                error: None,
-                finished: false,
-            },
-        );
+        let view = DownloadView {
+            key: key.clone(),
+            done_bytes: 0,
+            total_bytes: 0,
+            bytes_per_sec: 0.0,
+            current_file: "Listing files…".into(),
+            error: None,
+            finished: false,
+        };
+        // Shown at once; the first byte can be seconds away (listing, checking files on disk).
+        let _ = app.emit("download", &view);
+        inner.downloads.insert(key.clone(), view);
     }
 
     tauri::async_runtime::spawn(async move {
@@ -1068,8 +1223,9 @@ async fn model_in_use(key: &str) -> bool {
         .is_some_and(|c| c.state.running && c.model_key.as_deref() == Some(key))
 }
 
-/// Deletes weights that Openphalanx downloaded. Never touches the Hugging
-/// Face cache or user-provided folders.
+/// Deletes a downloaded model: the app's own copy, or its folder in the
+/// Hugging Face cache (the UI warns that the cache may be shared). Never
+/// touches user-provided folders.
 #[tauri::command]
 async fn delete_model(state: State<'_, AppState>, key: String) -> CmdResult<()> {
     if model_in_use(&key).await {
@@ -1079,10 +1235,16 @@ async fn delete_model(state: State<'_, AppState>, key: String) -> CmdResult<()> 
     let dir = server::resolve(&settings, &key)
         .and_then(|m| m.installed_dir)
         .ok_or("That model is not downloaded.")?;
-    if !is_app_managed(&dir) {
-        return Err("This copy was not downloaded by Openphalanx, so it is left alone.".into());
-    }
-    tokio::fs::remove_dir_all(&dir).await.map_err(err)
+    // Downloaded by the app: its folder. Found in the Hugging Face cache: that
+    // model's whole cache folder (the UI says the cache may be shared).
+    let target = if is_app_managed(&dir) {
+        dir
+    } else if let Some(repo) = paths::hf_cache_repo_dir(&dir, &paths::hf_hub_dir()) {
+        repo
+    } else {
+        return Err("This copy is outside the app's models folder and the Hugging Face cache, so it is left alone.".into());
+    };
+    tokio::fs::remove_dir_all(&target).await.map_err(err)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1336,6 +1498,9 @@ pub fn run() {
             cluster_rename,
             cluster_set_strategy,
             cluster_approve_download,
+            check_update,
+            install_update,
+            get_context_limit,
             cluster_member_logs,
         ])
         .build(tauri::generate_context!())

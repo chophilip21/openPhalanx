@@ -2,6 +2,7 @@
 //! unit-tested on machines without a desktop toolchain.
 
 pub mod admin;
+pub mod app_update;
 pub mod catalog;
 pub mod cluster;
 pub mod docker;
