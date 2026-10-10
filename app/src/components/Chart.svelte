@@ -12,7 +12,8 @@
     series,
     max = null,
     note = "",
-  }: { title: string; value: string; series: Series[]; max?: number | null; note?: string } = $props();
+    sub = "",
+  }: { title: string; value: string; series: Series[]; max?: number | null; note?: string; sub?: string } = $props();
 
   const W = 300;
   const H = 90;
@@ -54,7 +55,7 @@
       </span>
     {/if}
   </div>
-  <div class="value">{value}</div>
+  <div class="value">{value}{#if sub}<span class="sub">{sub}</span>{/if}</div>
   <svg viewBox="0 0 {W} {H}" preserveAspectRatio="none" aria-hidden="true">
     <line x1="0" x2={W} y1={H / 2} y2={H / 2} class="grid" />
     {#each series as s}
@@ -75,6 +76,8 @@
   .legend span { display: inline-flex; align-items: center; gap: 4px; }
   .legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
   .value { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  /* Secondary figures next to the headline one, so a panel with several doesn't crowd the big line. */
+  .sub { margin-left: 10px; font-size: 12px; font-weight: 500; color: var(--muted); white-space: nowrap; }
   svg { width: 100%; height: 72px; display: block; }
   .grid { stroke: var(--border); stroke-dasharray: 3 4; vector-effect: non-scaling-stroke; }
   .foot { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--faint); }

@@ -18,12 +18,13 @@ from .config import (ACCENT, CONTEXT, ENGINE, EXTRA_MEMORY, GREEN, MEMORY_FILE, 
                      REASONING, RED, SERVER, TESTED_AIDER, WEB, YELLOW)
 from .term import EscWatcher, SESSION, SPIN, Thinking, UI, out, step
 from .render import BulletStream, hide_reasoning, show_diff, show_edits, snapshot
+from .mcp import Hub
 from .agent import Agent, Hooks, Workspace
 from .routing import wants_edit
 from .context import CONTEXT_MGR, PRI_EDITED, _check_tokens, _fitted_format_messages
 from .oppx_io import OppxIO
 from .cache import _ask_file_mentions, _ask_init, _coder_init, _dump_requests, _stable_ranked_map
-from .commands import load_memory, translate
+from .commands import ask_about_connector, connector_names, load_memory, show_connector_problems, translate
 
 
 def _interrupted(self):
@@ -73,6 +74,8 @@ def welcome(coder):
     ]
     if memory:
         lines.append(f"  [{MUTED}]memory:[/] {escape(', '.join(memory))}")
+    if UI.connectors is not None and UI.connectors.connectors:
+        lines.append(f"  [{MUTED}]connectors:[/] {escape(connector_names(UI.connectors))}")
     width = max(Text.from_markup(line).cell_len for line in lines) + 2
     out(f"[{ACCENT}]╭{'─' * (width + 1)}╮[/]")
     for line in lines:
@@ -187,15 +190,54 @@ def make_agent(coder) -> Agent:
                 SESSION.watcher.resume()
             SPIN.start()
 
-    hooks = Hooks(step=on_step, stream=on_stream, edited=on_edited, confirm_run=on_confirm,
+    def on_confirm_tool(name: str, arguments: str, read_only: bool) -> bool:
+        """A connector tool reaches outside the repository, so each call is
+        the user's to allow: once, or for the rest of the session."""
+        if name in UI.tools_allowed:
+            return True
+        SPIN.stop()
+        note = f" [{MUTED}](its connector says it only reads)[/]" if read_only else ""
+        out(f"\n[{YELLOW}]⏺[/] [bold]Call this connector tool?[/]{note}")
+        for line in f"{name} {arguments}".splitlines()[:30]:
+            out(f"  [{MUTED}]│[/] {escape(line)}")
+        answer = coder.io._ask_line("  Allow? (y/N, a = always in this session) ").strip().lower()
+        ok = answer in ("y", "yes", "a", "always")
+        if answer in ("a", "always"):
+            UI.tools_allowed.add(name)
+        step(("Allowed for this session" if name in UI.tools_allowed else "Allowed") if ok else "Declined",
+             GREEN if ok else MUTED)
+        SPIN.start()
+        return ok
+
+    def on_notice(text: str):
+        SPIN.stop()
+        step(f"⚠ {escape(text)}", YELLOW)
+        SPIN.start()
+
+    hooks = Hooks(step=on_step, stream=on_stream, edited=on_edited, confirm_run=on_confirm, notice=on_notice,
+                  confirm_tool=on_confirm_tool,
                   waiting=lambda label: SPIN.start(label), interrupted=lambda: UI.interrupted)
     agent = Agent(ws=Workspace(coder.root, getattr(coder, "repo_map", None), coder.io.encoding),
-                  hooks=hooks, context=CONTEXT, reasoning=REASONING, web=WEB, memory=_memory(coder))
+                  hooks=hooks, context=CONTEXT, reasoning=REASONING, web=WEB, memory=_memory(coder),
+                  connectors=UI.connectors)
     # -c / -r: continue from the restored conversation (questions and answers).
     for m in coder.done_messages or []:
         if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str):
             agent.messages.append({"role": m["role"], "content": m["content"], "_user": m["role"] == "user"})
     return agent
+
+
+def connect_connectors(coder) -> Hub:
+    """Starts the user's connectors (MCP servers) before the first request, so
+    their tools are in the system prompt from the start and stay there (a
+    later change costs one uncached request)."""
+    import atexit
+
+    hub = Hub(coder.root)
+    atexit.register(hub.close)
+    hub.connect(ask_about_connector(coder), before=lambda: SPIN.start("Connecting to connectors"))
+    SPIN.stop()
+    return hub
 
 
 def _memory(coder) -> str:
@@ -211,13 +253,15 @@ def _memory(coder) -> str:
 
 
 def agent_turn(coder, text: str):
-    """A message for the agent: a question (no edits) or a task."""
+    """A message for the agent. It decides itself whether the message needs
+    an answer or a change; nothing has to be typed for that. Edits are off
+    only when the user switched them off (plan mode, /ask). Whether the
+    message reads as a change request is passed along as a hint."""
     can_edit = not UI.plan_mode
-    read_only = not can_edit
     if text.startswith("/ask "):
-        text, can_edit, read_only = text[5:].strip(), False, True
-    elif can_edit:
-        can_edit = wants_edit(text)
+        text, can_edit = text[5:].strip(), False
+    read_only = not can_edit
+    wants_change = can_edit and wants_edit(text)
     agent = UI.agent
     if agent.memory != _memory(coder):  # # notes and /init change it
         agent.memory = _memory(coder)
@@ -238,7 +282,7 @@ def agent_turn(coder, text: str):
         with EscWatcher() as w:
             SESSION.watcher = w
             SPIN.start()
-            reply = agent.turn(text, can_edit=can_edit)
+            reply = agent.turn(text, can_edit=can_edit, wants_change=wants_change)
     except KeyboardInterrupt:
         UI.interrupted = True
         agent.messages.append({"role": "assistant", "content": "(Interrupted by the user.)"})
@@ -333,6 +377,7 @@ def run(argv) -> int:
     coder = build_coder(argv)
     load_memory(coder)
     if ENGINE == "agent":
+        UI.connectors = connect_connectors(coder)
         UI.agent = make_agent(coder)
     initial = os.environ.get("OPPX_INITIAL", "").strip()
 
@@ -343,6 +388,7 @@ def run(argv) -> int:
         return 0
 
     welcome(coder)
+    show_connector_problems(UI.connectors)
     pending = initial
     while True:
         if not pending and UI.queued:

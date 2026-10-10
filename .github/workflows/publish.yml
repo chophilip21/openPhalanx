@@ -73,6 +73,31 @@ jobs:
           name: oppx-${{ matrix.target }}
           path: oppx-${{ matrix.target }}.tar.gz
 
+  # The headless server, static like oppx (the .deb carries its own copy).
+  oppxs:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04-arm }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked -p openphalanx-server --target ${{ matrix.target }}
+      - run: tar -czf oppxs-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release oppxs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oppxs-${{ matrix.target }}
+          path: oppxs-${{ matrix.target }}.tar.gz
+
   app:
     needs: meta
     runs-on: ubuntu-22.04
@@ -105,7 +130,7 @@ jobs:
             target/release/bundle/appimage/*.AppImage
 
   release:
-    needs: [meta, oppx, app]
+    needs: [meta, oppx, oppxs, app]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -116,6 +141,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: oppx-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: oppxs-*
           path: dist
           merge-multiple: true
       - uses: actions/download-artifact@v4
@@ -148,6 +178,11 @@ jobs:
           Server (Ubuntu/Debian, NVIDIA GPU):
           \`\`\`bash
           curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install-server.sh | OPPX_VERSION=$VERSION sh
+          \`\`\`
+
+          Server without a desktop (any Linux, \`oppxs\` only):
+          \`\`\`bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$VERSION/install-server.sh | OPPX_VERSION=$VERSION sh -s -- --headless
           \`\`\`
 
           The server app builds its backend on the first start, from the official SGLang image (about 16 GB, downloaded once by Docker).

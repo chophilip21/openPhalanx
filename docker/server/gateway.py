@@ -29,14 +29,17 @@ only as a SHA-256 hash and can be revoked from the GUI.
 """
 
 import asyncio
+import collections
 import datetime
 import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
+import signal
 import ssl
 import subprocess
 import time
@@ -89,6 +92,8 @@ MAX_ACTIVE = int(os.environ.get("MAX_ACTIVE_REQUESTS", "8"))  # server-wide, in 
 MAX_PER_DEVICE = int(os.environ.get("MAX_DEVICE_REQUESTS", "4"))  # per device, in flight
 QUEUE_WAIT_S = float(os.environ.get("QUEUE_WAIT_S", "120"))  # then 503 "busy"
 RATE_PER_MINUTE = int(os.environ.get("RATE_PER_MINUTE", "120"))  # per device
+TTFT_WINDOW_S = 300.0  # the latency percentiles cover the streamed requests of this long
+TTFT_MAX_SAMPLES = 2000
 MAX_OUTPUT_TOKENS = CONTEXT_LENGTH // 2
 SEARCH_TIMEOUT_S = 8.0
 ROUTER_TIMEOUT_S = 15.0
@@ -285,9 +290,31 @@ class Metrics:
         self.web_searches = 0
         self.auto_routed = 0
         self.auto_searched = 0
+        # Requests held back by the limits above (per device, server-wide),
+        # before SGLang has seen them.
+        self.requests_waiting = 0
+        # (when, seconds) per streamed request: from its arrival here to the
+        # first token sent back, so waiting for a slot and the search router count.
+        self._ttft: collections.deque[tuple[float, float]] = collections.deque(maxlen=TTFT_MAX_SAMPLES)
+
+    def note_ttft(self, seconds: float) -> None:
+        self._ttft.append((time.time(), seconds))
+
+    def ttft(self) -> dict:
+        """Time to first token over the last TTFT_WINDOW_S: exact percentiles
+        (nearest rank) of what clients waited, None without a streamed request."""
+        cutoff = time.time() - TTFT_WINDOW_S
+        while self._ttft and self._ttft[0][0] < cutoff:
+            self._ttft.popleft()
+        values = sorted(v for _, v in self._ttft)
+
+        def pick(q: float) -> float | None:
+            return values[max(0, math.ceil(q * len(values)) - 1)] if values else None
+
+        return {"ttft_p50": pick(0.50), "ttft_p95": pick(0.95), "ttft_p99": pick(0.99), "ttft_samples": len(values)}
 
     def snapshot(self) -> dict:
-        return dict(vars(self))
+        return {**{k: v for k, v in vars(self).items() if not k.startswith("_")}, **self.ttft()}
 
 
 devices = DeviceStore(DEVICES_PATH, POLICY_PATH)
@@ -835,6 +862,20 @@ def _release(device_id: str) -> None:
     _device_slots[device_id].release()
 
 
+def _has_token(event: bytes) -> bool:
+    """Whether a streamed event carries generated text (an answer, reasoning
+    or a tool call), not just the role or the usage."""
+    if not event.startswith(b"data: {"):
+        return False
+    try:
+        choices = json.loads(event[6:]).get("choices") or []
+    except ValueError:
+        return False
+    return any(isinstance(c, dict) and isinstance(c.get("delta"), dict)
+               and (c["delta"].get("content") or c["delta"].get("reasoning_content") or c["delta"].get("tool_calls"))
+               for c in choices)
+
+
 def _sanitize(body: dict) -> str | None:
     """Clamps generation settings; returns an error message for requests that
     cannot possibly fit (cheap check before SGLang tokenizes them)."""
@@ -856,6 +897,7 @@ def _sanitize(body: dict) -> str | None:
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, device: dict = Depends(require_device)) -> Response:
     """OpenAI-compatible chat completions (streaming supported), with safety limits and optional automatic web search (`X-Oppx-Web-Search: auto`)."""
+    arrived = time.monotonic()
     try:
         raw = await _read_body(request)
     except _TooLarge:
@@ -895,6 +937,7 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
         client_wants_usage = bool(options.get("include_usage"))
         body["stream_options"] = {**options, "include_usage": True}
 
+    metrics.requests_waiting += 1
     try:
         await _acquire(device["id"])
     except _Busy:
@@ -903,6 +946,8 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
             content={"error": {"message": "The server is busy with other requests; try again shortly.", "type": "server_busy"}},
             headers={"retry-after": "10"},
         )
+    finally:
+        metrics.requests_waiting -= 1
     metrics.requests_total += 1
     metrics.requests_active += 1
     metrics.last_request_at = time.time()
@@ -952,12 +997,16 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
         # Re-frame on SSE event boundaries so the usage event can be inspected
         # and, when the gateway injected it, removed before reaching the client.
         buf = b""
+        timed = resp.status_code >= 400  # only answers are timed
         try:
             async for chunk in resp.aiter_raw():
                 buf += chunk
                 *events, buf = buf.split(b"\n\n")
                 out = []
                 for event in events:
+                    if not timed and _has_token(event):
+                        timed = True
+                        metrics.note_ttft(time.monotonic() - arrived)
                     if event.startswith(b"data: {") and b'"usage"' in event:
                         try:
                             obj = json.loads(event[6:])
@@ -994,9 +1043,35 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
 admin = FastAPI(title="openphalanx-admin")
 
 
+# The app polls the admin API every 2 s while it is open. When it started this
+# backend it sets APP_WATCHDOG_S: if no authenticated admin call arrives for
+# that long, the app is gone without stopping us (it crashed or was killed),
+# and the backend stops itself rather than hold the GPU with nobody in charge.
+# Unset (a backend started by hand): no watchdog.
+APP_WATCHDOG_S = float(os.environ.get("APP_WATCHDOG_S") or 0)
+_last_app_call = time.monotonic()
+
+
 def require_admin(x_admin_token: str = Header(default="")) -> None:
+    global _last_app_call
     if not ADMIN_TOKEN or not hmac.compare_digest(x_admin_token, ADMIN_TOKEN):
         raise HTTPException(status_code=401, detail="invalid admin token")
+    _last_app_call = time.monotonic()
+
+
+async def watch_app() -> None:
+    """Stops the container when the app that started it has gone silent."""
+    while APP_WATCHDOG_S > 0:
+        await asyncio.sleep(5)
+        quiet = time.monotonic() - _last_app_call
+        if quiet > APP_WATCHDOG_S:
+            print(
+                f"No OpenPhalanx app has checked in for {quiet:.0f} s; stopping the backend "
+                "so it doesn't keep the GPU's memory.",
+                flush=True,
+            )
+            os.kill(1, signal.SIGTERM)  # supervisord: the whole container stops
+            return
 
 
 @admin.get("/admin/status", dependencies=[Depends(require_admin)])
@@ -1086,10 +1161,12 @@ async def main() -> None:
         uvicorn.Config(admin, host=ADMIN_HOST, port=ADMIN_PORT, log_level="warning")
     )
     flusher = asyncio.create_task(flush_devices())
+    watchdog = asyncio.create_task(watch_app())
     try:
         await asyncio.gather(public_server.serve(), admin_server.serve())
     finally:
         flusher.cancel()
+        watchdog.cancel()
         if devices.dirty:
             devices.save()
 

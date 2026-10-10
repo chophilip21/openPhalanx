@@ -38,6 +38,14 @@ TASKS = [
      "grep -Eq 'RATE_PER_MINUTE.*180' docker/server/gateway.py && ! grep -Eq 'RATE_PER_MINUTE.*\"120\"' docker/server/gateway.py && python3 -m py_compile docker/server/gateway.py"),
     ("Add a --version flag to scripts/probe_routing.py that prints \"probe_routing 1.0\" and exits.",
      "python3 scripts/probe_routing.py --version 2>&1 | grep -q 'probe_routing 1.0'"),
+    # No file named: the agent has to find the place itself.
+    ("Pairing codes should stay valid for 15 minutes instead of 10.",
+     "grep -Eq '^PAIRING_TTL_S = (900|15 \\* 60)' docker/server/gateway.py && python3 -m py_compile docker/server/gateway.py"),
+    ("A cluster member should count as offline after 30 seconds without a report, not 20.",
+     f"grep -Eq 'OFFLINE_AFTER_SECS: u64 = 30' crates/openphalanx-core/src/cluster.rs && {CARGO} cargo check -q -p openphalanx-core"),
+    ("Each paired device should be allowed 6 requests in flight at once instead of 4.",
+     "grep -Eq 'MAX_DEVICE_REQUESTS.*\"6\"' docker/server/gateway.py && ! grep -Eq 'MAX_DEVICE_REQUESTS.*\"4\"' docker/server/gateway.py "
+     "&& python3 -m py_compile docker/server/gateway.py"),
 ]
 
 PREFILL = re.compile(r"^\[(?P<ts>[^\]]+)\] Prefill batch.*?#new-token: (?P<new>\d+), #cached-token: (?P<cached>\d+)")

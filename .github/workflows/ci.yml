@@ -65,6 +65,10 @@ jobs:
         run: |
           pip install ruff
           ruff check --select F,E9 --target-version py312 docker/server client/oppx/frontend scripts
+      - name: Connector tests (MCP client and the agent's tool calls; no server needed)
+        run: |
+          pip install httpx
+          python3 scripts/test_connectors.py
       - name: Shell syntax
         # Each script with its own interpreter (bash scripts use arrays).
         run: |

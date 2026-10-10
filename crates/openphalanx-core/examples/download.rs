@@ -17,10 +17,17 @@ async fn main() -> anyhow::Result<()> {
     println!("{repo}@{} -> {} files, {} weight bytes, arch {:?}", &sha[..7], files.len(), info.weight_bytes, info.arch);
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
+    let mut last = 0u64;
     let result = download::download(&client, repo, &sha, &files, &dest, cancel, |p| {
         if cancel_after.is_some_and(|n| p.done_bytes >= n) {
             flag.store(true, Ordering::Relaxed);
         }
+        // Progress as the GUI sees it; it must never go backwards.
+        if p.done_bytes < last {
+            println!("PROGRESS WENT BACK: {last} -> {} ({})", p.done_bytes, p.current_file);
+        }
+        last = p.done_bytes;
+        println!("{:>5.1}% {:>12}/{} {}", 100.0 * p.done_bytes as f64 / p.total_bytes.max(1) as f64, p.done_bytes, p.total_bytes, p.current_file);
     })
     .await;
     match result {

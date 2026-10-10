@@ -32,6 +32,13 @@ export type AdminStatus = {
     web_searches: number;
     auto_routed: number;
     auto_searched: number;
+    /** Held back by the gateway's limits, before SGLang sees them. */
+    requests_waiting: number;
+    /** Time to first token (seconds) over the streamed requests of the last 5 minutes; null without any. */
+    ttft_p50: number | null;
+    ttft_p95: number | null;
+    ttft_p99: number | null;
+    ttft_samples: number;
   };
   inference: {
     prompt_tokens_total?: number | null;
@@ -70,6 +77,8 @@ export type Settings = {
   web_search: boolean;
   /** Days a client pairing lasts; null: never expires. */
   pairing_ttl_days: number | null;
+  /** Models with a long-context mode (YaRN) may go past their native window. */
+  long_context: boolean;
 };
 
 /** A server's hardware, as it reports it. */
@@ -239,6 +248,8 @@ export type ModelRow = {
   /** Year the model was published, e.g. "2025". */
   released: string | null;
   notes: string | null;
+  /** Full release date (YYYY-MM-DD), for sorting. */
+  released_on: string | null;
   tested: boolean;
   best_fit: boolean;
   custom: boolean;
@@ -247,6 +258,8 @@ export type ModelRow = {
   requirement: Requirement;
   fit: FitCheck | null;
   installed_dir: string | null;
+  /** The installed copy's files are damaged (what's wrong). */
+  broken: string | null;
   app_managed: boolean;
 };
 
@@ -295,10 +308,45 @@ export type Device = {
   expires_at: number | null;
 };
 
+/** The app's own update (GitHub releases). */
+export type UpdateCheck = {
+  current: string;
+  latest: string;
+  available: boolean;
+  install: { kind: "app_image"; path: string } | { kind: "deb" } | { kind: "source" };
+  can_install: boolean;
+  note: string | null;
+  url: string;
+};
+export type UpdateProgress = { stage: "downloading" | "installing" | "restarting"; done: number; total: number };
+
+/** The selected model's context ceiling for the VRAM free now (or pooled). */
+export type ContextLimit = {
+  model: string | null;
+  /** Longest context that fits; null: not even 2k fits, or no GPU. */
+  max_fit: number | null;
+  model_max: number | null;
+  /** The cap is the model's own maximum context, not the VRAM. */
+  by_model: boolean;
+  /** Above this the model runs in its long-context mode (YaRN); null: it has none. */
+  native_max: number | null;
+  /** How far the long-context mode reaches, on or not; null: the model has none. */
+  long_context_max: number | null;
+  /** The long-context mode is turned on. */
+  long_context: boolean;
+  available_bytes: number | null;
+  basis: string;
+  servers: number;
+};
+
 export const api = {
+  contextLimit: () => invoke<ContextLimit>("get_context_limit"),
   snapshot: () => invoke<Snapshot>("get_snapshot"),
+  checkUpdate: () => invoke<UpdateCheck>("check_update"),
+  installUpdate: () => invoke<void>("install_update"),
   preflight: () => invoke<Preflight>("get_preflight"),
-  start: () => invoke<void>("start_server"),
+  /** `force`: start although the model doesn't fit the free VRAM. */
+  start: (force = false) => invoke<void>("start_server", { force }),
   stop: () => invoke<void>("stop_server"),
   dismissError: () => invoke<void>("dismiss_error"),
   logs: (tail: number) => invoke<string>("get_logs", { tail }),
@@ -310,6 +358,7 @@ export const api = {
   models: () => invoke<ModelsView>("get_models"),
   selectModel: (key: string) => invoke<Settings>("select_model", { key }),
   setContextLen: (contextLen: number) => invoke<Settings>("set_context_len", { contextLen }),
+  setLongContext: (on: boolean) => invoke<Settings>("set_long_context", { on }),
   setGpu: (index: number) => invoke<Settings>("set_gpu", { index }),
   setWebSearch: (enabled: boolean) => invoke<Settings>("set_web_search", { enabled }),
   download: (key: string) => invoke<void>("download_model", { key }),
@@ -337,6 +386,8 @@ export const events = {
   snapshot: (cb: (s: Snapshot) => void): Promise<UnlistenFn> => listen<Snapshot>("snapshot", (e) => cb(e.payload)),
   download: (cb: (d: DownloadView) => void): Promise<UnlistenFn> => listen<DownloadView>("download", (e) => cb(e.payload)),
   log: (cb: (lines: string[]) => void): Promise<UnlistenFn> => listen<string[]>("log", (e) => cb(e.payload)),
+  updateProgress: (cb: (p: UpdateProgress) => void): Promise<UnlistenFn> =>
+    listen<UpdateProgress>("update-progress", (e) => cb(e.payload)),
 };
 
 /** Tauri rejects with the Rust error string. */

@@ -1,0 +1,18 @@
+# systemd user unit for the headless OpenPhalanx server.
+#   systemctl --user enable --now oppxs      # start now and at login
+#   loginctl enable-linger "$USER"           # also start at boot, without logging in
+# Don't enable it on a machine where you run the desktop app: they share ports.
+[Unit]
+Description=OpenPhalanx server (oppxs)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/oppxs run
+Restart=on-failure
+RestartSec=5
+# Stopping the service stops the model; give Docker time to do it.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

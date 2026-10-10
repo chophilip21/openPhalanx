@@ -6,6 +6,7 @@
   import Chart from "./Chart.svelte";
   import ClusterPanel from "./ClusterPanel.svelte";
   import Icon from "./Icon.svelte";
+  import Notice from "./Notice.svelte";
   import { api, errorText } from "../lib/api";
   import { LOCAL_NODE, nodeSeries, nodesOf, WINDOW_SECONDS } from "../lib/metrics.svelte";
   import { gib, pct, rate } from "../lib/format";
@@ -28,6 +29,11 @@
   const tps = $derived(nodeSeries(sel, (s) => s.tokensPerSec));
   const running = $derived(nodeSeries(sel, (s) => s.running));
   const queued = $derived(nodeSeries(sel, (s) => s.queued));
+  const waiting = $derived(nodeSeries(sel, (s) => s.waiting));
+  const p50 = $derived(nodeSeries(sel, (s) => s.ttftP50));
+  const p95 = $derived(nodeSeries(sel, (s) => s.ttftP95));
+  const p99 = $derived(nodeSeries(sel, (s) => s.ttftP99));
+  const secs = (v: number | null) => (v == null ? "–" : v < 10 ? `${v.toFixed(2)} s` : `${v.toFixed(1)} s`);
   const rpm = $derived(nodeSeries(sel, (s) => s.requestsPerMin));
   const hit = $derived(nodeSeries(sel, (s) => (s.cacheHit == null ? null : s.cacheHit * 100)));
   const kv = $derived(nodeSeries(sel, (s) => (s.kvUsage == null ? null : s.kvUsage * 100)));
@@ -91,14 +97,14 @@
 <section class="dash">
   <div class="dash-head">
     <div>
-      <span class="eyebrow">Cluster</span>
+      <span class="eyebrow titled"><Icon name="server" size={14} /> Cluster</span>
       <h2>{nodes.length} server{nodes.length === 1 ? "" : "s"} · {online} online · {serving} serving</h2>
     </div>
     <span class="muted small">Live · updates every 2 s · last {WINDOW_SECONDS / 60} min</span>
   </div>
 
   {#if cluster}<ClusterPanel {cluster} />{/if}
-  {#if nodeError}<div class="error-banner"><Icon name="alert" size={16} /><span>{nodeError}</span></div>{/if}
+  {#if nodeError}<Notice onclose={() => (nodeError = "")}>{nodeError}</Notice>{/if}
 
   <div class="tiles">
     <div class="tile"><span class="k">Servers online</span><span class="v">{online}<small>/{nodes.length}</small></span></div>
@@ -114,7 +120,7 @@
   </div>
 
   <div class="card table-card">
-    <div class="table-head"><span class="eyebrow">Machines</span></div>
+    <div class="table-head"><span class="eyebrow titled"><Icon name="list" size={14} /> Machines</span></div>
     <div class="table-scroll">
       <table>
         <thead>
@@ -199,7 +205,7 @@
   </div>
 
   <div class="charts-head">
-    <span class="eyebrow">Charts</span>
+    <span class="eyebrow titled"><Icon name="activity" size={14} /> Charts</span>
     <label class="picker">
       <span class="muted small">Machine</span>
       <select bind:value={chosen}>
@@ -218,6 +224,26 @@
         value={lastOf(running) == null ? "–" : `${fmt(lastOf(running))} running · ${fmt(lastOf(queued))} queued`}
         series={[
           { label: "running", color: "var(--link)", points: running },
+          { label: "queued", color: "var(--busy)", points: queued },
+        ]}
+      />
+      <Chart
+        title="Time to first token"
+        value={secs(lastOf(p50))}
+        sub={lastOf(p50) == null ? "" : `median · p95 ${secs(lastOf(p95))} · p99 ${secs(lastOf(p99))}`}
+        note="streamed requests, last 5 min"
+        series={[
+          { label: "p50", color: "var(--on)", points: p50 },
+          { label: "p95", color: "var(--busy)", points: p95 },
+          { label: "p99", color: "var(--bad)", points: p99 },
+        ]}
+      />
+      <Chart
+        title="Queue depth"
+        value={lastOf(waiting) == null ? "–" : `${fmt(lastOf(waiting))} waiting · ${fmt(lastOf(queued))} queued`}
+        note="waiting: for a slot · queued: in SGLang"
+        series={[
+          { label: "waiting", color: "var(--violet)", points: waiting },
           { label: "queued", color: "var(--busy)", points: queued },
         ]}
       />

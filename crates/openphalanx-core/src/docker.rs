@@ -38,6 +38,11 @@ pub fn default_image() -> String {
     format!("{IMAGE_NAME}:{}-{}", env!("CARGO_PKG_VERSION"), &hash[..12])
 }
 pub const ADMIN_PORT: u16 = 9091;
+/// A backend the app starts stops itself when no app has called its admin
+/// API for this long (the app polls every 2 s): an app that crashed or was
+/// killed can't stop it, and it would keep the GPU's memory. Long enough for
+/// an update's relaunch, which takes a few seconds.
+pub const APP_WATCHDOG_SECS: u32 = 60;
 /// Private bridge network shared by the backend and SearXNG (no published ports for SearXNG).
 pub const NETWORK: &str = "openphalanx";
 pub const SEARXNG_CONTAINER: &str = "openphalanx-searxng";
@@ -51,6 +56,13 @@ const SEARXNG_INTERNAL_URL: &str = "http://openphalanx-searxng:8080";
 pub const SEARXNG_LOOPBACK_PORT: u16 = 9098;
 /// Prefill chunk for every rank of a split model (see `SplitRank::args`).
 pub const SPLIT_PREFILL_CHUNK: u32 = 2048;
+/// Recurrent-state slots on every rank of a split model (`--max-mamba-cache-size`;
+/// only models with linear-attention layers, such as Qwen3.6/3.8, read it).
+/// SGLang otherwise sizes the pool from each GPU's own free memory, and rank 0
+/// hands out slot numbers from its pool: with 23 slots on a 3090 and 20 on a
+/// 4090, slot 20 was out of bounds on the 4090 ("index out of bounds" in
+/// IndexKernel.cu) and the whole backend went down mid-request.
+pub const SPLIT_STATE_SLOTS: u32 = 16;
 /// A member's share of a split model (a headless SGLang rank, no gateway).
 pub const WORKER_CONTAINER: &str = "openphalanx-worker";
 const MANAGED_LABEL: &str = "io.openphalanx.managed";
@@ -250,6 +262,8 @@ pub struct RunSpec {
     pub reasoning_parser: Option<String>,
     /// SGLang `--dtype` override.
     pub dtype: Option<String>,
+    /// YaRN rope scaling, when the context is above the model's native window.
+    pub yarn: Option<crate::catalog::Yarn>,
     /// Days a client pairing lasts (`None`: never).
     pub pairing_ttl_days: Option<u32>,
     /// Rank 0 of a model split across servers.
@@ -291,7 +305,8 @@ impl SplitRank {
         // handed a bigger chunk than its own fails to reshape it. 2048 is
         // the smaller default, so activations fit the smaller cards.
         format!(
-            "--pp-size {n} --nnodes {n} --node-rank {r} --dist-init-addr {a} --chunked-prefill-size {SPLIT_PREFILL_CHUNK}",
+            "--pp-size {n} --nnodes {n} --node-rank {r} --dist-init-addr {a} --chunked-prefill-size {SPLIT_PREFILL_CHUNK} \
+             --max-mamba-cache-size {SPLIT_STATE_SLOTS}",
             n = self.nnodes,
             r = self.rank,
             a = self.dist_init_addr
@@ -343,6 +358,7 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
         ("AGENT_PORT", spec.agent_port.to_string()),
         ("ADMIN_PORT", ADMIN_PORT.to_string()),
         ("ADMIN_TOKEN", spec.admin_token.clone()),
+        ("APP_WATCHDOG_S", APP_WATCHDOG_SECS.to_string()),
         ("DEVICE_TTL_DAYS", spec.pairing_ttl_days.map_or_else(|| "never".to_string(), |d| d.to_string())),
         // Weights are always fetched by the GUI; never let SGLang download.
         ("HF_HUB_OFFLINE", "1".into()),
@@ -376,6 +392,12 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
     if let Some(dtype) = &spec.dtype {
         extra.push(format!("--dtype {dtype}"));
     }
+    // JSON, so not in SGLANG_EXTRA_ARGS (split on spaces): its own variable,
+    // which start-sglang.sh quotes into --json-model-override-args.
+    if let Some(yarn) = &spec.yarn {
+        a.push("-e".into());
+        a.push(format!("{JSON_OVERRIDE_ENV}={}", yarn.override_json()));
+    }
     if let Some(parser) = &spec.reasoning_parser {
         extra.push(format!("--reasoning-parser {parser}"));
         // The gateway drives reasoning models differently (see gateway.classify).
@@ -403,10 +425,15 @@ pub struct WorkerSpec {
     pub split: SplitRank,
     /// Must match rank 0's.
     pub dtype: Option<String>,
+    /// Must match rank 0's (every rank computes the same rotary embedding).
+    pub yarn: Option<crate::catalog::Yarn>,
     pub run_id: String,
 }
 
 pub const RUN_LABEL: &str = "io.openphalanx.run";
+
+/// start-sglang.sh passes it, quoted, as SGLang's `--json-model-override-args`.
+pub const JSON_OVERRIDE_ENV: &str = "JSON_MODEL_OVERRIDE_ARGS";
 
 pub fn worker_run_args(spec: &WorkerSpec) -> Vec<String> {
     let mut a: Vec<String> = vec![
@@ -448,6 +475,9 @@ pub fn worker_run_args(spec: &WorkerSpec) -> Vec<String> {
         ),
     ];
     env.extend(spec.split.env());
+    if let Some(yarn) = &spec.yarn {
+        env.push((JSON_OVERRIDE_ENV, yarn.override_json()));
+    }
     for (k, v) in env {
         a.push("-e".into());
         a.push(format!("{k}={v}"));
@@ -568,6 +598,10 @@ pub async fn run_searxng(settings_file: &Path, secret: &str, loopback: bool) -> 
 
 pub async fn logs_tail(lines: u32) -> Result<String> {
     let out = docker(&["logs", "--tail", &lines.to_string(), CONTAINER_NAME]).await?;
+    if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("No such container") {
+        // Not started yet: no output, rather than Docker's error as a log line.
+        return Ok(String::new());
+    }
     Ok(format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -595,6 +629,15 @@ pub fn diagnose_crash(logs: &str) -> Option<String> {
     }
     if l.contains("not enough memory") {
         return Some("SGLang could not fit the model in the memory it was given. Pick a smaller model or context.".into());
+    }
+    // Corruption the quick pre-flight check can't see (bits changed inside a
+    // file of the right size) shows up when the weights are read.
+    if ["safetensorerror", "headertoolarge", "invalidheaderdeserialization", "metadataincompletebuffer",
+        "error while deserializing header", "invalid load key", "unpicklingerror"]
+        .iter()
+        .any(|sig| l.contains(sig))
+    {
+        return Some("The model's files are damaged and couldn't be loaded. Download the model again (Models page).".into());
     }
     if l.contains("incomplete download") || l.contains("missing from") {
         return Some("Some model files are missing or unreadable inside the backend. Re-download the model.".into());
@@ -631,9 +674,26 @@ mod tests {
             edit_format: "diff".into(),
             reasoning_parser: Some("qwen3".into()),
             dtype: None,
+            yarn: None,
             pairing_ttl_days: Some(7),
             split: None,
         }
+    }
+
+    #[test]
+    fn yarn_reaches_sglang_as_one_argument() {
+        let yarn = crate::catalog::Yarn { factor: 4.0, original_max: 32768, rope_theta: 1e6 };
+        let a = run_args(&RunSpec { yarn: Some(yarn), ..spec() });
+        // One docker argument (no shell, no splitting), not in SGLANG_EXTRA_ARGS.
+        let arg = a.iter().find(|x| x.starts_with("JSON_MODEL_OVERRIDE_ARGS=")).expect("override passed");
+        let json: serde_json::Value = serde_json::from_str(arg.split_once('=').unwrap().1).unwrap();
+        assert_eq!(json["rope_scaling"]["factor"], 4.0);
+        assert_eq!(json["rope_scaling"]["original_max_position_embeddings"], 32768);
+        assert_eq!(json["rope_scaling"]["rope_type"], "yarn");
+        assert_eq!(json["rope_scaling"]["rope_theta"], 1e6, "the model's base, or SGLang falls back to 10000");
+        assert_eq!(json["max_position_embeddings"], 131_072, "SGLang derives the limit from it");
+        assert!(!a.iter().any(|x| x.starts_with("SGLANG_EXTRA_ARGS=") && x.contains("rope")));
+        assert!(!run_args(&spec()).iter().any(|x| x.starts_with("JSON_MODEL_OVERRIDE_ARGS")), "off by default");
     }
 
     fn split_rank(rank: u32) -> SplitRank {
@@ -654,6 +714,7 @@ mod tests {
         assert!(a.contains("-v /m:/m:ro") && a.contains("-v /blobs:/blobs:ro"));
         assert!(a.contains("-e MEM_FRACTION_STATIC=0.812"));
         assert!(a.contains("-e HF_HUB_OFFLINE=1"));
+        assert!(a.contains("-e APP_WATCHDOG_S=60"), "an orphaned backend must stop itself");
         assert!(a.contains("-e DEVICE_TTL_DAYS=7"));
         assert!(run_args(&RunSpec { pairing_ttl_days: None, ..spec() }).join(" ").contains("-e DEVICE_TTL_DAYS=never"));
         assert!(a.contains("--network openphalanx"));
@@ -673,7 +734,7 @@ mod tests {
         assert!(a.contains("-e NCCL_SOCKET_IFNAME=eno1") && a.contains("-e GLOO_SOCKET_IFNAME=eno1"));
         assert!(a.contains(
             "-e SGLANG_EXTRA_ARGS=--pp-size 2 --nnodes 2 --node-rank 0 --dist-init-addr 192.168.1.77:9100 \
-             --chunked-prefill-size 2048 --reasoning-parser qwen3"
+             --chunked-prefill-size 2048 --max-mamba-cache-size 16 --reasoning-parser qwen3"
         ));
     }
 
@@ -688,14 +749,16 @@ mod tests {
             context_len: 32768,
             split: split_rank(1),
             dtype: Some("bfloat16".into()),
+            yarn: Some(crate::catalog::Yarn { factor: 4.0, original_max: 32768, rope_theta: 1e6 }),
             run_id: "r1".into(),
         };
+        assert!(worker_run_args(&w).iter().any(|x| x.starts_with("JSON_MODEL_OVERRIDE_ARGS={")), "same YaRN as rank 0");
         let a = worker_run_args(&w).join(" ");
         assert!(a.contains("--name openphalanx-worker") && a.contains("--network host"));
         assert!(a.contains("--entrypoint /opt/openphalanx/start-sglang.sh"), "no gateway on a worker");
         assert!(a.contains("--label io.openphalanx.run=r1"));
         assert!(a.contains("--node-rank 1") && a.contains("-v /m:/m:ro"));
-        assert!(a.contains("--chunked-prefill-size 2048 --dtype bfloat16"), "same dtype as rank 0: {a}");
+        assert!(a.contains("--chunked-prefill-size 2048 --max-mamba-cache-size 16 --dtype bfloat16"), "same settings as rank 0: {a}");
         assert!(!a.contains("ADMIN_TOKEN"));
     }
 
@@ -732,5 +795,7 @@ mod tests {
     fn diagnoses_oom() {
         assert!(diagnose_crash("torch.OutOfMemoryError: CUDA out of memory. Tried").is_some());
         assert!(diagnose_crash("all good").is_none());
+        let damaged = diagnose_crash("safetensors_rust.SafetensorError: Error while deserializing header: HeaderTooLarge");
+        assert!(damaged.unwrap().contains("Download the model again"));
     }
 }

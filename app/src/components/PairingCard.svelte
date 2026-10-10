@@ -39,7 +39,7 @@
 
 <section class="pairing">
   <div class="head">
-    <span class="eyebrow">Pair a client</span>
+    <span class="eyebrow titled"><Icon name="laptop" size={14} /> Pair a client</span>
     {#if active}<span class="expires">expires in {countdown(pairing?.expires_at, now)}</span>{/if}
   </div>
 

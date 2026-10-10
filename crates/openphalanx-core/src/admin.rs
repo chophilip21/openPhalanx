@@ -30,6 +30,21 @@ pub struct GatewayMetrics {
     pub auto_routed: u64,
     #[serde(default)]
     pub auto_searched: u64,
+    /// Requests held back by the gateway's limits (per device, server-wide),
+    /// before SGLang sees them. Older gateways don't report these.
+    #[serde(default)]
+    pub requests_waiting: u64,
+    /// Time to first token in seconds, as clients waited for it (from the
+    /// request's arrival at the gateway), over the streamed requests of the
+    /// last five minutes. `None` when there were none.
+    #[serde(default)]
+    pub ttft_p50: Option<f64>,
+    #[serde(default)]
+    pub ttft_p95: Option<f64>,
+    #[serde(default)]
+    pub ttft_p99: Option<f64>,
+    #[serde(default)]
+    pub ttft_samples: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
