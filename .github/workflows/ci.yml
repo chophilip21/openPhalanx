@@ -69,6 +69,8 @@ jobs:
         run: |
           pip install httpx
           python3 scripts/test_connectors.py
+      - name: Agent loop tests (scripted model; no server needed)
+        run: python3 scripts/test_agent.py
       - name: Shell syntax
         # Each script with its own interpreter (bash scripts use arrays).
         run: |

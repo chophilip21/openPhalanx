@@ -270,7 +270,11 @@ def agent_turn(coder, text: str):
     UI.server_error = ""
     UI.before = {}
     UI.originals = {}
-    coder.io.user_input(text, log_only=True)  # the session file, for -c / -r
+    # The session file, for -c / -r. A message typed at the prompt is already
+    # in it (get_input writes it, as Aider does); it used to be written twice.
+    if not getattr(coder.io, "input_logged", False):
+        coder.io.user_input(text, log_only=True)
+    coder.io.input_logged = False
     # Files the user pointed at (/add, @file): the agent reads them as needed.
     pointed = sorted(coder.get_rel_fname(f) for f in coder.abs_fnames)
     if pointed:
@@ -395,6 +399,7 @@ def run(argv) -> int:
             pending = UI.queued.pop(0)
         if pending:
             text, pending = pending, ""
+            coder.io.input_logged = False  # not typed at the prompt: nothing has logged it
             out(f"[{ACCENT} bold]>[/] {escape(text)}")
         else:
             try:

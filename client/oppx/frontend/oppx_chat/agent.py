@@ -41,10 +41,17 @@ ANSWER_RESERVE = 4096  # tokens kept free for the model's reply
 FIT_LOW = 0.75  # once over budget, cut down to this share of it
 KEEP_RECENT = 6  # tool results never cut: the latest few
 
-THINK_FIELDS = os.environ.get("OPPX_AGENT_STATUS") == "1"
+LOOKUPS = ("find", "grep", "list", "outline", "read")  # read-only, and safe to run several at once
+MAX_THEN = 2
 TOOLS = ("find", "grep", "list", "outline", "read", "plan", "edit", "create", "run", "web_search", "answer")
 # Documentation and data match almost every search: code is shown first.
 LOW_RANK = (".md", ".txt", ".rst", ".lock", ".json", ".svg", ".csv", ".toml", ".yml", ".yaml", ".html", ".css")
+STOPWORDS = frozenset("""about after also been before being could does doing done each from have having here into
+just like make made more most much must need needs only other over same should some such than that their them then
+there these they this those through under using very want wants were what when where which while will with would your
+instead please change changes changed code file files function sure know think moment thing stay stays show tell
+find look fixed default many long""".split())
+CONST_DEF = re.compile(r"^(?:export\s+)?([A-Z][A-Z0-9_]{2,})\s*(?::[^=\n]+)?=(?!=)")  # LIMIT = 3 (Python, shell)
 CODE_DEF = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:static\s+)?"
                       r"(?:def|class|fn|struct|enum|trait|impl|type|interface|function|const|static|mod|let|var)\s+"
                       r"(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)")
@@ -74,6 +81,8 @@ Reply with exactly one JSON action per step:
 How to work:
 - Decide for yourself what the message needs: a question gets an answer from the code, a request for a change gets the change made. The user never has to say which.
 - Locate before reading: find a definition by name, grep for a word the code would contain (not a description of it), outline big files, then read only the lines you need.
+- A lookup (find, grep, list, outline, read) can carry "then": up to two more lookups that run in the same step, for example {"tool": "read", "path": "a.py", "start": 10, "end": 40, "then": [{"tool": "read", "path": "b.py", "start": 1, "end": 30}]}. Whenever you already know several things you need (two places a search named, a definition and its caller), ask for them together: every step takes time.
+- Search the whole repository first (no path): the code may live in a folder you wouldn't guess. Give a path only to narrow a search that returned too much.
 - Never take the same action twice: its result is already above. If a search didn't help, change the name or the place you look.
 - Stop as soon as the code you have read answers the request. Don't sweep the repository file by file to be thorough: one definition and the place it is used are usually enough.
 - grep shows where something is, not how it works: for how/why questions, read the code that does the work (follow the call to it) before answering.
@@ -82,17 +91,20 @@ How to work:
 - Base answers on code you have read. If what you read doesn't contain the answer, grep for the specific function, constant or message before answering; don't guess from nearby code.
 - Read the exact lines you are going to change right before you edit them; never guess file contents.
 - Do what was asked and no more. For a question, don't edit anything.
+- When the user asks for a change, make it. Don't describe it and ask whether to go ahead: they already asked.
 - A change that needs several places (a check and the code that calls it, a setting and its UI): plan first, then make every edit; a half-made change is worse than none.
 - If you can't finish, say so plainly: what you found, what is missing, and what would unblock you.
 - To change a value or a default, change it where it is defined (the constant, setting or default argument), not where it's used.
 - After editing, check your work if it's cheap (re-read the lines, or run the tests the user would run).
 - Answer briefly when done: what you found, or what you changed and where. Don't repeat code you already edited."""
 
-WHY_PLAIN = 'Every action also has "why": a few words on what you are looking for.'
-WHY_STATUS = ('Every action starts with "enough": true when the code you have read already answers the request or the '
-              'change is made (the tool is then answer); otherwise false, followed by "missing": the one specific thing '
-              "you still need, which the action must go and get.")
-SYSTEM = SYSTEM.replace("{WHY}", WHY_STATUS if THINK_FIELDS else WHY_PLAIN)
+# Each step opens with a judgement, not a search term: with a free "why" the
+# model kept reading (10.9 steps a question on Qwen3.8-27B, one stuck); having
+# to say whether it has enough, and what exactly is missing, brought that to
+# 6.4 with none stuck (scripts/eval_nav.py, 10/10 answered both ways).
+SYSTEM = SYSTEM.replace("{WHY}", 'Every action starts with "enough": true when the code you have read already answers '
+                        'the request, or your edits have made the change that was asked for (the tool is then answer); otherwise false, followed by '
+                        '"missing": in a few words, the one specific thing you still need, which the action must go and get.')
 
 EDIT_PROMPT = """Now write the change to {path} as one or more SEARCH/REPLACE blocks, like this:
 
@@ -123,25 +135,26 @@ PLAN_PROMPT = ("Write a short plan in plain text (no JSON), at most 8 lines: wha
                "naming the files and functions.")
 # Going in circles: one forced look at what is known before giving up.
 RETHINK_PROMPT = ("You are going in circles. Your actions this turn:\n{trail}\n\nStop and think, in plain text "
-                  "(no JSON), at most 6 lines: what do the results above already tell you? Is that enough to answer? "
+                  "(no JSON), at most 4 short lines: what do the results above already tell you? Is that enough to answer? "
                   "If something is missing, name it and one action you have NOT tried that would find it (find a "
                   "definition by another name, grep the whole repository for one specific word, read a file you "
                   "haven't opened).{unseen}")
 # A long turn without a change: the model keeps reading because nothing makes
 # it judge what it has. Every CHECK_EVERY steps it has to, in free text.
-CHECKPOINT_PROMPT = ("You have taken {n} steps. Stop and take stock, in plain text (no JSON), at most 6 lines: what "
+CHECKPOINT_PROMPT = ("You have taken {n} steps. Stop and take stock, in plain text (no JSON), at most 3 short lines: what "
                      "have you established so far (path:line)? Does that answer the user's request? If yes, say "
                      "\"enough\". If not, name the one thing still missing and the single action that gets it.")
 CHECK_EVERY = 10
 SWEEP = 3  # the same pattern grepped in this many places in a row is a sweep
-EDIT_PLAN_PROMPT = ("Before the first edit, write the plan for this change in plain text (no JSON), at most 10 lines: "
-                    "every file and function that must change and what changes there, in the order you will edit "
-                    "them; what calls or shows it and must change too; how it can be checked. Only list places "
-                    "you have read; name what you still need to read first.")
+EDIT_PLAN_PROMPT = ("Before the first edit, write the plan for this change in plain text (no JSON), one short line per "
+                    "edit: the file and function, and what changes there, in the order you will make them. Include "
+                    "what would be broken or wrong without it (callers, a message that states the old value); "
+                    "leave everything else alone. Name anything you still need to read first.")
 ASK_EDIT_CHECK = ("The user's latest message reads as a question, and you are about to change a file. Change it only "
                   "if they asked for that change (now, or earlier and it still isn't done). If so, choose the edit "
                   "again; otherwise choose answer.")
 MAX_PLANS = 2
+THINK_TOKENS = 350  # a plan or a stock-take; the model writes ~36 tokens a second
 # A small model answered five different messages with the same sentences (its own
 # earlier replies made them the likeliest text): a repeat is redone once with this.
 REPEAT_PROMPT = ("You just wrote a reply you already gave earlier, word for word, but the user's message is a "
@@ -194,8 +207,8 @@ def as_action(text: str) -> dict | None:
         obj = json.loads(t)
     except json.JSONDecodeError:
         # Cut off mid-object, or several objects: still not a reply.
-        return {} if re.match(r'\{\s*"(?:why|tool)"\s*:', t) else None
-    if isinstance(obj, dict) and (not obj or "tool" in obj or set(obj) <= {"why", "path", "pattern", "query", "command", "start", "end", "arguments"}):
+        return {} if re.match(r'\{\s*"(?:enough|missing|why|tool)"\s*:', t) else None
+    if isinstance(obj, dict) and (not obj or "tool" in obj or set(obj) <= {"enough", "missing", "why", "arguments", *FIELD_TYPES}):
         return obj
     return None
 
@@ -216,23 +229,31 @@ FIELD_TYPES = {
 
 
 def action_schema(tools: tuple[str, ...], flat: bool = False) -> dict:
-    why = {"type": "string", "maxLength": 200}
+    missing = {"type": "string", "maxLength": 90}  # every step pays for these tokens
     if flat:  # for a server whose grammar can't do anyOf
-        return {"type": "object", "properties": {"why": why, "tool": {"type": "string", "enum": list(tools)}, **FIELD_TYPES},
-                "required": ["why", "tool"], "additionalProperties": False}
-    one = []
-    for t in tools:
+        return {"type": "object", "additionalProperties": False, "required": ["enough", "tool"],
+                "properties": {"enough": {"type": "boolean"}, "missing": missing,
+                               "tool": {"type": "string", "enum": list(tools)}, **FIELD_TYPES}}
+    def branch(t: str, head: dict, then: dict | None = None) -> dict:
         fields = TOOL_FIELDS.get(t, ())  # a connector tool: its arguments are written in a second call
-        if not THINK_FIELDS:
-            head = {"why": why}
-        elif t == "answer":
-            head = {"enough": {"type": "boolean", "enum": [True]}}
-        else:
-            head = {"enough": {"type": "boolean", "enum": [False]}, "missing": {"type": "string", "maxLength": 160}}
         props = {**head, "tool": {"type": "string", "enum": [t]}}
         props.update({f.lstrip("*"): FIELD_TYPES[f.lstrip("*")] for f in fields})
-        one.append({"type": "object", "properties": props, "additionalProperties": False,
-                    "required": [*head, "tool"] + [f[1:] for f in fields if f.startswith("*")]})
+        if then:
+            props["then"] = then
+        return {"type": "object", "properties": props, "additionalProperties": False,
+                "required": [*head, "tool"] + [f[1:] for f in fields if f.startswith("*")]}
+
+    # A lookup may bring up to two more lookups along ("then"): each model
+    # call costs a second or two whatever it asks for.
+    lookups = [branch(t, {}) for t in LOOKUPS if t in tools]
+    then = {"type": "array", "maxItems": MAX_THEN, "items": lookups[0] if len(lookups) == 1 else {"anyOf": lookups}} if lookups else None
+    one = []
+    for t in tools:
+        if t == "answer":
+            one.append(branch(t, {"enough": {"type": "boolean", "enum": [True]}}))
+        else:
+            one.append(branch(t, {"enough": {"type": "boolean", "enum": [False]}, "missing": missing},
+                              then if t in LOOKUPS else None))
     return one[0] if len(one) == 1 else {"anyOf": one}
 
 
@@ -284,7 +305,10 @@ class Workspace:
         self.encoding = encoding
 
     def path(self, rel: str, must_exist: bool = True) -> Path:
-        rel = (rel or "").strip().lstrip("./") if rel not in (".", "./") else ""
+        rel = (rel or "").strip()
+        while rel.startswith(("./", "/")):  # not lstrip("./"): that ate the dot of .github, .env…
+            rel = rel[2:] if rel.startswith("./") else rel[1:]
+        rel = "" if rel == "." else rel
         p = (self.root / rel).resolve()
         if p != self.root and self.root not in p.parents:
             raise ToolError(f"{rel} is outside the repository")
@@ -370,8 +394,23 @@ class Workspace:
             f, _, rest = ln.partition(":")
             no, _, text = rest.partition(":")
             by_file.setdefault(f, []).append((no, text))
+        elsewhere = ""
+        if base != self.root:
+            # Models guess a folder and keep looking there: say where else the
+            # pattern is, so one search shows the whole repository.
+            try:
+                rest_out = subprocess.run(["git", "grep", "-c", "-I", "-E", "--untracked", "-e", pattern], cwd=self.root,
+                                          capture_output=True, text=True, timeout=30).stdout
+            except subprocess.TimeoutExpired:
+                rest_out = ""
+            counts = [(f, int(n)) for f, _, n in (ln.rpartition(":") for ln in rest_out.splitlines())
+                      if n.isdigit() and f not in by_file]
+            counts.sort(key=lambda c: (c[0].lower().endswith(LOW_RANK), -c[1], c[0]))
+            if counts:
+                elsewhere = ("\nOutside " + self.rel(base) + ": " + ", ".join(f"{f} ({n})" for f, n in counts[:8])
+                             + (f", and {len(counts) - 8} more files" if len(counts) > 8 else ""))
         if not by_file:
-            return f"No matches for {pattern!r}" + (f" in {path}." if path else ".")
+            return f"No matches for {pattern!r}" + (f" in {path}." if path else ".") + elsewhere
         total = sum(len(v) for v in by_file.values())
         # Code first, then by how often it matches (the file about it, usually).
         order = sorted(by_file, key=lambda f: (f.lower().endswith(LOW_RANK), -len(by_file[f]), f))
@@ -394,7 +433,7 @@ class Workspace:
                              + (f", and {len(rest) - GREP_FILES} more files" if len(rest) > GREP_FILES else ""))
         if rest or total > shown:
             out_lines.append("(not everything is shown: make the pattern more specific rather than going file by file)")
-        return head + ":\n" + "\n".join(out_lines)
+        return head + ":\n" + "\n".join(out_lines) + elsewhere
 
     # ---- definitions ------------------------------------------------------
     def symbols(self) -> list[tuple[str, str, int, str]]:
@@ -423,12 +462,40 @@ class Workspace:
                 except Exception:  # noqa: BLE001 - the regex below still applies
                     pass
             for i, ln in enumerate(lines, 1):
-                m = CODE_DEF.match(ln) if i not in defs else None
+                m = (CODE_DEF.match(ln) or CONST_DEF.match(ln)) if i not in defs else None
                 if m and (not ln[:1].isspace() or m.group(0).lstrip().startswith(("pub", "fn", "def", "async", "export", "function", "class"))):
                     defs[i] = m.group(1)
             found += [(name, rel, no, lines[no - 1].strip()[:150]) for no, name in sorted(defs.items()) if no <= len(lines)]
         self._symbols = found
         return found
+
+    def related(self, text: str, limit: int = 10) -> str:
+        """Definitions whose names contain words of a message (whole name
+        parts: "pairing" finds PAIRING_TTL_S and new_pairing_code, "valid"
+        doesn't find validate_name), most words and rarest words first: where
+        to start, before the model has guessed a single name."""
+        import math
+        words = {w for w in re.findall(r"[a-z][a-z0-9]{3,}", re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text).lower())
+                 if w not in STOPWORDS}
+        words |= {w[:-1] for w in words if w.endswith("s") and len(w) > 4}
+        if not words:
+            return ""
+
+        def parts(name: str) -> set[str]:
+            return {p for p in re.split(r"[^a-z0-9]+", re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name).lower()) if p}
+
+        # Not tests: their sentence-long names match any message.
+        names = [(p, name, rel, no, line) for name, rel, no, line in self.symbols()
+                 if not name.lower().startswith("test") and "/tests/" not in rel and len(p := parts(name)) <= 5]
+        seen_in = {w: sum(1 for p, *_ in names if w in p) for w in words}
+        weight = {w: 1 / math.log(2 + c) for w, c in seen_in.items() if 0 < c <= 80}  # words in everything say nothing
+        scored = []
+        for p, name, rel, no, line in names:
+            hit = [w for w in weight if w in p]
+            if hit:
+                scored.append((-len(hit), -sum(weight[w] for w in hit), rel.lower().endswith(LOW_RANK), len(name), rel, no, line))
+        scored.sort()
+        return "\n".join(f"  {rel}:{no}: {line}" for *_, rel, no, line in scored[:limit])
 
     def find(self, query: str) -> str:
         """Definitions and files whose name contains the query's words (any
@@ -763,7 +830,7 @@ class Agent:
         try:
             act = json.loads(m.group(0) if m else text)
         except json.JSONDecodeError:
-            act = {"tool": "answer", "why": "the action couldn't be read"}
+            act = {"enough": True, "tool": "answer"}
         if act.get("tool") not in tools:
             act["tool"] = "answer"
         return act
@@ -933,11 +1000,20 @@ class Agent:
                 lines = len(self.ws.read_text(self.ws.path(path)).splitlines())
             except ToolError:
                 continue
-            act = ({"why": "the file the user named", "tool": "read", "path": path} if lines <= WHOLE_FILE
-                   else {"why": "the file the user named (outline; it is long)", "tool": "outline", "path": path})
+            act = ({"enough": False, "missing": "the file the user named", "tool": "read", "path": path} if lines <= WHOLE_FILE
+                   else {"enough": False, "missing": "the file the user named (outline; it is long)", "tool": "outline", "path": path})
             self.messages.append({"role": "assistant", "content": json.dumps(act)})
             self.messages.append({"role": "user", "_result": True, "content":
                                   f"Result of step 0 ({act['tool']}):\n{self._do(act)}"})
+        if not named:
+            # Where to start: definitions named like the words of the message.
+            # Without it a "pairing codes" request cost ten greps in the wrong
+            # folders before the file that holds PAIRING_TTL_S was found.
+            related = self.ws.related(text)
+            if related:
+                self.messages.append({"role": "user", "_result": True, "content":
+                                      "Definitions named like words of the request (a starting point; read before "
+                                      f"relying on one):\n{related}"})
         # Connector tools sit before "answer". With edits off, only those
         # their connector marks as read-only are offered.
         extra = self.connectors.names(read_only=not can_edit) if self.connectors is not None else ()
@@ -953,6 +1029,8 @@ class Agent:
         nudged = edit_nudged = checked = rethought = edit_checked = edit_planned = False
         changed_files: list[str] = []
         last_repeat = ""
+        queued: list[dict] = []  # lookups asked for in one step, still to run
+        calls = 0  # actions the model chose (a queued lookup costs no call)
         sweep: tuple[str, int] = ("", 0)  # a grep pattern and how many places in a row it was tried on
         checked_at = 0
 
@@ -976,16 +1054,28 @@ class Agent:
                 # Going in circles (small models, and any model whose search
                 # words don't match the code): one forced look at what is
                 # already known, in free text, before anything else.
-                rethought, repeats, checked_at = True, 0, n
+                rethought, repeats, checked_at, queued = True, 0, calls, []
                 self._think(RETHINK_PROMPT.format(trail="\n".join(self._trail[-12:]), unseen=self._unseen()), "Rethink")
                 note("Now act on that: answer if you have enough, or take the new action you named.")
                 continue
-            if n - checked_at > CHECK_EVERY and not changed:
-                checked_at = n
-                self._think(CHECKPOINT_PROMPT.format(n=n - 1), "Taking stock")
+            if calls - checked_at >= CHECK_EVERY and not changed and not queued:
+                checked_at = calls
+                self._think(CHECKPOINT_PROMPT.format(n=n - 1), "Taking stock")  # counted in model calls, not lookups
                 note("Now act on that: answer if it is enough, otherwise take that one action.")
                 continue
-            act = self._action(tools)
+            if queued:
+                # A lookup asked for along with the previous one: no model call.
+                act = queued.pop(0)
+            else:
+                calls += 1
+                # A change was asked for: the first move is never "answer"
+                # (with a list of likely definitions in view, the model
+                # declared it had enough and offered to make the change).
+                first = wants_change and calls == 1 and not changed
+                act = self._action(tuple(t for t in tools if t != "answer") if first else tools)
+                then = act.pop("then", None) if act.get("tool") in LOOKUPS else None
+                queued = [{"enough": False, "missing": "(asked for with the step before)", **x}
+                          for x in (then or [])[:MAX_THEN] if isinstance(x, dict) and x.get("tool") in LOOKUPS and x.get("tool") in tools]
             tool = act["tool"]
             self.messages.append({"role": "assistant", "content": json.dumps(act, ensure_ascii=False)})
             if tool == "answer":
@@ -1136,7 +1226,7 @@ class Agent:
         self.messages.append({"role": "user", "content": prompt})
         self.hooks.waiting("Planning")
         try:
-            plan = self._text(700, stream=False).strip()
+            plan = self._text(THINK_TOKENS, stream=False).strip()
         finally:
             self.messages.pop()
         if not plan or as_action(plan) is not None:
@@ -1375,17 +1465,42 @@ class Agent:
         return any(m.get("_result") and head in m["content"][:400] and "[output removed" not in m["content"]
                    for m in self.messages)
 
+    def _written(self, prompt: str, max_tokens: int, path: str) -> str:
+        """The text of an edit or a new file. The action that asked for it is
+        the last thing the model sees, and as JSON it invites the same JSON
+        again (Qwen3.8 answered an edit prompt with its own action four times
+        in a row): it reads as a sentence for this call, and a reply that is
+        still an action is asked for once more with the first character
+        constrained."""
+        last = self.messages[-1] if self.messages and self.messages[-1]["role"] == "assistant" else None
+        saved = last["content"] if last else ""
+        if last and saved.startswith("{"):
+            last["content"] = f"I'll write the change to {path} now."
+        self.messages.append({"role": "user", "content": prompt})
+        try:
+            reply = self._text(max_tokens, stream=False)
+            if not reply.strip() or as_action(reply) is not None:
+                self.messages[-1] = {"role": "user", "content": prompt + "\n\nYour last output was a JSON action, not "
+                                     "the text. Write the text itself now, starting with the file's name or the code."}
+                try:
+                    reply = self._text(max_tokens, stream=False, regex=r"[^{\s][\s\S]*")
+                except ContextOverflow:
+                    raise
+                except RuntimeError:  # a server without regex constraints
+                    reply = self._text(max_tokens, stream=False)
+        finally:
+            self.messages.pop()
+            if last:
+                last["content"] = saved
+        return reply
+
     def _edit(self, path: str) -> str:
         rel = self.ws.rel(self.ws.path(path))  # exists?
         if not self._has_read(rel):
             raise ToolError(f"read the lines you're changing in {rel} first (read with start and end); "
                             "an edit must copy the file's current text exactly")
-        self.messages.append({"role": "user", "content": EDIT_PROMPT.format(path=path)})
         self.hooks.waiting("Editing")
-        try:
-            reply = self._text(4096, stream=False)
-        finally:
-            self.messages.pop()
+        reply = self._written(EDIT_PROMPT.format(path=path), 4096, path)
         # Keep the blocks in the conversation as the action's text.
         self.messages[-1] = {"role": "assistant", "content": self.messages[-1]["content"] + "\n" + reply}
         rel, before, after = apply_edit(self.ws, path, reply)
@@ -1396,12 +1511,8 @@ class Agent:
         p = self.ws.path(path, must_exist=False)
         if p.exists():
             raise ToolError(f"{path} already exists; use edit")
-        self.messages.append({"role": "user", "content": CREATE_PROMPT.format(path=path)})
         self.hooks.waiting("Writing")
-        try:
-            reply = self._text(8192, stream=False)
-        finally:
-            self.messages.pop()
+        reply = self._written(CREATE_PROMPT.format(path=path), 8192, path)
         self.messages[-1] = {"role": "assistant", "content": self.messages[-1]["content"] + "\n" + reply}
         m = re.search(r"```[^\n]*\n(.*?)```", reply, re.S)
         content = m.group(1) if m else reply

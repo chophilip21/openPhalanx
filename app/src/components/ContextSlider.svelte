@@ -88,13 +88,20 @@
     }
     await load();
   }
+  // Saves where the thumb was let go. Called on release (pointer, key, blur)
+  // as well as on `change`: WebKit doesn't fire `change` after a drag whose
+  // value the code moved (the snapping in `move`), so the slider showed the
+  // new context without ever saving it, and Start used the old one.
+  let saving = false;
   async function commit(el: HTMLInputElement) {
     const ctx = dragging?.ctx;
     blocked = false;
-    if (ctx == null) return;
+    if (ctx == null || saving) return;
+    saving = true;
     try {
       if (ctx !== value) await onchange(ctx);
     } finally {
+      saving = false;
       dragging = null;
       el.value = String(posOf(value));
     }
@@ -130,6 +137,9 @@
       disabled={locked || noFit}
       oninput={(e) => move(e.currentTarget)}
       onchange={(e) => commit(e.currentTarget)}
+      onpointerup={(e) => commit(e.currentTarget)}
+      onkeyup={(e) => commit(e.currentTarget)}
+      onblur={(e) => commit(e.currentTarget)}
       aria-label="Context window"
     />
   </div>

@@ -17,6 +17,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "client/oppx/fro
 from oppx_chat import agent as A  # noqa: E402
 
 
+try:  # edits are applied with Aider's matcher; CI runs without it
+    import aider  # noqa: F401
+    HAVE_AIDER = True
+except ImportError:
+    HAVE_AIDER = False
+needs_aider = unittest.skipUnless(HAVE_AIDER, "needs aider-chat (run with the oppx engine's Python)")
+
+
 class Scripted:
     """An Agent whose model calls are played from lists."""
 
@@ -134,6 +142,7 @@ class AgentLoop(unittest.TestCase):
         s.agent.turn("where is add?", can_edit=True, wants_change=False)
         self.assertEqual([t for t, _ in s.steps].count("Grep(def add)"), 2)
 
+    @needs_aider
     def test_a_question_can_still_lead_to_an_edit_if_chosen_twice(self):
         s = self.s
         edit = {"tool": "edit", "path": "src/calc.py"}
@@ -146,6 +155,26 @@ class AgentLoop(unittest.TestCase):
         self.assertEqual(len(checks), 1)
         self.assertEqual(s.agent.changed_session, ["src/calc.py"])
 
+    @needs_aider
+    def test_an_edit_written_as_json_is_asked_for_again(self):
+        s = self.s
+        edit = {"tool": "edit", "path": "src/calc.py"}
+        s.actions = [edit, {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = ['{"enough": false, "missing": "apply the edit", "tool": "edit", "path": "src/calc.py"}',
+                   "src/calc.py\n<<<<<<< SEARCH\nLIMIT = 3\n=======\nLIMIT = 4\n>>>>>>> REPLACE", "LIMIT is now 4."]
+        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
+        self.assertIn("LIMIT = 4", (self.root / "src/calc.py").read_text())
+        self.assertEqual([t for t, _ in s.steps].count("Update(src/calc.py)"), 1)  # one step, not a failed one and a retry
+
+    def test_a_change_request_never_opens_with_answer(self):
+        s = self.s
+        seen = []
+        s.agent._action = lambda tools: (seen.append(tools), {"tool": "answer"} if "answer" in tools else {"tool": "list", "path": ""})[1]
+        s.texts = ["Nothing was changed: I couldn't find it."]
+        s.agent.turn("the limit should be 4", can_edit=True, wants_change=True)
+        self.assertNotIn("answer", seen[0])
+        self.assertIn("answer", seen[1])
+
     def test_plan_mode_has_no_edit_tools(self):
         s = self.s
         s.actions = [{"tool": "edit", "path": "src/calc.py"}]
@@ -153,6 +182,7 @@ class AgentLoop(unittest.TestCase):
         s.agent.turn("make the limit 4", can_edit=False)
         self.assertIn("LIMIT = 3", (self.root / "src/calc.py").read_text())
 
+    @needs_aider
     def test_a_refused_edit_is_not_a_change(self):
         s = self.s
         edit = {"tool": "edit", "path": "src/calc.py"}
@@ -171,6 +201,30 @@ class AgentLoop(unittest.TestCase):
         self.assertIn("Rethink", titles)
         self.assertLess(titles.index("Rethink"), 5)
         self.assertIn("one file after another", "".join(m["content"] for m in s.agent.messages))
+
+    def test_lookups_asked_for_together_run_in_one_step(self):
+        s = self.s
+        calls = []
+        script = [{"tool": "grep", "pattern": "def add", "then": [{"tool": "read", "path": "src/calc.py"},
+                                                                 {"tool": "outline", "path": "src/other.py"},
+                                                                 {"tool": "read", "path": "README.md"},  # over the limit
+                                                                 ]}, {"tool": "answer"}]
+
+        def action(tools):
+            calls.append(1)
+            return dict(script.pop(0)) if script else {"tool": "answer"}
+
+        s.agent._action = action
+        s.texts = ["add is in src/calc.py:4."]
+        s.agent.turn("where is add?", can_edit=True, wants_change=False)
+        titles = [t for t, _ in s.steps]
+        self.assertEqual(titles[:3], ["Grep(def add)", "Read(src/calc.py:1-)", "Outline(src/other.py)"])
+        self.assertNotIn("Read(README.md:1-)", titles)
+        self.assertEqual(len(calls), 2)  # one for the three lookups, one to answer
+        schema = A.action_schema(("grep", "read", "edit", "answer"))
+        by_tool = {b["properties"]["tool"]["enum"][0]: b for b in schema["anyOf"]}
+        self.assertIn("then", by_tool["grep"]["properties"])
+        self.assertNotIn("then", by_tool["edit"]["properties"])  # only lookups travel together
 
     def test_a_long_turn_takes_stock(self):
         s = self.s
@@ -238,6 +292,31 @@ class Tools(unittest.TestCase):
             self.ws.read("server.rs", 1, 5)
         self.assertIn("did you mean: src/server.rs", str(e.exception))
 
+    def test_related_definitions_and_matches_elsewhere(self):
+        root = Path(self.tmp.name)
+        (root / "docker").mkdir()
+        (root / "docker/gateway.py").write_text("PAIRING_TTL_S = 600\n\n\ndef validate_name(n):\n    return n\n")
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        ws = A.Workspace(str(root))
+        related = ws.related("Pairing codes should stay valid for 15 minutes")
+        self.assertIn("docker/gateway.py:1: PAIRING_TTL_S = 600", related)
+        self.assertNotIn("validate_name", related)  # "valid" is not a part of that name
+        self.assertEqual(ws.related("what is this?"), "")
+        out = ws.grep("PAIRING_TTL", "src")
+        self.assertIn("No matches", out)
+        self.assertIn("Outside src: docker/gateway.py (1)", out)
+
+    def test_dot_folders_can_be_opened(self):
+        root = Path(self.tmp.name)
+        (root / ".github").mkdir()
+        (root / ".github/ci.yml").write_text("name: ci\n")
+        for path in (".github/ci.yml", "./.github/ci.yml", "/.github/ci.yml"):
+            self.assertIn("name: ci", self.ws.read(path, 1, 5), path)
+        self.assertIn("src/server.rs", self.ws.list("./src"))
+        self.assertIn("src/server.rs", self.ws.list("."))
+        with self.assertRaises(A.ToolError):
+            self.ws.read(".git/config", 1, 5)
+
     def test_each_tool_has_its_own_schema(self):
         schema = A.action_schema(("grep", "read", "answer"))
         by_tool = {b["properties"]["tool"]["enum"][0]: b for b in schema["anyOf"]}
@@ -250,7 +329,7 @@ class Tools(unittest.TestCase):
         self.assertIsNotNone(A.as_action('{"tool": "answer", "why": "x"}'))
         self.assertIsNotNone(A.as_action('```json\n{"why": "x", "tool": "grep", "pattern": "a"}\n```'))
         self.assertIsNotNone(A.as_action("{}"))
-        self.assertIsNotNone(A.as_action('{"why": "cut off mid'))
+        self.assertIsNotNone(A.as_action('{"enough": false, "missing": "cut off mid'))
         self.assertIsNone(A.as_action('{"name": "demo"}'))
         self.assertIsNone(A.as_action("The answer is {x}."))
         self.assertTrue(A.maybe_json("  {"))
