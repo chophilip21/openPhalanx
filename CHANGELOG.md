@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.6.0 (2026-10-10)
+
+### Features
+
+- Trace feature added to the server (#8)
+
 ## v0.5.1 (2026-10-07)
 
 ### Fixes
