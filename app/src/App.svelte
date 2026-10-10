@@ -1,9 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { openUrl } from "@tauri-apps/plugin-opener";
   import Icon from "./components/Icon.svelte";
   import UpdatePrompt from "./components/UpdatePrompt.svelte";
-  import { api, errorText, type UpdateCheck } from "./lib/api";
+  import { api, errorText, openLink, type UpdateCheck } from "./lib/api";
   import logo from "./assets/logo.svg";
   import Devices from "./pages/Devices.svelte";
   import Home from "./pages/Home.svelte";
@@ -93,7 +92,7 @@
       {checking ? "Checking…" : updateNote === "Up to date" ? "Up to date ✓" : "Check for updates"}
     </button>
     {#if updateNote && updateNote !== "Up to date"}<div class="update-error">{updateNote}</div>{/if}
-    <button class="check-update" title={REPO} onclick={() => openUrl(REPO)}>GitHub <Icon name="external" size={11} /></button>
+    <button class="check-update" title={REPO} onclick={() => openLink(REPO).catch((e) => (updateNote = errorText(e)))}>GitHub <Icon name="external" size={11} /></button>
   </nav>
   {#if update}<UpdatePrompt check={update} onclose={() => (update = null)} />{/if}
 

@@ -1,13 +1,12 @@
 <script lang="ts">
   import { ask, open } from "@tauri-apps/plugin-dialog";
-  import { openUrl } from "@tauri-apps/plugin-opener";
   import ContextSlider from "../components/ContextSlider.svelte";
   import Icon from "../components/Icon.svelte";
   import Notice from "../components/Notice.svelte";
   import VramBar from "../components/VramBar.svelte";
   import VramPool from "../components/VramPool.svelte";
   import RunningModel from "../components/RunningModel.svelte";
-  import { api, errorText, type CustomInspect, type ModelRow, type ModelsView } from "../lib/api";
+  import { api, errorText, type CustomInspect, type ModelRow, type ModelsView, openLink } from "../lib/api";
   import { gb, gib, rate, tokens } from "../lib/format";
   import { fuzzyFilter } from "../lib/search";
   import { app } from "../lib/store.svelte";
@@ -342,7 +341,7 @@
             {[row.params, row.quant].filter(Boolean).join(" · ") || "–"}{#if knownLicense(row.license)}<span class="lic">{` · ${row.license}`}</span>{/if}
           </span>
           {#if row.source_url}
-            <button class="link mono" onclick={() => openUrl(row.source_url!)} title="View on Hugging Face">
+            <button class="link mono" onclick={() => openLink(row.source_url!).catch((e) => (error = errorText(e)))} title="View on Hugging Face">
               {row.repo}{row.revision ? `@${row.revision.slice(0, 7)}` : ""} <Icon name="external" size={11} />
             </button>
           {:else if row.installed_dir}

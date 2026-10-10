@@ -139,6 +139,9 @@ fn is_newer(a: &str, b: &str) -> bool {
 }
 
 pub async fn run() -> Result<()> {
+    // Taken before the update: once the file is replaced, the system reports
+    // this process's own path as "… (deleted)".
+    let me = std::env::current_exe().ok();
     match RELEASE_TARGET {
         Some(target) => update_release(target).await?,
         None => update_source()?,
@@ -150,8 +153,40 @@ pub async fn run() -> Result<()> {
         }
         _ => engine::install().await?,
     }
-    ui::line(ui::accent("Up to date. Run oppx to start."));
+    // The version that runs next, read from the binary itself: the header
+    // above shows the one that started this update.
+    match me.as_deref().map(version_of).filter(|v| v != "?") {
+        Some(now) => ui::line(ui::accent(format!("oppx {now} is installed. Run oppx to start."))),
+        None => ui::line(ui::accent("Up to date. Run oppx to start.")),
+    }
     Ok(())
+}
+
+/// What `--version` of a binary says ("0.6.1 (ff00f1a)"), or "?".
+fn version_of(binary: &Path) -> String {
+    Command::new(binary)
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().trim_start_matches("oppx ").to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "?".into())
+}
+
+/// Puts a copy of `built` in place of the running executable when they are
+/// different files. Written beside it first and renamed over it, which works
+/// while it runs. Returns the path it replaced, or None when the running one
+/// is `built` itself.
+fn replace_running(built: &Path) -> Result<Option<PathBuf>> {
+    let running = std::env::current_exe()?.canonicalize()?;
+    let built = built.canonicalize().with_context(|| format!("{} is missing after the build", built.display()))?;
+    if running == built {
+        return Ok(None);
+    }
+    let tmp = running.with_extension("new");
+    std::fs::copy(&built, &tmp).with_context(|| format!("can't write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &running).with_context(|| format!("can't replace {}", running.display()))?;
+    Ok(Some(running))
 }
 
 fn update_source() -> Result<()> {
@@ -209,7 +244,25 @@ fn update_source() -> Result<()> {
             let err = String::from_utf8_lossy(&out.stderr);
             bail!("build failed:\n{}", err.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
         }
-        sp.done("oppx installed");
+        // `cargo install` writes to cargo's bin folder. When the `oppx` that is
+        // running lives somewhere else (a copy in ~/.local/bin, say), that one
+        // comes first on PATH and would stay as it was: the update said
+        // "installed" and `oppx --version` still showed the old version.
+        let root = std::env::var_os("CARGO_INSTALL_ROOT").map(PathBuf::from).unwrap_or_else(|| home.join(".cargo"));
+        let built = root.join("bin").join("oppx");
+        match replace_running(&built) {
+            Ok(Some(path)) => sp.done(format!("oppx {} installed ({} and {})", version_of(&built), path.display(), built.display())),
+            Ok(None) => sp.done(format!("oppx {} installed", version_of(&built))),
+            Err(e) => {
+                sp.clear();
+                bail!(
+                    "the new oppx is in {}, but the `oppx` you are running is {} and couldn't be replaced ({e:#}). \
+                     Copy it over by hand, or remove the old one.",
+                    built.display(),
+                    std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
+                );
+            }
+        }
     }
 
     Ok(())
