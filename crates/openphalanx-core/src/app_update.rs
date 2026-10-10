@@ -162,12 +162,10 @@ pub async fn download(install: &Install, progress: impl Fn(u64, u64)) -> Result<
     let sums = http.get(&sums_url).send().await?.error_for_status()?.text().await?;
     let want = expected_sum(&sums, &asset.name).with_context(|| format!("SHA256SUMS doesn't list {}", asset.name))?;
 
-    // Next to the AppImage, so the final rename stays on one filesystem.
-    let dir = match install {
-        Install::AppImage { path } => path.parent().map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir),
-        _ => std::env::temp_dir(),
-    };
-    let file = dir.join(format!(".{}.download", asset.name));
+    let file = download_path(install, &asset.name);
+    if let Some(dir) = file.parent() {
+        tokio::fs::create_dir_all(dir).await.with_context(|| format!("can't create {}", dir.display()))?;
+    }
     let resp = http.get(&asset.browser_download_url).send().await?.error_for_status()?;
     let total = resp.content_length().unwrap_or(asset.size);
     let mut out = tokio::fs::File::create(&file).await.with_context(|| format!("can't write {}", file.display()))?;
@@ -191,6 +189,23 @@ pub async fn download(install: &Install, progress: impl Fn(u64, u64)) -> Result<
     Ok((release, file))
 }
 
+/// Where a release asset is downloaded to.
+///
+/// * AppImage: a hidden file next to the running one, so the final rename
+///   stays on one filesystem.
+/// * .deb: under its own name in a folder of ours. apt takes a file on its
+///   command line only when the name ends in `.deb`; given
+///   `.Openphalanx_0.6.1_amd64.deb.download` it answered "Unsupported file"
+///   and the update button never worked for a package install.
+fn download_path(install: &Install, asset_name: &str) -> PathBuf {
+    match install {
+        Install::AppImage { path } => {
+            path.parent().map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir).join(format!(".{asset_name}.download"))
+        }
+        _ => std::env::temp_dir().join("openphalanx-update").join(asset_name),
+    }
+}
+
 /// Installs a downloaded package over this copy. The caller relaunches.
 pub async fn install(install: &Install, file: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -212,6 +227,9 @@ pub async fn install(install: &Install, file: &Path) -> Result<()> {
                 .await
                 .context("pkexec is not installed; install the .deb by hand")?;
             let _ = std::fs::remove_file(file);
+            if let Some(dir) = file.parent().filter(|d| d.ends_with("openphalanx-update")) {
+                let _ = std::fs::remove_dir(dir);
+            }
             match out.status.code() {
                 Some(0) => {}
                 Some(126 | 127) => bail!("the password prompt was cancelled; nothing was changed"),
@@ -229,6 +247,17 @@ pub async fn install(install: &Install, file: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_package_is_downloaded_under_a_name_apt_accepts() {
+        // apt: "E: Unsupported file … given on commandline" unless it ends in .deb.
+        let deb = download_path(&Install::Deb, "Openphalanx_0.6.1_amd64.deb");
+        assert_eq!(deb.file_name().unwrap(), "Openphalanx_0.6.1_amd64.deb");
+        assert!(deb.is_absolute() && deb.extension().is_some_and(|e| e == "deb"), "{}", deb.display());
+        // An AppImage is renamed over the running one: beside it, hidden until then.
+        let app = download_path(&Install::AppImage { path: "/opt/apps/Openphalanx.AppImage".into() }, "Openphalanx_0.6.1_amd64.AppImage");
+        assert_eq!(app, PathBuf::from("/opt/apps/.Openphalanx_0.6.1_amd64.AppImage.download"));
+    }
 
     #[test]
     fn compares_versions() {

@@ -155,7 +155,7 @@ At launch the app asks GitHub for the latest release (`app_update.rs` in core; q
 
 * **How it installs** depends on how the app was installed (`Install::detect`):
   * AppImage (`$APPIMAGE`): the new AppImage is downloaded next to it and renamed over it.
-  * .deb (the binary belongs to a package, `dpkg-query -S`): `pkexec apt-get install` on the downloaded file, so the system asks for the password.
+  * .deb (the binary belongs to a package, `dpkg-query -S`): `pkexec apt-get install` on the downloaded file, so the system asks for the password. The file is downloaded as `/tmp/openphalanx-update/<asset name>` (`download_path`): apt accepts a file on its command line only when the name ends in `.deb`, and the first version passed `.Openphalanx_0.6.1_amd64.deb.download`, so every package update failed with "E: Unsupported file … given on commandline". Reproduced and checked with `apt-get -s install` on the real 0.6.1 package (old name refused; new name "Inst openphalanx [0.6.0] (0.6.1 local-deb)"); the password prompt and relaunch after it still haven't been run.
   * Built from source or `tauri dev`: the dialog says to `git pull` and rebuild, with no install button.
 * **Checked before anything changes:** the download must match its line in the release's `SHA256SUMS` (the same trust model as `oppx --update`: GitHub over TLS). Tauri's updater plugin would add signatures, but needs a signing key in CI and a `latest.json` per release.
 * **Relaunch:** a detached `sh -c 'sleep 2; exec <app>'` starts the new copy after this one exits (Tauri's `restart()` starts it first, and both would bind the cluster port). The backend container keeps running and the new app adopts it, a split run included (`workers.json`).
