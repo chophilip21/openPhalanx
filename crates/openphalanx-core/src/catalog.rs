@@ -34,9 +34,6 @@ pub struct CatalogEntry {
     /// Verified end to end on real hardware.
     #[serde(default)]
     pub tested: bool,
-    /// Specialized for code by its publisher (Qwen Coder, Devstral, DeepSeek Coder).
-    #[serde(default)]
-    pub coding: bool,
     #[serde(default)]
     pub min_compute_capability: Option<f32>,
     #[serde(default)]

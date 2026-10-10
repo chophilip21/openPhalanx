@@ -1604,7 +1604,8 @@ impl Cluster {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let base = ModelSync { label: spec.label.clone(), repo: spec.repo.clone(), revision: spec.revision.clone(), ..Default::default() };
-        if crate::model::find_installed(&spec.repo, Some(&spec.revision)).is_some() {
+        // A damaged copy counts as missing: downloading again repairs it.
+        if crate::model::find_installed(&spec.repo, Some(&spec.revision)).is_some_and(|d| crate::model::broken(&d).is_none()) {
             *self.sync.lock().unwrap() = Some(ModelSync { state: "ready".into(), ..base });
             self.log(format!("{} is already on this machine", spec.label));
             return;
@@ -1827,6 +1828,9 @@ async fn start_worker(order: &WorkerOrder) -> Result<()> {
     order.check()?;
     let dir = crate::model::find_installed(&order.model.repo, Some(&order.model.revision))
         .with_context(|| format!("{} isn't on this machine yet", order.model.label))?;
+    if let Some(why) = crate::model::broken(&dir) {
+        bail!("{}'s files are broken on this machine ({why}); delete it and download it again", order.model.label);
+    }
     // Built here like on the host (the first time this downloads the SGLang
     // base image, ~16 GB); the host shows the worker as starting meanwhile.
     crate::docker::ensure_image(&order.image, |_| {}).await?;

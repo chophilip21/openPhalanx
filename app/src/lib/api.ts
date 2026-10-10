@@ -242,8 +242,6 @@ export type ModelRow = {
   /** Full release date (YYYY-MM-DD), for sorting. */
   released_on: string | null;
   tested: boolean;
-  /** Specialized for code by its publisher. */
-  coding: boolean;
   best_fit: boolean;
   custom: boolean;
   weight_bytes: number;
@@ -251,6 +249,8 @@ export type ModelRow = {
   requirement: Requirement;
   fit: FitCheck | null;
   installed_dir: string | null;
+  /** The installed copy's files are damaged (what's wrong). */
+  broken: string | null;
   app_managed: boolean;
 };
 

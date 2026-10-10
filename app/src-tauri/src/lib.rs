@@ -836,8 +836,6 @@ struct ModelRow {
     released_on: Option<String>,
     /// Verified end to end on real hardware (catalog flag).
     tested: bool,
-    /// Specialized for code (catalog flag).
-    coding: bool,
     /// Largest installed-or-downloadable model that fits comfortably right now.
     best_fit: bool,
     custom: bool,
@@ -846,6 +844,8 @@ struct ModelRow {
     requirement: Requirement,
     fit: Option<FitCheck>,
     installed_dir: Option<String>,
+    /// The installed copy's files are damaged (what's wrong): delete and download again.
+    broken: Option<String>,
     /// Downloaded by Openphalanx (so it can also be deleted from here).
     app_managed: bool,
 }
@@ -1032,7 +1032,6 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
                 notes: entry.as_ref().and_then(|e| e.notes.clone()),
                 released_on: entry.as_ref().and_then(|e| e.released.clone()),
                 tested: entry.as_ref().is_some_and(|e| e.tested),
-                coding: entry.as_ref().is_some_and(|e| e.coding),
                 best_fit: false,
                 custom: entry.is_none(),
                 weight_bytes: m.weight_bytes,
@@ -1040,6 +1039,7 @@ async fn get_models(state: State<'_, AppState>) -> CmdResult<ModelsView> {
                 fit: available.map(|free| vram::check(&requirement, free)),
                 requirement,
                 app_managed: m.installed_dir.as_deref().is_some_and(is_app_managed),
+                broken: m.broken.clone(),
                 installed_dir: m.installed_dir.map(|d| d.display().to_string()),
             })
         })

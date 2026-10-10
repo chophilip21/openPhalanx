@@ -80,6 +80,28 @@ Copy SEARCH lines character for character from what you read (keep the indentati
 
 CREATE_PROMPT = "Now write the whole content of the new file {path}, in one fenced code block and nothing else."
 ANSWER_PROMPT = "Now write your reply to the user. Be brief and specific; refer to files as path:line."
+# A small model answered five different messages with the same sentences (its own
+# earlier replies made them the likeliest text): a repeat is redone once with this.
+REPEAT_PROMPT = ("You just wrote a reply you already gave earlier, word for word, but the user's message is a "
+                 "different one. Read their latest message again and answer exactly that, in different words, "
+                 "without repeating earlier sentences. If they ask about a change or say it is missing, go by "
+                 "the facts above and say plainly what was and wasn't changed.")
+RECENT_REPLIES = 6  # how far back a repeat is looked for
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _sentences(text: str) -> list[str]:
+    """Normalized sentences and lines, the units a repeat is made of."""
+    return [n for n in (_norm(p) for p in re.split(r"(?<=[.!?:])\s+|\n+", text)) if n]
+
+
+def is_repeat(reply: str, old: set[str]) -> bool:
+    """Every sentence of the reply was already said in an earlier one."""
+    parts = _sentences(reply)
+    return bool(parts) and all(p in old for p in parts)
 
 
 def action_schema(tools: tuple[str, ...]) -> dict:
@@ -397,6 +419,10 @@ class Agent:
     # session (characters / 3 ran ~5% short on Qwen3.6 for code).
     ratio: float = 1.0
     _sent_raw: int = 0
+    # Files really changed in this conversation (an edit that applied), for the
+    # facts each reply is given; and the last reply, to catch a repeat.
+    changed_session: list = field(default_factory=list)
+    _replies: list = field(default_factory=list)  # (user message, reply), the latest few
 
     # ---- model calls ------------------------------------------------------
     def _system(self) -> str:
@@ -409,6 +435,14 @@ class Agent:
         """/clear: a fresh conversation (the project notes are re-read)."""
         self.messages.clear()
         self._system_text = None
+        self.changed_session.clear()
+        self._replies.clear()
+
+    def undone(self, names: list[str]):
+        """/undo restored these files: they no longer count as changed."""
+        self.changed_session[:] = [f for f in self.changed_session if Path(f).name not in names]
+        self.messages.append({"role": "user", "_result": True, "content":
+                              "(The user undid your last edit: " + ", ".join(names) + " is back to how it was.)"})
 
     def reset_system(self):
         """The project notes changed: rebuild the system prompt (this costs
@@ -486,12 +520,41 @@ class Agent:
         used = self._estimate()
         return max(256, min(want, self.context - used - 256))
 
-    def _text(self, max_tokens: int, stream: bool) -> str:
-        return self._sized(lambda: self._text_once(max_tokens, stream))
+    def _held_back(self, old: set[str]) -> tuple[str, bool]:
+        """Streams the reply, but shows nothing while it only repeats sentences
+        of earlier replies. Returns the reply and whether it was shown: a
+        reply that is a repeat from start to end never is."""
+        show, shown = self.hooks.stream, False
 
-    def _text_once(self, max_tokens: int, stream: bool) -> str:
+        def gate(text: str, final: bool):
+            nonlocal shown
+            if not shown:
+                parts = _sentences(text)
+                last = parts.pop() if parts and not final else ""  # still being written
+                # Something new: a whole sentence, or one that has gone its own way.
+                shown = any(p not in old for p in parts) or (
+                    len(last) >= 40 and not any(o.startswith(last) for o in old))
+            if shown:
+                show(text, final)
+
+        self.hooks.stream = gate
+        try:
+            reply = self._text(ANSWER_RESERVE, stream=True)
+        finally:
+            self.hooks.stream = show
+        if not shown and not is_repeat(reply, old):
+            show(reply, True)  # short, and new after all
+            shown = True
+        return reply, shown
+
+    def _text(self, max_tokens: int, stream: bool, temperature: float | None = None) -> str:
+        return self._sized(lambda: self._text_once(max_tokens, stream, temperature))
+
+    def _text_once(self, max_tokens: int, stream: bool, temperature: float | None = None) -> str:
         self._fit()
         body = self._body({"max_tokens": self._room(max_tokens), "stream": stream})
+        if temperature is not None:
+            body["temperature"] = temperature
         if not stream:
             msg = self._post(body)["choices"][0]["message"]
             content = msg.get("content") or ""
@@ -612,7 +675,7 @@ class Agent:
         tools = tuple(t for t in TOOLS if (can_edit or t not in EDIT_TOOLS) and (self.web or t != "web_search"))
         done: dict[str, int] = {}  # action -> step it was taken, to stop loops
         reads: dict[str, list] = {}  # path -> [(first, last, step)] shown this turn
-        repeats = search_errors = 0
+        repeats = search_errors = failed_edits = 0
         searched = opened = changed = 0  # grep/list, read/outline, edit/create steps this turn
         nudged = edit_nudged = checked = False
         changed_files: list[str] = []
@@ -657,10 +720,7 @@ class Agent:
                                           "a test you meant to add), do it now with edit; grep for an old name to check. "
                                           "Otherwise choose answer, and describe only these changes."})
                     continue
-                return self._answer()
-            if tool in ("edit", "create"):
-                changed += 1
-                changed_files.append(act.get("path") or "")
+                return self._answer(text, self._facts(changed_files, failed_edits, can_edit))
             if tool in ("grep", "list"):
                 searched += 1
             elif tool in ("read", "outline"):
@@ -687,11 +747,40 @@ class Agent:
                         result += "\n\nWeb search isn't working right now; carry on without it."
                 if tool == "read":
                     result = self._note_read(act, result, reads, n)
+                if tool in ("edit", "create"):
+                    # Only an edit that applied is a change. Counting the attempt
+                    # told the model it had changed a file when its edit was refused.
+                    if result.startswith("Error:"):
+                        failed_edits += 1
+                        result += "\n\nNothing was changed. Read the exact lines again and retry, or say that it failed."
+                    else:
+                        changed += 1
+                        path = act.get("path") or ""
+                        changed_files.append(path)
+                        if path not in self.changed_session:
+                            self.changed_session.append(path)
             left = MAX_STEPS - n
             self.messages.append({"role": "user", "_result": True, "content":
                                   f"Result of step {n} ({tool}):\n{result}\n\n[{left} steps left]"})
         self.messages.append({"role": "user", "content": "You have used all your steps."})
-        return self._answer()
+        return self._answer(text, self._facts(changed_files, failed_edits, can_edit))
+
+    def _facts(self, changed_files: list[str], failed_edits: int, can_edit: bool) -> str:
+        """What really changed, given with every reply: small models claim edits
+        they never made, and repeat the claim when asked about it."""
+        now = list(dict.fromkeys(changed_files))
+        before = [f for f in self.changed_session if f not in now]
+        parts = ["Files you changed in this request: " + (", ".join(now) if now else "none") + "."]
+        if failed_edits and not now:
+            parts.append("An edit you tried was refused, so that change was NOT made: say so, don't describe it as done.")
+        elif can_edit and not now:
+            # Asked for a change, it read some code and answered as if the code already did it.
+            parts.append("The user asked for a change and you made none: begin your reply by saying that nothing "
+                         "was changed, then say why, or what is missing.")
+        parts.append("Files you changed earlier in this conversation: " + (", ".join(before) if before else "none") + ".")
+        parts.append("Never say you added, changed or fixed something in a file that is not in these lists; "
+                     "mention the lists only if the user asks about changes.")
+        return "\n\nFacts: " + " ".join(parts)
 
     @staticmethod
     def _already_read(act: dict, reads: dict) -> int | None:
@@ -725,13 +814,32 @@ class Agent:
                        f"grep with path {path!r} for the name you need instead.]")
         return result
 
-    def _answer(self) -> str:
-        """The reply, as free text, streamed."""
-        self.messages.append({"role": "user", "content": ANSWER_PROMPT})
+    def _answer(self, user_text: str = "", facts: str = "") -> str:
+        """The reply, as free text, streamed. A reply that repeats the previous
+        one (to a different message) is held back and written again once."""
+        asked = _norm(user_text)
+        # What it said to other messages; asking the same thing again may get the same reply.
+        old = {s for q, r in self._replies if _norm(q) != asked for s in _sentences(r)}
+        self.messages.append({"role": "user", "content": ANSWER_PROMPT + facts})
+        hidden: list = []
         try:
-            reply = self._text(ANSWER_RESERVE, stream=True)
+            reply, shown = self._held_back(old) if old else (self._text(ANSWER_RESERVE, stream=True), True)
+            if not shown:
+                self.messages[-1] = {"role": "user", "content": ANSWER_PROMPT + facts + "\n\n" + REPEAT_PROMPT}
+                # The earlier copies are what it copies from (with them in view
+                # the redo came out the same, even with randomness): for this
+                # one request they are replaced by a note.
+                said = set(_sentences(reply))
+                for m in self.messages:
+                    if m["role"] == "assistant" and not m["content"].startswith("{") and said & set(_sentences(m["content"])):
+                        hidden.append((m, m["content"]))
+                        m["content"] = "(An earlier reply of yours, which didn't answer what the user asks now.)"
+                reply = self._text(ANSWER_RESERVE, stream=True, temperature=0.7)
         finally:
+            for m, content in hidden:
+                m["content"] = content
             self.messages.pop()  # the instruction isn't part of the conversation
+        self._replies = (self._replies + [(user_text, reply)])[-RECENT_REPLIES:]
         if self.messages and self.messages[-1]["role"] == "assistant" and self.messages[-1]["content"].startswith("{"):
             self.messages[-1] = {"role": "assistant", "content": reply}
         else:

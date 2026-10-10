@@ -9,6 +9,7 @@
   import RunningModel from "../components/RunningModel.svelte";
   import { api, errorText, type CustomInspect, type ModelRow, type ModelsView } from "../lib/api";
   import { gb, gib, rate, tokens } from "../lib/format";
+  import { fuzzyFilter } from "../lib/search";
   import { app } from "../lib/store.svelte";
   import { suggestStart } from "../lib/nav.svelte";
 
@@ -148,12 +149,21 @@
   // Filters.
   let family = $state("All");
   let fitsOnly = $state(false);
+  // Search over everything a row shows as text; typos are forgiven (see fuzzyFilter).
+  let query = $state("");
+  const found = $derived(
+    fuzzyFilter(view?.rows ?? [], query, (r) =>
+      [r.name, r.family ?? "Custom", r.repo, r.params, r.quant, r.quantized_by, r.license]
+        .filter(Boolean)
+        .join(" "),
+    ),
+  );
   const families = $derived([
     "All",
     ...new Set((view?.rows ?? []).map((r) => r.family ?? "Custom")),
   ]);
   const shown = $derived(
-    (view?.rows ?? []).filter(
+    found.filter(
       (r) =>
         (family === "All" || (r.family ?? "Custom") === family) &&
         (!fitsOnly || (r.fit != null && r.fit.fit !== "insufficient")),
@@ -185,7 +195,7 @@
   const pageRows = $derived(sorted.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE));
   // A new filter or order starts from the first page.
   $effect(() => {
-    void [family, fitsOnly, sortKey, descending];
+    void [query, family, fitsOnly, sortKey, descending];
     page = 0;
   });
   function goPage(p: number) {
@@ -269,6 +279,11 @@
   </p>
 
   <div class="filters">
+    <label class="search">
+      <Icon name="search" size={14} />
+      <input type="search" placeholder="Search models" aria-label="Search models" bind:value={query}
+        onkeydown={(e) => e.key === "Escape" && (query = "")} />
+    </label>
     <label class="pick">
       <span class="muted small">Family</span>
       <select bind:value={family}>
@@ -309,7 +324,6 @@
           <span class="title">
             {row.name}
             {#if row.best_fit}<span class="badge ok" title="Largest model that fits this GPU with headroom at the selected context">Best fit for this GPU</span>{/if}
-            {#if row.coding}<span class="badge coding" title="Specialized for code by its publisher"><Icon name="terminal" size={11} stroke={2.4} /> Coding</span>{/if}
             {#if row.tested}<span class="badge neutral" title="Verified end to end on real hardware">Tested</span>{/if}
             {#if row.custom}<span class="badge neutral">Custom</span>{/if}
             {#if row.quantized_by}<span class="badge community" title="Quantized by {row.quantized_by}, not by the model's publisher">Community · {row.quantized_by}</span>{/if}
@@ -326,6 +340,7 @@
             <span class="link mono plain">{row.installed_dir}</span>
           {/if}
           {#if row.notes}<span class="note">{row.notes}</span>{/if}
+          {#if row.broken}<span class="note broken">Broken: {row.broken}. Delete it and download it again; the server can't start with it.</span>{/if}
         </span>
         <span class="cell num muted" data-label="Download">{gb(row.requirement.download_bytes)}</span>
         <span class="cell need" data-label="VRAM needed">
@@ -361,7 +376,9 @@
             </div>
             <button class="ghost icon" title="Cancel download" onclick={() => api.cancelDownload(row.key)}><Icon name="x" size={14} /></button>
           {:else if row.installed_dir}
-            {#if live?.key === row.key}
+            {#if row.broken}
+              <span class="badge insufficient" title="Its files are damaged ({row.broken}). Delete it and download it again."><Icon name="alert" size={12} stroke={2.6} /> Broken</span>
+            {:else if live?.key === row.key}
               <span class="badge ok" title="The server is running this model. Stop the server to switch models."><Icon name="lock" size={12} stroke={2.6} /> Running</span>
             {:else if selected}
               <span class="badge ok"><Icon name="check" size={12} stroke={3} /> Selected</span>
@@ -384,7 +401,9 @@
         {/if}
       </div>
     {:else}
-      <div class="empty muted">No models match these filters.</div>
+      <div class="empty muted">
+        {query.trim() && !found.length ? `No models match "${query.trim()}".` : "No models match these filters."}
+      </div>
     {/each}
   </div>
 
@@ -451,10 +470,21 @@
   .ctx-help { margin: 4px 0 0; font-size: 12.5px; max-width: 900px; }
   .ctx-model { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 13px; border-top: 1px solid var(--border); padding-top: 10px; }
   .filters { display: flex; align-items: center; gap: 10px 20px; flex-wrap: wrap; margin-bottom: 4px; }
-  .filters .fits-only { margin-left: auto; }
+  /* The search box takes the space the rest leaves; whatever doesn't fit
+     wraps to the next line, left-aligned. */
   .fits-only { display: flex; gap: 8px; align-items: center; font-size: 13px; cursor: pointer; }
-  .pick { display: flex; gap: 8px; align-items: center; }
-  .pick select { padding: 5px 8px; font-size: 13px; }
+  .search { position: relative; display: flex; align-items: center; flex: 1 1 240px; min-width: 0; }
+  .search :global(svg) { position: absolute; left: 9px; color: var(--muted); pointer-events: none; }
+  .search input { width: 100%; min-width: 0; padding: 5px 8px 5px 30px; font-size: 13px; }
+  .pick { display: flex; gap: 8px; align-items: center; min-width: 0; }
+  .pick select { padding: 5px 8px; font-size: 13px; min-width: 0; max-width: 100%; }
+  /* Narrow: search on its own line, the two pickers share the next one. */
+  @media (max-width: 1100px) {
+    .search { flex-basis: 100%; }
+    .pick { flex: 1 1 180px; }
+    .pick select { flex: 1; }
+    .fits-only { flex-basis: 100%; }
+  }
   .th-sort { border: none; background: none; padding: 0; font: inherit; letter-spacing: inherit; text-transform: inherit; color: inherit; text-align: left; cursor: pointer; }
   .th-sort:hover { color: var(--text); }
   .empty { padding: 18px; text-align: center; }
@@ -463,7 +493,6 @@
   .pages button { min-width: 34px; padding: 5px 10px; font-size: 13px; }
   .pages button.active { background: var(--on-soft); border-color: var(--on); color: var(--on); font-weight: 600; }
   :global(.badge.community) { color: var(--violet); background: var(--surface-2); }
-  :global(.badge.coding) { display: inline-flex; align-items: center; gap: 4px; color: var(--on); background: var(--on-soft); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--on) 45%, transparent); }
   .avail { display: flex; align-items: center; gap: 6px; font-size: 13px; }
   .table { padding: 6px 0; margin: 12px 0 20px; container-type: inline-size; }
   .tr {
@@ -487,6 +516,7 @@
   .link { border: none; background: none; padding: 0; color: var(--link); font-size: 11.5px; text-align: left; display: inline-flex; gap: 4px; align-items: center; }
   .link.plain { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .note { font-size: 11.5px; color: var(--faint); }
+  .note.broken { color: var(--bad-text); }
   .num { font-variant-numeric: tabular-nums; }
   .need { display: flex; flex-direction: column; gap: 2px; }
   .need-top { display: flex; gap: 4px 6px; align-items: center; flex-wrap: wrap; }

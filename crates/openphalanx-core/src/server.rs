@@ -21,6 +21,8 @@ pub struct ResolvedModel {
     pub repo: Option<String>,
     pub revision: Option<String>,
     pub installed_dir: Option<PathBuf>,
+    /// The installed copy's files are damaged (what's wrong); it can't be started.
+    pub broken: Option<String>,
     pub weight_bytes: u64,
     pub arch: ArchSpec,
     pub max_context: u32,
@@ -95,6 +97,7 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
             quant: Some(e.quant.clone()),
             repo: Some(e.id.clone()),
             revision: Some(e.revision.clone()),
+            broken: installed_dir.as_deref().and_then(model::broken),
             installed_dir,
             weight_bytes: e.weight_bytes,
             arch: e.arch,
@@ -118,6 +121,7 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
         quant: c.quant.clone(),
         repo: c.repo.clone(),
         revision: c.revision.clone(),
+        broken: installed.then(|| model::broken(&c.dir)).flatten(),
         installed_dir: installed.then(|| c.dir.clone()),
         weight_bytes: c.weight_bytes,
         arch: c.arch,
@@ -234,6 +238,16 @@ pub async fn preflight(settings: &Settings) -> Preflight {
         Some(m) if m.installed_dir.is_none() => {
             checks.push(Check::new("model", "Model", Fail, format!("{} is not downloaded yet.", m.label)))
         }
+        Some(m) if m.broken.is_some() => checks.push(Check::new(
+            "model",
+            "Model",
+            Fail,
+            format!(
+                "{}'s files are broken ({}). Delete it on the Models page and download it again.",
+                m.label,
+                m.broken.as_deref().unwrap_or_default()
+            ),
+        )),
         Some(m) => checks.push(Check::new("model", "Model", Pass, format!("{} · {}", m.label, m.quant.clone().unwrap_or_default()))),
     }
 

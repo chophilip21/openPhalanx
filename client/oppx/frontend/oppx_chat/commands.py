@@ -256,6 +256,8 @@ def undo_edits() -> None:
             continue
         names.append(p.name)
     UI.undo = {}
+    if names and UI.agent is not None:
+        UI.agent.undone(names)  # the agent stops counting them as changed
     if names:
         step(f"Undid the last edit: restored {escape(', '.join(names))}", GREEN)
 

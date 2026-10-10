@@ -14,8 +14,7 @@
       "kv_layers": 28,
       "kv_heads": 4,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "Qwen/Qwen2.5-Coder-7B-Instruct",
@@ -32,8 +31,7 @@
       "kv_layers": 28,
       "kv_heads": 4,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ",
@@ -52,8 +50,7 @@
       "head_dim": 128
     },
     "tested": true,
-    "notes": "Tested end to end on an RTX 3090 (24 GB).",
-    "coding": true
+    "notes": "Tested end to end on an RTX 3090 (24 GB)."
   },
   {
     "id": "Qwen/Qwen2.5-Coder-14B-Instruct",
@@ -70,8 +67,7 @@
       "kv_layers": 48,
       "kv_heads": 8,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ",
@@ -88,8 +84,7 @@
       "kv_layers": 64,
       "kv_heads": 8,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
@@ -108,8 +103,7 @@
       "head_dim": 128
     },
     "min_compute_capability": 8.9,
-    "notes": "Mixture-of-experts. FP8 runs natively on Ada/Hopper (compute capability 8.9 or higher).",
-    "coding": true
+    "notes": "Mixture-of-experts. FP8 runs natively on Ada/Hopper (compute capability 8.9 or higher)."
   },
   {
     "id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
@@ -127,8 +121,7 @@
       "kv_heads": 4,
       "head_dim": 128
     },
-    "notes": "Mixture-of-experts.",
-    "coding": true
+    "notes": "Mixture-of-experts."
   },
   {
     "id": "Qwen/Qwen3-Coder-Next-FP8",
@@ -148,8 +141,7 @@
       "linear_layers": 36
     },
     "min_compute_capability": 8.9,
-    "notes": "Hybrid attention: only 1 in 4 layers keeps a KV cache.",
-    "coding": true
+    "notes": "Hybrid attention: only 1 in 4 layers keeps a KV cache."
   },
   {
     "id": "Qwen/Qwen3-Coder-Next",
@@ -167,8 +159,7 @@
       "kv_heads": 2,
       "head_dim": 256,
       "linear_layers": 36
-    },
-    "coding": true
+    }
   },
   {
     "id": "Qwen/Qwen3.6-27B",
@@ -287,6 +278,26 @@
     "quantized_by": "QuantTrio",
     "reasoning_parser": "qwen3",
     "dtype": "bfloat16"
+  },
+  {
+    "id": "RedHatAI/Qwen3.8-27B-INT4",
+    "revision": "91bd022d5b49442a868bc35008f6c21e1860edfa",
+    "name": "Qwen3.8 27B",
+    "family": "Qwen",
+    "params": "27B",
+    "quant": "W4A16",
+    "weight_bytes": 19452788048,
+    "max_context": 262144,
+    "license": "apache-2.0",
+    "released": "2026-08-05",
+    "arch": {
+      "kv_layers": 16,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "linear_layers": 48
+    },
+    "quantized_by": "Red Hat AI",
+    "reasoning_parser": "qwen3"
   },
   {
     "id": "google/gemma-4-E4B-it",
@@ -502,8 +513,7 @@
       "kv_layers": 40,
       "kv_heads": 8,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "mistralai/Devstral-Small-2-24B-Instruct-2512",
@@ -520,8 +530,7 @@
       "kv_layers": 40,
       "kv_heads": 8,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "cyankiwi/Devstral-Small-2-24B-Instruct-2512-AWQ-4bit",
@@ -539,8 +548,7 @@
       "kv_heads": 8,
       "head_dim": 128
     },
-    "quantized_by": "cyankiwi",
-    "coding": true
+    "quantized_by": "cyankiwi"
   },
   {
     "id": "mistralai/Devstral-2-123B-Instruct-2512",
@@ -557,8 +565,7 @@
       "kv_layers": 88,
       "kv_heads": 8,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "Qwen/Qwen3-8B-AWQ",
@@ -727,8 +734,7 @@
       "head_dim": 288
     },
     "quantized_by": "TechxGenus",
-    "notes": "Mixture-of-experts with MLA attention (a small KV cache).",
-    "coding": true
+    "notes": "Mixture-of-experts with MLA attention (a small KV cache)."
   },
   {
     "id": "casperhansen/deepseek-r1-distill-qwen-32b-awq",
@@ -1197,8 +1203,7 @@
       "kv_layers": 24,
       "kv_heads": 2,
       "head_dim": 64
-    },
-    "coding": true
+    }
   },
   {
     "id": "Qwen/Qwen2.5-Coder-1.5B-Instruct-AWQ",
@@ -1215,8 +1220,7 @@
       "kv_layers": 28,
       "kv_heads": 2,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "Qwen/Qwen2.5-Coder-3B-Instruct-AWQ",
@@ -1233,8 +1237,7 @@
       "kv_layers": 36,
       "kv_heads": 2,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ",
@@ -1253,7 +1256,6 @@
       "head_dim": 128
     },
     "quantized_by": "QuantTrio",
-    "coding": true,
     "notes": "Mixture-of-experts. Needs a large split cluster."
   },
   {
@@ -1272,8 +1274,7 @@
       "kv_heads": 32,
       "head_dim": 128
     },
-    "quantized_by": "TheBloke",
-    "coding": true
+    "quantized_by": "TheBloke"
   },
   {
     "id": "TheBloke/CodeLlama-13B-Instruct-AWQ",
@@ -1291,8 +1292,7 @@
       "kv_heads": 40,
       "head_dim": 128
     },
-    "quantized_by": "TheBloke",
-    "coding": true
+    "quantized_by": "TheBloke"
   },
   {
     "id": "TheBloke/CodeLlama-34B-Instruct-AWQ",
@@ -1310,8 +1310,7 @@
       "kv_heads": 8,
       "head_dim": 128
     },
-    "quantized_by": "TheBloke",
-    "coding": true
+    "quantized_by": "TheBloke"
   },
   {
     "id": "TheBloke/CodeLlama-70B-Instruct-AWQ",
@@ -1329,8 +1328,7 @@
       "kv_heads": 8,
       "head_dim": 128
     },
-    "quantized_by": "TheBloke",
-    "coding": true
+    "quantized_by": "TheBloke"
   },
   {
     "id": "TheBloke/deepseek-coder-6.7B-instruct-AWQ",
@@ -1348,8 +1346,7 @@
       "kv_heads": 32,
       "head_dim": 128
     },
-    "quantized_by": "TheBloke",
-    "coding": true
+    "quantized_by": "TheBloke"
   },
   {
     "id": "TheBloke/deepseek-coder-33B-instruct-GPTQ",
@@ -1367,8 +1364,7 @@
       "kv_heads": 8,
       "head_dim": 128
     },
-    "quantized_by": "TheBloke",
-    "coding": true
+    "quantized_by": "TheBloke"
   },
   {
     "id": "casperhansen/deepseek-coder-v2-instruct-awq",
@@ -1387,7 +1383,6 @@
       "head_dim": 288
     },
     "quantized_by": "casperhansen",
-    "coding": true,
     "notes": "Mixture-of-experts with MLA attention. Needs a large split cluster."
   },
   {
@@ -1406,8 +1401,7 @@
       "kv_heads": 4,
       "head_dim": 128
     },
-    "quantized_by": "TechxGenus",
-    "coding": true
+    "quantized_by": "TechxGenus"
   },
   {
     "id": "TechxGenus/Codestral-22B-v0.1-AWQ",
@@ -1426,7 +1420,6 @@
       "head_dim": 128
     },
     "quantized_by": "TechxGenus",
-    "coding": true,
     "notes": "Mistral Non-Production License: not for commercial use."
   },
   {
@@ -1444,8 +1437,7 @@
       "kv_layers": 32,
       "kv_heads": 32,
       "head_dim": 80
-    },
-    "coding": true
+    }
   },
   {
     "id": "ibm-granite/granite-8b-code-instruct-128k",
@@ -1462,8 +1454,7 @@
       "kv_layers": 36,
       "kv_heads": 8,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "ibm-granite/granite-34b-code-instruct-8k",
@@ -1480,8 +1471,7 @@
       "kv_layers": 88,
       "kv_heads": 1,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "ByteDance-Seed/Seed-Coder-8B-Instruct",
@@ -1498,8 +1488,7 @@
       "kv_layers": 32,
       "kv_heads": 8,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "stelterlab/Yi-Coder-9B-Chat-AWQ",
@@ -1517,8 +1506,7 @@
       "kv_heads": 4,
       "head_dim": 128
     },
-    "quantized_by": "stelterlab",
-    "coding": true
+    "quantized_by": "stelterlab"
   },
   {
     "id": "infly/OpenCoder-8B-Instruct",
@@ -1535,8 +1523,7 @@
       "kv_layers": 32,
       "kv_heads": 8,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "JetBrains/Mellum2-12B-A2.5B-Instruct",
@@ -1558,7 +1545,6 @@
       "swa_head_dim": 128,
       "swa_window": 1024
     },
-    "coding": true,
     "notes": "Mixture-of-experts, by JetBrains."
   },
   {
@@ -1576,8 +1562,7 @@
       "kv_layers": 14,
       "kv_heads": 8,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "IQuestLab/IQuest-Coder-V1-14B-Instruct",
@@ -1594,8 +1579,7 @@
       "kv_layers": 28,
       "kv_heads": 8,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "IQuestLab/IQuest-Coder-V1-40B-Instruct",
@@ -1612,8 +1596,7 @@
       "kv_layers": 80,
       "kv_heads": 8,
       "head_dim": 128
-    },
-    "coding": true
+    }
   },
   {
     "id": "cyankiwi/KAT-Coder-V2.5-Dev-AWQ-INT4",
@@ -1633,7 +1616,6 @@
       "linear_layers": 30
     },
     "quantized_by": "cyankiwi",
-    "coding": true,
     "reasoning_parser": "qwen3",
     "notes": "Mixture-of-experts, by Kwaipilot."
   },
@@ -1654,7 +1636,6 @@
       "head_dim": 128
     },
     "quantized_by": "stelterlab",
-    "coding": true,
     "notes": "Tuned for agentic software engineering."
   },
   {
@@ -1712,7 +1693,6 @@
       "head_dim": 128
     },
     "quantized_by": "cyankiwi",
-    "coding": true,
     "notes": "Tuned for software-engineering tasks."
   },
   {
@@ -1731,7 +1711,6 @@
       "kv_heads": 1,
       "head_dim": 288
     },
-    "coding": true,
     "reasoning_parser": "kimi_k2",
     "notes": "Mixture-of-experts, released by Moonshot in INT4. Needs a large split cluster."
   },

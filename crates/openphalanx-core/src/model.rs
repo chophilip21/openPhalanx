@@ -252,6 +252,119 @@ fn hf_snapshot_complete(dir: &Path) -> bool {
     dir.join("model.safetensors").is_file()
 }
 
+/// Why the model in `dir` can't be loaded, when its files are damaged: a file
+/// the download recorded is gone or has another size, the config doesn't
+/// parse, a shard is missing, or a weight file is cut short. Only sizes and
+/// the safetensors headers are read (no hashing), so it's cheap to ask often;
+/// the answer is kept until a file's size or date changes.
+pub fn broken(dir: &Path) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Stamp = Vec<(String, u64, Option<std::time::SystemTime>)>;
+    type Seen = HashMap<PathBuf, (Stamp, Option<String>)>;
+    static SEEN: OnceLock<Mutex<Seen>> = OnceLock::new();
+
+    let mut stamp: Stamp = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| {
+                    let meta = std::fs::metadata(e.path()).ok(); // follows links (HF cache)
+                    let name = e.file_name().to_string_lossy().to_string();
+                    (name, meta.as_ref().map_or(u64::MAX, |m| m.len()), meta.and_then(|m| m.modified().ok()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    stamp.sort();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some((old, verdict)) = seen.lock().unwrap().get(dir) {
+        if *old == stamp {
+            return verdict.clone();
+        }
+    }
+    let verdict = find_damage(dir);
+    seen.lock().unwrap().insert(dir.to_path_buf(), (stamp, verdict.clone()));
+    verdict
+}
+
+fn find_damage(dir: &Path) -> Option<String> {
+    // Our own download wrote down every file and its size.
+    if let Ok(bytes) = std::fs::read(dir.join(COMPLETE_MARKER)) {
+        let files = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v.get("files").cloned());
+        for f in files.as_ref().and_then(Value::as_array).into_iter().flatten() {
+            let (Some(path), Some(size)) = (f.get("path").and_then(Value::as_str), f.get("size").and_then(Value::as_u64)) else {
+                continue;
+            };
+            match std::fs::metadata(dir.join(path)) {
+                Err(_) => return Some(format!("{path} is missing")),
+                Ok(m) if m.len() != size => return Some(format!("{path} is {} bytes instead of {size}", m.len())),
+                Ok(_) => {}
+            }
+        }
+    }
+    match std::fs::read(dir.join("config.json")) {
+        Err(_) => return Some("config.json is missing".into()),
+        Ok(bytes) if serde_json::from_slice::<Value>(&bytes).is_err() => return Some("config.json is damaged".into()),
+        Ok(_) => {}
+    }
+    if let Ok(bytes) = std::fs::read(dir.join("model.safetensors.index.json")) {
+        let Some(map) = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v.get("weight_map").cloned()) else {
+            return Some("model.safetensors.index.json is damaged".into());
+        };
+        let mut shards: Vec<&str> = map.as_object().into_iter().flatten().filter_map(|(_, v)| v.as_str()).collect();
+        shards.sort();
+        shards.dedup();
+        if let Some(gone) = shards.iter().find(|s| !dir.join(s).is_file()) {
+            return Some(format!("{gone} is missing"));
+        }
+    }
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".safetensors"))
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return Some("it has no .safetensors weights".into());
+    }
+    // Only the files SGLang loads (not Mistral's consolidated copy).
+    let all: Vec<&str> = names.iter().map(String::as_str).collect();
+    names.iter().filter(|n| !crate::download::is_duplicate_weight(n, &all)).find_map(|name| safetensors_damage(&dir.join(name)).map(|why| format!("{name} {why}")))
+}
+
+/// A safetensors file is an 8-byte header length, a JSON header giving each
+/// tensor's byte range, then the data: the file must end where the last
+/// tensor does. A download cut short, or a file overwritten, fails here.
+fn safetensors_damage(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else { return Some("can't be read".into()) };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut head = [0u8; 8];
+    if file.read_exact(&mut head).is_err() {
+        return Some("is empty or cut short".into());
+    }
+    let header_len = u64::from_le_bytes(head);
+    // Real headers are well under this (a few MB for the largest models).
+    if header_len == 0 || header_len > 512 * 1024 * 1024 || 8 + header_len > len {
+        return Some("is not a valid weights file".into());
+    }
+    let mut header = vec![0u8; header_len as usize];
+    if file.read_exact(&mut header).is_err() {
+        return Some("is cut short".into());
+    }
+    let Ok(Value::Object(tensors)) = serde_json::from_slice::<Value>(&header) else {
+        return Some("is not a valid weights file".into());
+    };
+    let data_end = tensors
+        .values()
+        .filter_map(|t| t.get("data_offsets")?.get(1)?.as_u64())
+        .max()
+        .unwrap_or(0);
+    let expected = 8 + header_len + data_end;
+    (len != expected).then(|| format!("is {} bytes instead of {expected} (cut short or damaged)", len))
+}
+
 /// Read-only bind mounts that make a model folder usable inside the container.
 ///
 /// Model folders are often symlink farms (the Hugging Face cache links
@@ -301,6 +414,59 @@ pub fn mount_for(model_dir: &Path) -> Result<ModelMount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A safetensors file with one tensor of `data` bytes.
+    fn weights(data: usize) -> Vec<u8> {
+        let header = format!(r#"{{"w":{{"dtype":"U8","shape":[{data}],"data_offsets":[0,{data}]}}}}"#);
+        let mut out = (header.len() as u64).to_le_bytes().to_vec();
+        out.extend(header.as_bytes());
+        out.extend(vec![7u8; data]);
+        out
+    }
+
+    #[test]
+    fn finds_damaged_model_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let write = |name: &str, bytes: &[u8]| std::fs::write(dir.join(name), bytes).unwrap();
+        write("config.json", b"{}");
+        write("model-00001-of-00002.safetensors", &weights(64));
+        write("model-00002-of-00002.safetensors", &weights(32));
+        write(
+            "model.safetensors.index.json",
+            br#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#,
+        );
+        assert_eq!(find_damage(dir), None);
+
+        // A shard cut short (an interrupted copy).
+        let whole = weights(32);
+        write("model-00002-of-00002.safetensors", &whole[..whole.len() - 10]);
+        let why = find_damage(dir).unwrap();
+        assert!(why.starts_with("model-00002-of-00002.safetensors is ") && why.contains("cut short"), "{why}");
+        // The cached answer follows the file.
+        assert!(broken(dir).is_some());
+        write("model-00002-of-00002.safetensors", &whole);
+        assert_eq!(broken(dir), None);
+
+        // Not a weights file at all.
+        write("model-00002-of-00002.safetensors", b"garbage, not safetensors");
+        assert!(find_damage(dir).unwrap().contains("not a valid weights file"));
+        write("model-00002-of-00002.safetensors", &whole);
+
+        // A shard the index names is gone.
+        std::fs::remove_file(dir.join("model-00001-of-00002.safetensors")).unwrap();
+        assert_eq!(find_damage(dir).as_deref(), Some("model-00001-of-00002.safetensors is missing"));
+        write("model-00001-of-00002.safetensors", &weights(64));
+
+        // Our download's own record: a small file with another size.
+        write(COMPLETE_MARKER, br#"{"files":[{"path":"config.json","size":2,"sha256":null},{"path":"vocab.json","size":5,"sha256":null}]}"#);
+        assert_eq!(find_damage(dir).as_deref(), Some("vocab.json is missing"));
+        write("vocab.json", b"12345");
+        assert_eq!(find_damage(dir), None);
+
+        write("config.json", b"{ not json");
+        assert!(find_damage(dir).unwrap().starts_with("config.json is "));
+    }
     use serde_json::json;
 
     #[test]
