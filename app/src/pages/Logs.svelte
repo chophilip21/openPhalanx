@@ -13,7 +13,7 @@
   let memberLines = $state<string[]>([]);
   const cluster = $derived(app.snapshot?.cluster ?? null);
   const members = $derived(cluster?.role.role === "host" ? cluster.members : []);
-  const thisName = $derived(cluster ? `${cluster.name} (this machine)` : "This machine");
+  const thisName = "This machine";
   // A member that left falls back to this machine.
   $effect(() => {
     if (source !== LOCAL && !members.some((m) => m.id === source)) source = LOCAL;

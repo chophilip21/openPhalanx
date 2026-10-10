@@ -934,7 +934,8 @@ fn cluster_pool(state: &AppState, gpu: Option<&gpu::GpuInfo>, available: Option<
         .map(|c| {
             let mut nodes = vec![PoolNode {
                 id: c.id(),
-                name: c.name(),
+                // Its own name is what other machines see; here it is just this one.
+                name: "This machine".into(),
                 this: true,
                 gpu: gpu.map(|g| g.name.clone()),
                 available_bytes: available.unwrap_or(0),
@@ -1433,11 +1434,50 @@ async fn remove_custom(state: State<'_, AppState>, key: String) -> CmdResult<Set
 async fn serve_cluster(app: AppHandle) {
     let st = app.state::<AppState>();
     let Some(c) = st.cluster.clone() else { return };
-    if let Err(e) = c.run().await {
-        *st.cluster_error.lock().unwrap() = Some(format!(
-            "The cluster service couldn't start ({e:#}). Is oppxs or another Openphalanx app running on this machine?"
-        ));
+    // It keeps trying: opened while `oppxs` (or another copy of the app) still
+    // held the ports, the app used to stay without a cluster service for good,
+    // invisible to the other servers, with only a small line saying why.
+    let mut first = true;
+    loop {
+        // The background loops start once; after that only the API is retried.
+        let ended = if first { c.clone().run().await } else { c.clone().serve_api().await };
+        first = false;
+        if let Err(e) = ended {
+            *st.cluster_error.lock().unwrap() = Some(format!(
+                "This machine isn't visible to other servers yet: the cluster service couldn't start ({e:#}). \
+                 Is oppxs or another Openphalanx app running here? Stop it; this retries by itself."
+            ));
+        }
+        // Wait until the cluster port is free again, then start over.
+        loop {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            if tokio::net::TcpListener::bind(("0.0.0.0", openphalanx_core::cluster::CLUSTER_PORT)).await.is_ok() {
+                break;
+            }
+        }
+        *st.cluster_error.lock().unwrap() = None;
     }
+}
+
+/// A nickname for another server (or a paired device), kept on this machine:
+/// `None` or an empty name removes it, and the address shows again.
+#[tauri::command]
+fn cluster_set_nickname(state: State<'_, AppState>, id: String, name: Option<String>) -> CmdResult<()> {
+    require_cluster(&state)?.set_nickname(&id, name.as_deref()).map_err(err)
+}
+
+/// Other processes holding this server's ports (a leftover `oppxs`, a second app).
+#[tauri::command]
+async fn port_holders() -> CmdResult<Vec<openphalanx_core::ports::Holder>> {
+    openphalanx_core::ports::holders().await.map_err(err)
+}
+
+/// Stops this project's other server processes that hold the ports (never
+/// anything else); the cluster service then starts on its next try. Returns
+/// what was stopped and what still holds a port.
+#[tauri::command]
+async fn free_ports() -> CmdResult<(Vec<String>, Vec<openphalanx_core::ports::Holder>)> {
+    openphalanx_core::ports::free().await.map_err(err)
 }
 
 fn require_cluster(state: &AppState) -> CmdResult<Arc<Cluster>> {
@@ -1592,6 +1632,9 @@ pub fn run() {
             cluster_leave,
             cluster_dissolve,
             cluster_rename,
+            cluster_set_nickname,
+            port_holders,
+            free_ports,
             cluster_set_strategy,
             cluster_approve_download,
             check_update,

@@ -331,6 +331,10 @@ struct Persisted {
     /// As host: the user agreed that members without it download it.
     #[serde(default)]
     download_approved: bool,
+    /// Names the user gave other servers here (by server id). Only this
+    /// machine uses them; a server without one is shown by its address.
+    #[serde(default)]
+    nicknames: std::collections::BTreeMap<String, String>,
 }
 
 /// A member, as its host stores it (`members.json`).
@@ -421,7 +425,14 @@ pub struct HostLink {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemberView {
     pub id: String,
+    /// What to call it here: the user's nickname for it, else its address.
     pub name: String,
+    /// The nickname alone, when there is one.
+    #[serde(default)]
+    pub nickname: Option<String>,
+    /// The name the server gives itself.
+    #[serde(default)]
+    pub announced: String,
     pub url: String,
     pub fingerprint: String,
     pub joined_at: u64,
@@ -433,7 +444,13 @@ pub struct MemberView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateView {
     pub id: String,
+    /// What to call it here: the user's nickname for it, else its address.
     pub name: String,
+    #[serde(default)]
+    pub nickname: Option<String>,
+    /// The name the server gives itself.
+    #[serde(default)]
+    pub announced: String,
     pub url: String,
     pub fingerprint: String,
     pub role: String,
@@ -459,6 +476,10 @@ pub struct ClusterView {
     pub host_link: Option<HostLink>,
     /// Discovery isn't working (e.g. the UDP port is taken).
     pub discovery_error: Option<String>,
+    /// Every nickname given on this machine, by id (servers, and paired
+    /// client devices on the Trace page).
+    #[serde(default)]
+    pub nicknames: std::collections::BTreeMap<String, String>,
     /// As host: the model members are asked to have.
     pub desired_model: Option<ModelSpec>,
     /// As host: members that lack it may download it.
@@ -593,6 +614,7 @@ impl Cluster {
                 strategy: Strategy::default(),
                 desired_model: None,
                 download_approved: false,
+                nicknames: Default::default(),
             },
         };
         let members = match std::fs::read(dir.join("members.json")) {
@@ -648,6 +670,38 @@ impl Cluster {
     }
 
     /// Renames this server (shown to other servers and in the app).
+    /// What this machine calls another server: the nickname the user gave it
+    /// here, else its address (the name a server gives itself can be anything,
+    /// and two machines can pick the same one), else that name.
+    pub fn label(&self, id: &str, url: &str, announced: &str) -> String {
+        if let Some(nick) = self.state.lock().unwrap().nicknames.get(id) {
+            return nick.clone();
+        }
+        address_of(url).unwrap_or_else(|| announced.to_string())
+    }
+
+    fn show(&self, peer: &Peer) -> String {
+        self.label(&peer.id, &peer.url, &peer.name)
+    }
+
+    pub fn nickname(&self, id: &str) -> Option<String> {
+        self.state.lock().unwrap().nicknames.get(id).cloned()
+    }
+
+    /// Gives a server a nickname on this machine, or removes it (`None`, or
+    /// an empty name). Saved with this machine's cluster state.
+    pub fn set_nickname(&self, id: &str, name: Option<&str>) -> Result<()> {
+        let name = name.map(clean_name).filter(|n| !n.is_empty());
+        {
+            let mut st = self.state.lock().unwrap();
+            match name {
+                Some(n) => st.nicknames.insert(id.to_string(), n),
+                None => st.nicknames.remove(id),
+            };
+        }
+        self.save_state()
+    }
+
     pub fn set_name(&self, name: &str) -> Result<()> {
         let name = clean_name(name);
         if name.is_empty() {
@@ -735,7 +789,7 @@ impl Cluster {
                     bail!(
                         "{} is running the cluster's server, so this machine can't start one. \
                          Leave the cluster to run on your own.",
-                        host.name
+                        self.show(&host)
                     );
                 }
                 self.take_over(&host, &token).await?;
@@ -763,9 +817,9 @@ impl Cluster {
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .with_context(|| format!("can't reach the host, {}", host.name))?;
+            .with_context(|| format!("can't reach the host, {}", self.show(host)))?;
         if !resp.status().is_success() {
-            bail!("{} refused: {}", host.name, error_text(resp).await);
+            bail!("{} refused: {}", self.show(host), error_text(resp).await);
         }
         let peers: Vec<Peer> = resp.json().await?;
         self.set_role(Role::Host)?;
@@ -845,7 +899,7 @@ impl Cluster {
                 let seen = l.and_then(|l| l.last_seen).unwrap_or(m.joined_at.max(self.started_at));
                 l.is_some_and(|l| l.gone) || t.saturating_sub(seen) > after_secs
             })
-            .map(|m| m.peer.name.clone())
+            .map(|m| self.show(&m.peer))
             .collect()
     }
 
@@ -1094,11 +1148,11 @@ impl Cluster {
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .with_context(|| format!("cannot reach {}", invite.host.name))?;
+            .with_context(|| format!("cannot reach {}", self.show(&invite.host)))?;
         if !resp.status().is_success() {
             let msg = error_text(resp).await;
             self.pending.lock().unwrap().retain(|p| p.host.id != host_id);
-            bail!("{} refused: {msg}", invite.host.name);
+            bail!("{} refused: {msg}", self.show(&invite.host));
         }
         let reply: JoinReply = resp.json().await?;
         {
@@ -1216,7 +1270,9 @@ impl Cluster {
                 let l = live.get(&m.peer.id).cloned().unwrap_or_default();
                 MemberView {
                     id: m.peer.id.clone(),
-                    name: m.peer.name.clone(),
+                    name: self.show(&m.peer),
+                    nickname: self.nickname(&m.peer.id),
+                    announced: m.peer.name.clone(),
                     url: m.peer.url.clone(),
                     fingerprint: m.peer.fingerprint.clone(),
                     joined_at: m.joined_at,
@@ -1246,7 +1302,9 @@ impl Cluster {
             .filter(|c| !member_ids.contains(&c.beacon.id) && Some(&c.beacon.id) != my_host.as_ref())
             .map(|c| CandidateView {
                 id: c.beacon.id.clone(),
-                name: c.beacon.name.clone(),
+                name: self.label(&c.beacon.id, &url_for(c.address, c.beacon.port), &c.beacon.name),
+                nickname: self.nickname(&c.beacon.id),
+                announced: c.beacon.name.clone(),
                 url: url_for(c.address, c.beacon.port),
                 fingerprint: c.beacon.fingerprint.clone(),
                 role: c.beacon.role.clone(),
@@ -1262,6 +1320,17 @@ impl Cluster {
         let mut role = self.role();
         if let Role::Member { token, .. } = &mut role {
             token.clear(); // never leaves the service
+        }
+        if let Role::Member { host, .. } = &mut role {
+            host.name = self.show(host); // nickname or address, like every other server
+        }
+        let relabel = |p: &mut Peer| p.name = self.show(p);
+        let mut invites = self.pending.lock().unwrap().clone();
+        invites.iter_mut().for_each(|i| relabel(&mut i.host));
+        let mut host_requests = self.host_requests.lock().unwrap().clone();
+        for r in &mut host_requests {
+            relabel(&mut r.from);
+            r.members.iter_mut().for_each(relabel);
         }
         let host_link = matches!(role, Role::Member { .. }).then(|| self.host_link.lock().unwrap().clone());
         // Read these before building the view: a lock taken inside the struct
@@ -1281,10 +1350,11 @@ impl Cluster {
             role,
             members: self.members(),
             candidates: self.candidates(),
-            invites: self.pending.lock().unwrap().clone(),
-            host_requests: self.host_requests.lock().unwrap().clone(),
+            invites,
+            host_requests,
             host_link,
             discovery_error: self.discovery_error.lock().unwrap().clone(),
+            nicknames: self.state.lock().unwrap().nicknames.clone(),
             desired_model,
             download_approved,
             model_sync: self.sync.lock().unwrap().clone(),
@@ -1313,6 +1383,12 @@ impl Cluster {
         tokio::spawn(self.clone().discovery());
         tokio::spawn(self.clone().check_candidates());
         tokio::spawn(self.clone().report_loop());
+        self.serve_api().await
+    }
+
+    /// The cluster API alone (TLS on `CLUSTER_PORT`), without the background
+    /// loops `run` starts: for trying again after the port was busy.
+    pub async fn serve_api(self: Arc<Self>) -> Result<()> {
         let config = tls_config(&self.dir)?;
         let addr = SocketAddr::from(([0, 0, 0, 0], CLUSTER_PORT));
         let app = self.router().into_make_service_with_connect_info::<SocketAddr>();
@@ -1342,12 +1418,20 @@ impl Cluster {
 
     /// Sends a beacon every few seconds and records everyone else's.
     async fn discovery(self: Arc<Self>) {
-        let socket = match bind_discovery() {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                *self.discovery_error.lock().unwrap() =
-                    Some(format!("Can't use UDP port {DISCOVERY_PORT} for discovery ({e:#}); other servers won't be listed."));
-                return;
+        // Keeps trying: another server process on this machine (oppxs next to
+        // the app) may hold the port for a while, and giving up here left the
+        // machine unable to find anyone until it was restarted.
+        let socket = loop {
+            match bind_discovery() {
+                Ok(s) => {
+                    *self.discovery_error.lock().unwrap() = None;
+                    break Arc::new(s);
+                }
+                Err(e) => {
+                    *self.discovery_error.lock().unwrap() =
+                        Some(format!("Can't use UDP port {DISCOVERY_PORT} for discovery ({e:#}); other servers won't be listed."));
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
             }
         };
         let sender = socket.clone();
@@ -1533,7 +1617,7 @@ impl Cluster {
                         link.error = Some(if pinned_tls::is_pin_mismatch(e.root_cause()) {
                             "the host's certificate changed; nothing was sent".into()
                         } else {
-                            format!("{} is unreachable", host.name)
+                            format!("{} is unreachable", self.show(&host))
                         });
                     }
                 }
@@ -1821,7 +1905,7 @@ impl Cluster {
         let host_layers = workers.values().next()?.rank.partition.split(',').next()?.to_string();
         let mut stages: Vec<&crate::split::Stage> = workers.values().map(|o| &o.stage).collect();
         stages.sort_by_key(|s| s.rank);
-        let mut parts = vec![format!("{}: {host_layers} layers", self.name())];
+        let mut parts = vec![format!("This machine: {host_layers} layers")];
         parts.extend(stages.iter().map(|s| {
             format!("{}: {} layers ({})", s.name, s.layers, crate::vram::fmt_gib(s.requirement.total_bytes))
         }));
@@ -1835,7 +1919,7 @@ impl Cluster {
         orders
             .iter()
             .map(|(id, order)| {
-                let name = self.members.lock().unwrap().iter().find(|m| &m.peer.id == id).map(|m| m.peer.name.clone()).unwrap_or_else(|| id.clone());
+                let name = self.members.lock().unwrap().iter().find(|m| &m.peer.id == id).map(|m| self.show(&m.peer)).unwrap_or_else(|| id.clone());
                 let st = live
                     .get(id)
                     .and_then(|l| l.report.as_ref())
@@ -1887,6 +1971,14 @@ async fn start_worker(order: &WorkerOrder) -> Result<()> {
         run_id: order.run_id.clone(),
     })
     .await
+}
+
+/// The host part of a server's URL (`https://192.168.1.74:9092` → `192.168.1.74`).
+pub fn address_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let host = rest.split('/').next()?.rsplit_once(':').map_or(rest, |(h, _)| h);
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn url_for(ip: IpAddr, port: u16) -> String {
@@ -2263,6 +2355,27 @@ mod tests {
         assert!(c.sync_cancel.lock().unwrap().is_none(), "asking again doesn't start it either");
         rt.block_on(async { c.clone().ensure_model(spec, true) });
         assert!(c.sync_cancel.lock().unwrap().is_some(), "approved: the download starts");
+    }
+
+    #[test]
+    fn other_servers_are_shown_by_address_until_given_a_nickname_that_sticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Cluster::open(dir.path()).unwrap();
+        assert_eq!(c.label("abc", "https://192.168.1.74:9092", "laptop-4090"), "192.168.1.74");
+        assert_eq!(c.label("abc", "", "laptop-4090"), "laptop-4090", "no address known: the name it gives itself");
+        c.set_nickname("abc", Some("  the laptop  ")).unwrap();
+        assert_eq!(c.label("abc", "https://192.168.1.74:9092", "laptop-4090"), "the laptop");
+        assert_eq!(c.label("other", "https://192.168.1.80:9092", "laptop-4090"), "192.168.1.80", "a nickname is per server");
+        drop(c);
+        // Saved with the cluster state: still there after the app is closed and opened.
+        let c = Cluster::open(dir.path()).unwrap();
+        assert_eq!(c.nickname("abc").as_deref(), Some("the laptop"));
+        c.set_nickname("abc", None).unwrap();
+        assert_eq!(c.label("abc", "https://192.168.1.74:9092", "laptop-4090"), "192.168.1.74");
+        c.set_nickname("abc", Some("x")).unwrap();
+        c.set_nickname("abc", Some("   ")).unwrap(); // an empty name removes it
+        assert_eq!(Cluster::open(dir.path()).unwrap().nickname("abc"), None);
+        assert_eq!(address_of("https://[fe80::1]:9092").as_deref(), Some("fe80::1"));
     }
 
     #[test]

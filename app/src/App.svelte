@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import Icon from "./components/Icon.svelte";
   import UpdatePrompt from "./components/UpdatePrompt.svelte";
   import { api, errorText, type UpdateCheck } from "./lib/api";
@@ -21,6 +22,7 @@
     { id: "trace", label: "Trace", icon: "activity" },
   ];
 
+  const REPO = "https://github.com/chophilip21/openPhalanx";
   let failed = $state("");
   let update = $state<UpdateCheck | null>(null);
   let checking = $state(false);
@@ -91,6 +93,7 @@
       {checking ? "Checking…" : updateNote === "Up to date" ? "Up to date ✓" : "Check for updates"}
     </button>
     {#if updateNote && updateNote !== "Up to date"}<div class="update-error">{updateNote}</div>{/if}
+    <button class="check-update" title={REPO} onclick={() => openUrl(REPO)}>GitHub <Icon name="external" size={11} /></button>
   </nav>
   {#if update}<UpdatePrompt check={update} onclose={() => (update = null)} />{/if}
 
@@ -142,6 +145,7 @@
   .version { font-size: 11.5px; padding: 6px 12px 0; }
   .check-update { align-self: flex-start; border: none; background: none; padding: 2px 12px; font-size: 11.5px; color: var(--muted); text-decoration: underline; text-underline-offset: 2px; }
   .check-update:hover:not(:disabled) { color: var(--text); }
+  .check-update :global(svg) { vertical-align: -1px; }
   .update-error { font-size: 11px; color: var(--bad-text); padding: 2px 12px; overflow-wrap: anywhere; }
   main { min-width: 0; height: 100%; overflow: hidden; }
 </style>
