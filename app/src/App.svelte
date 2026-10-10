@@ -24,6 +24,25 @@
   let checking = $state(false);
   let updateNote = $state("");
 
+  // The launch screen is plain markup in index.html, so it is on screen before
+  // any of this code has loaded. It stays at least this long after its first
+  // frame, even when the backend answers at once.
+  const SPLASH_MIN_MS = 2000;
+  const loaded = $derived(app.snapshot !== null || failed !== "");
+  let splashClosing = false;
+
+  $effect(() => {
+    if (!loaded || splashClosing) return;
+    splashClosing = true;
+    const el = document.getElementById("splash");
+    if (!el) return;
+    const shown = performance.now() - (window.__splashShownAt ?? performance.now());
+    setTimeout(() => {
+      el.classList.add("out");
+      setTimeout(() => el.remove(), 400);
+    }, Math.max(0, SPLASH_MIN_MS - shown));
+  });
+
   onMount(() => {
     connect().catch((e) => (failed = String(e)));
     // Ask once per launch; offline or rate-limited stays quiet.

@@ -9,8 +9,9 @@ from pathlib import Path
 
 from rich.markup import escape
 
-from .config import ACCENT, CONTEXT, ENGINE, EXTRA_MEMORY, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, OPPX_BIN, RED, SERVER, VERSION, WEB, YELLOW
-from .term import Thinking, UI, headline, out, step
+from .config import ACCENT, CONTEXT, ENGINE, EXTRA_MEMORY, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, OPPX_BIN, PRINT_MODE, RED, SERVER, VERSION, WEB, YELLOW
+from .term import SPIN, Thinking, UI, headline, out, step
+from .mcp import cost_warning
 from .context import CONTEXT_MGR, MAP_MAX, PRI_EDITED, PRI_MODEL, PRI_USER, _orig_format_messages, _raw_tokens
 from .oppx_io import show_shortcuts
 from .routing import wants_edit
@@ -42,6 +43,7 @@ HELP = [
         ("/web <url>", "add a web page to the chat"),
         ("!<command>", "run a shell command and share its output"),
         ("/test, /lint", "run your tests or linter and fix failures"),
+        ("/mcp", "connectors (MCP servers): list, add, remove, tools, reconnect"),
     ]),
     ("Session", [
         ("/status", "server, model, context and mode"),
@@ -52,7 +54,7 @@ HELP = [
 ]
 
 NOT_AVAILABLE = {
-    "/mcp", "/agents", "/login", "/logout", "/permissions", "/hooks", "/config", "/terminal-setup",
+    "/agents", "/login", "/logout", "/permissions", "/hooks", "/config", "/terminal-setup",
     "/bug", "/pr_comments", "/ide", "/install-github-app", "/upgrade", "/release-notes", "/add-dir",
     "/rewind", "/output-style", "/statusline", "/privacy-settings",
 }
@@ -79,6 +81,8 @@ def show_status(coder):
         ("mode", "plan (no edits)" if UI.plan_mode else "default (edits applied, never committed)"),
         ("files in chat", ", ".join(coder.get_inchat_relative_files()) or "none"),
         ("memory", ", ".join(Path(f).name for f in coder.abs_read_only_fnames) or f"none (/init creates {MEMORY_FILE})"),
+        ("connectors", (connector_names(UI.connectors) or "none (/mcp add …)") if UI.connectors is not None
+         else "not used by --engine aider"),
         ("oppx", VERSION or "?"),
     ]
     for k, v in rows:
@@ -156,6 +160,142 @@ def show_cost(coder):
     if UI.agent is not None and sent:
         step(f"[{MUTED}]{UI.agent.cached_tokens:,} of the tokens sent were served from the server's prefix cache "
              f"({100 * UI.agent.cached_tokens // sent}%)[/]")
+
+
+# ---------------------------------------------------------------------------
+# Connectors (MCP servers): /mcp
+# ---------------------------------------------------------------------------
+
+MCP_USAGE = "/mcp add <name> -- <command> [args] (or --url <https://…>) · remove <name> · tools <name> · reconnect"
+
+
+def connector_names(hub) -> str:
+    """One line: every connector with its tool count, or why it isn't running."""
+    parts = []
+    for name, c in hub.connectors.items():
+        n = len(c.tools)
+        parts.append(f"{name} ({n} tool{'s' if n != 1 else ''})" if c.state == "connected"
+                     else f"{name} ({'not approved' if c.state == 'waiting' else 'failed'})")
+    return ", ".join(parts)
+
+
+def ask_about_connector(coder):
+    """The question for a repository's own connector (its .mcp.json): it is a
+    program that would run on this machine, so it starts only once the user
+    agreed. In print mode nothing can be asked, so it waits."""
+    def ask(d) -> bool:
+        if PRINT_MODE:
+            return False
+        return coder.io.confirm_ask(
+            "This repository's .mcp.json adds a connector: a program that runs on this machine. Start it?",
+            subject=f"{d.name}: {d.summary()}", explicit_yes_required=True)
+    return ask
+
+
+def show_connector_problems(hub, adding: bool = False):
+    """What the user should know about their connectors without asking: one
+    that didn't start, and the room the tool lists take when that is a lot
+    (or, right after adding one, whenever the model's window is small)."""
+    if hub is None or PRINT_MODE:
+        return
+    if hub.error:
+        step(f"Connectors: {escape(hub.error)}", YELLOW)
+    for name, c in hub.connectors.items():
+        if c.state != "connected":
+            step(f"Connector [bold]{escape(name)}[/] isn't running: {escape(c.error)}", YELLOW)
+    warning = cost_warning(hub.tokens(), CONTEXT, adding)
+    if warning:
+        step(f"⚠ {escape(warning)}", YELLOW)
+
+
+def show_connectors(hub):
+    tokens = hub.tokens()
+    cost = f" [{MUTED}]· about {tokens:,} tokens of every request ({100 * tokens / CONTEXT:.1f}% of {CONTEXT // 1024}k)[/]" if tokens else ""
+    headline(f"[bold]Connectors[/]{cost}")
+    if hub.error:
+        step(escape(hub.error), YELLOW)
+    if not hub.connectors:
+        step("None yet. A connector is an MCP server whose tools the model can call.")
+        step(f"[{MUTED}]{escape(MCP_USAGE)}[/]")
+        return
+    width = max(len(n) for n in hub.connectors)
+    for name, c in hub.connectors.items():
+        d = c.definition
+        where = "yours" if d.scope == "user" else "this repo"
+        if c.state == "connected":
+            n = len(c.tools)
+            state = f"[{GREEN}]✓[/] {name:<{width}}  {f'{n} tool' + ('s' if n != 1 else ''):<9}"
+        else:
+            state = f"[{RED if c.state == 'failed' else YELLOW}]{'✗' if c.state == 'failed' else '!'}[/] {name:<{width}}  {'failed' if c.state == 'failed' else 'waiting':<9}"
+        step(f"{state}  [{MUTED}]{where:<9}[/]  {escape(d.summary()[:70])}")
+        if c.state != "connected":
+            out(f"       [{MUTED}]{escape(c.error)}[/]")
+    step(f"[{MUTED}]{escape(MCP_USAGE)}[/]")
+
+
+def show_connector_tools(hub, name: str):
+    c = hub.connectors.get(name)
+    if c is None:
+        step(f"No connector named {escape(name)}. /mcp lists them.", YELLOW)
+        return
+    if c.state != "connected":
+        step(f"{escape(name)} isn't running: {escape(c.error)}", YELLOW)
+        return
+    headline(f"[bold]{escape(name)}[/] [{MUTED}]· {len(c.tools)} tools · {escape(c.definition.summary()[:70])}[/]")
+    for t in c.tools:
+        mark = f" [{MUTED}](read-only)[/]" if t.read_only else ""
+        step(f"[{ACCENT}]{escape(t.qualified)}[/]{mark}  [{MUTED}]{escape(t.summary)}[/]")
+
+
+def reconnect_connectors(coder, adding: bool = False):
+    """Starts the connectors again from the files as they are now (after
+    /mcp add or remove, or to retry one that failed)."""
+    hub = UI.connectors
+    before = {n: (t.description, t.schema) for n, t in hub.tools().items()}
+    hub.connect(ask_about_connector(coder), before=lambda: SPIN.start("Connecting to connectors"))
+    SPIN.stop()
+    show_connectors(hub)
+    if {n: (t.description, t.schema) for n, t in hub.tools().items()} != before:
+        if UI.agent is not None:
+            UI.agent.reset_system()
+        step(f"[{MUTED}]The tool list changed: the next request is sent whole once (no prefix cache).[/]")
+    warning = cost_warning(hub.tokens(), CONTEXT, adding)
+    if warning:
+        step(f"⚠ {escape(warning)}", YELLOW)
+
+
+def mcp_command(coder, arg: str):
+    sub, _, rest = arg.partition(" ")
+    rest = rest.strip()
+    hub = UI.connectors
+    if sub in ("add", "remove", "rm"):
+        try:
+            words = shlex.split(rest)
+        except ValueError as e:
+            step(f"Couldn't read that: {escape(str(e))}", YELLOW)
+            return
+        SPIN.stop()
+        # oppx owns the connector files; told it runs inside the chat, it
+        # leaves the check and the context warning to us (below).
+        done = subprocess.run([OPPX_BIN, "mcp", "remove" if sub == "rm" else sub, *words],
+                              env={**os.environ, "OPPX_IN_CHAT": "1"})
+        if done.returncode == 0 and hub is not None:
+            reconnect_connectors(coder, adding=sub == "add")
+        elif done.returncode == 0:
+            step("Saved. Connectors are used by the default engine; this session runs --engine aider.", YELLOW)
+        return
+    if hub is None:
+        SPIN.stop()
+        subprocess.run([OPPX_BIN, "mcp", "list"])
+        step("Connectors are used by the default engine; this session runs --engine aider.", YELLOW)
+    elif sub in ("", "list"):
+        show_connectors(hub)
+    elif sub == "tools" and rest:
+        show_connector_tools(hub, rest)
+    elif sub in ("reconnect", "reload"):
+        reconnect_connectors(coder)
+    else:
+        step(f"Usage: /mcp  ·  {escape(MCP_USAGE)}", YELLOW)
 
 
 def compact(coder, instructions: str):
@@ -337,6 +477,8 @@ def translate(coder, text: str):
         step("Exit (/exit), then run oppx -r to pick a past conversation, or oppx -c for the latest.")
     elif name == "/undo":
         undo_edits()
+    elif name == "/mcp":
+        mcp_command(coder, arg)
     elif name in ("/commit", "/git"):
         step("OpenPhalanx never commits. Use git yourself: git diff, git commit.", YELLOW)
     elif name in NOT_AVAILABLE:

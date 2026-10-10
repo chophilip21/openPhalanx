@@ -22,6 +22,7 @@ Run these before every commit. CI runs the same ones.
 
 ```bash
 cargo test -p openphalanx-core && cargo test -p oppx
+~/.local/share/oppx/engine/tools/aider-chat/bin/python scripts/test_connectors.py   # MCP connectors (any Python with httpx)
 cargo clippy --workspace --all-targets -- -D warnings
 (cd app && npm install && npm run check)
 ```

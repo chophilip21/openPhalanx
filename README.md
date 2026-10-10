@@ -20,7 +20,7 @@ Run a coding model on your own Linux GPU machine and use it from any laptop on y
 
 * ✅ **Private**: your repo, tests and git stay on your laptop. Prompts go only to your own server, over TLS pinned to its certificate, and the server keeps no code.
 * ✅ **Models that fit**: the app shows which models fit your GPU, counting the KV cache and runtime memory, not just the download size.
-* ✅ **Whole-repo agent**: the agent reads your files on demand and runs your own tests and commands (after asking).
+* ✅ **Whole-repo agent**: the agent reads your files on demand and runs your own tests and commands (after asking). Add tools from any MCP server (GitHub, a database, a browser…) as connectors; you approve each call.
 * ✅ **Managed context**: when a conversation grows, older content is trimmed or summarized automatically.
 * ✅ **Web search**: the server searches the web through its own private SearXNG when a request needs current information.
 * ✅ **Clusters**: servers on one network can form a cluster and split a model too big for one GPU across them.
@@ -69,6 +69,7 @@ oppx "fix the failing test"       # start with a request
 oppx -c                           # continue the last conversation (-r to pick an older one)
 oppx -p "explain src/main.rs"     # answer once and exit
 oppx --no-web                     # without automatic web search
+oppx mcp add <name> -- <command>  # add an MCP server's tools (oppx mcp list, oppx mcp remove <name>; /mcp in the chat)
 ```
 
 Edits are never committed: review them with `git diff` and commit yourself. To remove a laptop, run `oppx unpair` (or revoke it on the app's **Devices** page).
@@ -83,7 +84,7 @@ Edits are never committed: review them with `git diff` and commit yourself. To r
 | **@file** | Add a file to the conversation |
 | **!cmd** | Run a shell command |
 | **# note** | Save a note to project memory (`OPENPHALANX.md`) |
-| **/help** | All commands (`/context`, `/init`, `/undo`, `/search`, …) |
+| **/help** | All commands (`/context`, `/init`, `/undo`, `/search`, `/mcp`, …) |
 
 ## From source
 
@@ -96,5 +97,4 @@ cargo install --path client/oppx && cargo install --path crates/openphalanx-serv
 
 ## Learn more
 
-* **[CLAUDE.md](CLAUDE.md)**: architecture, security model, clusters, the headless server, troubleshooting
-* **[Releases](https://github.com/chophilip21/openPhalanx/releases)**: downloads and changelog
+* **[CLAUDE.md](CLAUDE.md)** (architecture, security model, clusters, connectors, troubleshooting) · **[Releases](https://github.com/chophilip21/openPhalanx/releases)** (downloads and changelog)

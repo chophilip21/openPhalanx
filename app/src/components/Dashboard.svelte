@@ -29,6 +29,11 @@
   const tps = $derived(nodeSeries(sel, (s) => s.tokensPerSec));
   const running = $derived(nodeSeries(sel, (s) => s.running));
   const queued = $derived(nodeSeries(sel, (s) => s.queued));
+  const waiting = $derived(nodeSeries(sel, (s) => s.waiting));
+  const p50 = $derived(nodeSeries(sel, (s) => s.ttftP50));
+  const p95 = $derived(nodeSeries(sel, (s) => s.ttftP95));
+  const p99 = $derived(nodeSeries(sel, (s) => s.ttftP99));
+  const secs = (v: number | null) => (v == null ? "–" : v < 10 ? `${v.toFixed(2)} s` : `${v.toFixed(1)} s`);
   const rpm = $derived(nodeSeries(sel, (s) => s.requestsPerMin));
   const hit = $derived(nodeSeries(sel, (s) => (s.cacheHit == null ? null : s.cacheHit * 100)));
   const kv = $derived(nodeSeries(sel, (s) => (s.kvUsage == null ? null : s.kvUsage * 100)));
@@ -219,6 +224,26 @@
         value={lastOf(running) == null ? "–" : `${fmt(lastOf(running))} running · ${fmt(lastOf(queued))} queued`}
         series={[
           { label: "running", color: "var(--link)", points: running },
+          { label: "queued", color: "var(--busy)", points: queued },
+        ]}
+      />
+      <Chart
+        title="Time to first token"
+        value={secs(lastOf(p50))}
+        sub={lastOf(p50) == null ? "" : `median · p95 ${secs(lastOf(p95))} · p99 ${secs(lastOf(p99))}`}
+        note="streamed requests, last 5 min"
+        series={[
+          { label: "p50", color: "var(--on)", points: p50 },
+          { label: "p95", color: "var(--busy)", points: p95 },
+          { label: "p99", color: "var(--bad)", points: p99 },
+        ]}
+      />
+      <Chart
+        title="Queue depth"
+        value={lastOf(waiting) == null ? "–" : `${fmt(lastOf(waiting))} waiting · ${fmt(lastOf(queued))} queued`}
+        note="waiting: for a slot · queued: in SGLang"
+        series={[
+          { label: "waiting", color: "var(--violet)", points: waiting },
           { label: "queued", color: "var(--busy)", points: queued },
         ]}
       />

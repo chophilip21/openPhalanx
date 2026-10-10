@@ -56,6 +56,13 @@ const SEARXNG_INTERNAL_URL: &str = "http://openphalanx-searxng:8080";
 pub const SEARXNG_LOOPBACK_PORT: u16 = 9098;
 /// Prefill chunk for every rank of a split model (see `SplitRank::args`).
 pub const SPLIT_PREFILL_CHUNK: u32 = 2048;
+/// Recurrent-state slots on every rank of a split model (`--max-mamba-cache-size`;
+/// only models with linear-attention layers, such as Qwen3.6/3.8, read it).
+/// SGLang otherwise sizes the pool from each GPU's own free memory, and rank 0
+/// hands out slot numbers from its pool: with 23 slots on a 3090 and 20 on a
+/// 4090, slot 20 was out of bounds on the 4090 ("index out of bounds" in
+/// IndexKernel.cu) and the whole backend went down mid-request.
+pub const SPLIT_STATE_SLOTS: u32 = 16;
 /// A member's share of a split model (a headless SGLang rank, no gateway).
 pub const WORKER_CONTAINER: &str = "openphalanx-worker";
 const MANAGED_LABEL: &str = "io.openphalanx.managed";
@@ -298,7 +305,8 @@ impl SplitRank {
         // handed a bigger chunk than its own fails to reshape it. 2048 is
         // the smaller default, so activations fit the smaller cards.
         format!(
-            "--pp-size {n} --nnodes {n} --node-rank {r} --dist-init-addr {a} --chunked-prefill-size {SPLIT_PREFILL_CHUNK}",
+            "--pp-size {n} --nnodes {n} --node-rank {r} --dist-init-addr {a} --chunked-prefill-size {SPLIT_PREFILL_CHUNK} \
+             --max-mamba-cache-size {SPLIT_STATE_SLOTS}",
             n = self.nnodes,
             r = self.rank,
             a = self.dist_init_addr
@@ -726,7 +734,7 @@ mod tests {
         assert!(a.contains("-e NCCL_SOCKET_IFNAME=eno1") && a.contains("-e GLOO_SOCKET_IFNAME=eno1"));
         assert!(a.contains(
             "-e SGLANG_EXTRA_ARGS=--pp-size 2 --nnodes 2 --node-rank 0 --dist-init-addr 192.168.1.77:9100 \
-             --chunked-prefill-size 2048 --reasoning-parser qwen3"
+             --chunked-prefill-size 2048 --max-mamba-cache-size 16 --reasoning-parser qwen3"
         ));
     }
 
@@ -750,7 +758,7 @@ mod tests {
         assert!(a.contains("--entrypoint /opt/openphalanx/start-sglang.sh"), "no gateway on a worker");
         assert!(a.contains("--label io.openphalanx.run=r1"));
         assert!(a.contains("--node-rank 1") && a.contains("-v /m:/m:ro"));
-        assert!(a.contains("--chunked-prefill-size 2048 --dtype bfloat16"), "same dtype as rank 0: {a}");
+        assert!(a.contains("--chunked-prefill-size 2048 --max-mamba-cache-size 16 --dtype bfloat16"), "same settings as rank 0: {a}");
         assert!(!a.contains("ADMIN_TOKEN"));
     }
 

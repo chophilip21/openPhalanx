@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 
 use oppx::config::{self, Config, Server};
 use oppx::proxy::Proxy;
-use oppx::{agent, api, tls, ui};
+use oppx::{agent, api, mcp, tls, ui};
 
 #[derive(Parser)]
 #[command(
@@ -73,6 +73,8 @@ struct Launch {
     initial: Option<String>,
     print: bool,
     session: SessionChoice,
+    /// The user's connectors file, for the chat's MCP client.
+    connectors: PathBuf,
 }
 
 enum SessionChoice {
@@ -165,6 +167,25 @@ enum Command {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Connectors: MCP servers whose tools the model can call in the chat.
+    ///
+    /// A connector is a program on this machine or a URL that offers tools
+    /// (GitHub, a database, a browser…). The chat lists them for the model,
+    /// and asks you before each call. In the chat, `/mcp` does the same.
+    ///
+    /// Examples:
+    ///   oppx mcp add github -e GITHUB_TOKEN=… -- npx -y @modelcontextprotocol/server-github
+    ///   oppx mcp add docs --url https://mcp.example.com/mcp -H "Authorization: Bearer …"
+    ///   oppx mcp list
+    ///   oppx mcp remove github
+    ///
+    /// Each connector's tool list is sent with every request, so on a model
+    /// with a small context window add only the ones you need.
+    #[command(verbatim_doc_comment)]
+    Mcp {
+        #[command(subcommand)]
+        action: Option<McpCommand>,
+    },
     /// List paired servers (tokens are never shown).
     Servers,
     /// Set the default server.
@@ -172,6 +193,48 @@ enum Command {
         /// Server name, as listed by `oppx servers`.
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// Add a connector: a command to run (after `--`), or a URL.
+    ///
+    /// oppx mcp add github -e GITHUB_TOKEN=… -- npx -y @modelcontextprotocol/server-github
+    /// oppx mcp add docs --url https://mcp.example.com/mcp
+    #[command(verbatim_doc_comment)]
+    Add {
+        /// A short name; the model sees its tools as <name>.<tool>.
+        name: String,
+        /// A connector reached over HTTP (MCP's streamable HTTP), instead of a command.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Environment for the command; repeat for more. `${VAR}` in a value is read from your shell at start.
+        #[arg(long, short = 'e', value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// A header for --url, e.g. "Authorization: Bearer …"; repeat for more.
+        #[arg(long, short = 'H', value_name = "NAME: VALUE")]
+        header: Vec<String>,
+        /// Save it in this repository's .mcp.json (shared with the repo) instead of your own list.
+        #[arg(long)]
+        project: bool,
+        /// Replace a connector with the same name.
+        #[arg(long)]
+        force: bool,
+        /// The command that starts the connector, and its arguments.
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+    /// Remove a connector (yours, or this repository's with --project).
+    #[command(alias = "rm")]
+    Remove {
+        name: String,
+        /// Remove it from this repository's .mcp.json.
+        #[arg(long)]
+        project: bool,
+    },
+    /// Show the connectors you added and this repository's (the default).
+    #[command(alias = "ls")]
+    List,
 }
 
 #[tokio::main]
@@ -196,6 +259,7 @@ fn welcome(cfg: &Config) {
         &[
             ("oppx", "start coding in the current repo (--no-web: no web search)"),
             ("oppx search \"query\"", "search the web through the server"),
+            ("oppx mcp add <name> -- <cmd>", "add a connector (MCP server) for the chat"),
             ("oppx status", "check the connection and the model"),
             ("oppx servers", "list paired servers"),
         ]
@@ -228,6 +292,7 @@ async fn run(cli: Cli) -> Result<()> {
                 bail!("-p needs a prompt, e.g. oppx -p \"explain src/main.rs\"");
             }
             let launch = Launch {
+                connectors: mcp::user_path(&path),
                 web: !cli.no_web,
                 classic: cli.classic,
                 engine: cli.engine.clone(),
@@ -269,6 +334,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Aider { server, no_web, web: _, args } => {
             let launch = Launch {
+                connectors: mcp::user_path(&path),
                 web: !no_web,
                 classic: true,
                 engine: "aider".into(),
@@ -281,6 +347,14 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Proxy { name, port, no_web, web: _ } => run_proxy(&cfg, name.as_deref(), port, !no_web).await?,
         Command::Search { query, max, server } => run_search(&cfg, server.as_deref(), &query.join(" "), max).await?,
+        Command::Mcp { action } => match action.unwrap_or(McpCommand::List) {
+            McpCommand::Add { name, url, env, header, project, force, command } => {
+                let spec = mcp::spec(url.as_deref(), &command, &env, &header)?;
+                mcp_add(&cfg, &path, &name, spec, project, force, !env.is_empty() || !header.is_empty()).await?
+            }
+            McpCommand::Remove { name, project } => mcp_remove(&path, &name, project)?,
+            McpCommand::List => mcp_list(&path)?,
+        },
         Command::Servers => {
             if cfg.servers.is_empty() {
                 println!("No servers paired yet. Pair with: {}", ui::accent("oppx pair <server> <code>"));
@@ -310,6 +384,128 @@ async fn run(cli: Cli) -> Result<()> {
             ui::line(ui::ok("default", &name));
         }
     }
+    Ok(())
+}
+
+/// The context window of the default server's model, to judge what a
+/// connector costs: from the chat when it runs us (`/mcp add`), otherwise
+/// asked from the server, briefly. `None`: not paired, or it isn't answering.
+async fn server_context(cfg: &Config) -> Option<u64> {
+    if let Some(ctx) = std::env::var("OPPX_CONTEXT").ok().and_then(|c| c.parse().ok()) {
+        return Some(ctx);
+    }
+    let (_, s) = cfg.server(None).ok()?;
+    let client = tls::pinned_client(&s.fingerprint).ok()?;
+    let ask = async {
+        match api::info(&client, &s.url, &s.token).await {
+            Ok(Some(i)) => Some(i.context_length),
+            _ => api::context_len(&client, &s.url, &s.token).await.ok().flatten(),
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(4), ask).await.ok().flatten()
+}
+
+async fn mcp_add(cfg: &Config, config: &std::path::Path, name: &str, spec: serde_json::Value, project: bool, force: bool, secrets: bool) -> Result<()> {
+    mcp::validate_name(name)?;
+    let root = mcp::project_root(&std::env::current_dir()?);
+    let user_file = mcp::user_path(config);
+    let path = if project { root.join(mcp::PROJECT_FILE) } else { user_file.clone() };
+    let mut file = mcp::File::load(&path, !project)?;
+    if file.get(name).is_some() && !force {
+        bail!("a connector named \"{name}\" is already in {}; use --force to replace it", path.display());
+    }
+    file.insert(name, spec.clone());
+    file.save()?;
+    ui::line(ui::ok("added", format!("{name}  {}", ui::dim(mcp::describe(&spec)))));
+    println!("  {}", ui::dim(format!("saved in {}", path.display())));
+    if project {
+        if secrets {
+            ui::warning(format!(
+                "{} is usually committed with the repository: keep secrets out of it. Write ${{VAR}} as the value \
+                 and set VAR in your shell.",
+                mcp::PROJECT_FILE
+            ));
+        }
+        if mcp::File::load(&user_file, true)?.get(name).is_some() {
+            ui::warning(format!("you also have your own connector named \"{name}\"; yours is the one the chat uses."));
+        }
+    }
+    // Inside the chat (/mcp add), the chat connects to it right away and
+    // reports on it with the numbers of the whole session.
+    if std::env::var_os("OPPX_IN_CHAT").is_some() {
+        return Ok(());
+    }
+    let sp = ui::spinner(format!("Starting {name}"));
+    let (probe, ctx) = tokio::join!(mcp::probe(name, &root, &user_file, project), server_context(cfg));
+    sp.clear();
+    let tokens = match &probe {
+        Some(p) if p.ok => {
+            let tools = format!("{} tool{}", p.tools, if p.tools == 1 { "" } else { "s" });
+            ui::line(ui::ok("connected", format!("{tools} · {}", mcp::cost(p.tokens, ctx))));
+            Some(p.tokens)
+        }
+        Some(p) => {
+            ui::line(ui::bad("not running", &p.error));
+            println!(
+                "  {}",
+                ui::dim(format!("It is saved as written. Fix it with: oppx mcp add {name} --force …   or drop it: oppx mcp remove {name}"))
+            );
+            None
+        }
+        None => None, // no engine yet: the chat checks it at its first start
+    };
+    if let Some(w) = mcp::context_warning(ctx, tokens) {
+        ui::warning(w);
+    }
+    println!("  Next: {} uses it in the chat  ·  {}", ui::accent("oppx"), ui::accent("oppx mcp list"));
+    Ok(())
+}
+
+fn mcp_remove(config: &std::path::Path, name: &str, project: bool) -> Result<()> {
+    let root = mcp::project_root(&std::env::current_dir()?);
+    let mut files = Vec::new();
+    if !project {
+        files.push(mcp::File::load(&mcp::user_path(config), true)?);
+    }
+    // Without --project, a name that is only in the repository's file is removed there.
+    files.push(mcp::File::load(&root.join(mcp::PROJECT_FILE), false)?);
+    for mut file in files {
+        if file.remove(name) {
+            file.save()?;
+            ui::line(ui::ok("removed", format!("{name}  {}", ui::dim(format!("from {}", file.path.display())))));
+            return Ok(());
+        }
+    }
+    bail!("no connector named \"{name}\"; `oppx mcp list` shows them");
+}
+
+fn mcp_list(config: &std::path::Path) -> Result<()> {
+    let root = mcp::project_root(&std::env::current_dir()?);
+    let user_file = mcp::user_path(config);
+    let mine = mcp::File::load(&user_file, true)?.servers();
+    let repo = mcp::File::load(&root.join(mcp::PROJECT_FILE), false)?.servers();
+    if mine.is_empty() && repo.is_empty() {
+        println!("No connectors yet. A connector is an MCP server whose tools the model can call in the chat.");
+        println!("  Add one: {}", ui::accent("oppx mcp add <name> -- <command> [args]"));
+        println!("       or: {}", ui::accent("oppx mcp add <name> --url https://…"));
+        return Ok(());
+    }
+    let mut rows = Vec::new();
+    for (name, spec) in &mine {
+        rows.push(format!("{name:<16} {} {}", ui::dim(format!("{:<10}", "yours")), mcp::describe(spec)));
+    }
+    for (name, spec) in &repo {
+        // On a shared name the user's own connector is the one that runs.
+        let hidden = mine.iter().any(|(n, _)| n == name);
+        let what = if hidden { ui::dim(format!("{} (yours is used instead)", mcp::describe(spec))) } else { mcp::describe(spec) };
+        rows.push(format!("{name:<16} {} {what}", ui::dim(format!("{:<10}", "this repo"))));
+    }
+    ui::panel("Connectors", &rows);
+    println!("  {}", ui::dim(format!("yours: {}", user_file.display())));
+    if !repo.is_empty() {
+        println!("  {}", ui::dim(format!("this repo: {}", root.join(mcp::PROJECT_FILE).display())));
+    }
+    println!("  {}", ui::dim("In the chat, /mcp shows each connector's tools and what they cost per request."));
     Ok(())
 }
 
@@ -795,6 +991,7 @@ async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args:
             .env("OPPX_REASONING", if info.reasoning { "1" } else { "0" })
             .env("OPPX_WEB", if web { "1" } else { "0" })
             .env("OPPX_ENGINE", &launch.engine)
+            .env("OPPX_MCP_CONFIG", &launch.connectors)
             .env("OPPX_VERSION", env!("CARGO_PKG_VERSION"))
             .env("OPPX_BIN", std::env::current_exe().unwrap_or_else(|_| "oppx".into()))
             .env("OPPX_PRINT", if launch.print { "1" } else { "0" })

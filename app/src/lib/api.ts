@@ -32,6 +32,13 @@ export type AdminStatus = {
     web_searches: number;
     auto_routed: number;
     auto_searched: number;
+    /** Held back by the gateway's limits, before SGLang sees them. */
+    requests_waiting: number;
+    /** Time to first token (seconds) over the streamed requests of the last 5 minutes; null without any. */
+    ttft_p50: number | null;
+    ttft_p95: number | null;
+    ttft_p99: number | null;
+    ttft_samples: number;
   };
   inference: {
     prompt_tokens_total?: number | null;

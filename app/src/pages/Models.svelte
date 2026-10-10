@@ -149,6 +149,7 @@
   // Filters.
   let family = $state("All");
   let fitsOnly = $state(false);
+  let downloadedOnly = $state(false);
   // Search over everything a row shows as text; typos are forgiven (see fuzzyFilter).
   let query = $state("");
   const found = $derived(
@@ -166,9 +167,11 @@
     found.filter(
       (r) =>
         (family === "All" || (r.family ?? "Custom") === family) &&
-        (!fitsOnly || (r.fit != null && r.fit.fit !== "insufficient")),
+        (!fitsOnly || (r.fit != null && r.fit.fit !== "insufficient")) &&
+        (!downloadedOnly || r.installed_dir != null),
     ),
   );
+  const downloadedCount = $derived((view?.rows ?? []).filter((r) => r.installed_dir != null).length);
   const fitting = $derived((view?.rows ?? []).filter((r) => r.fit != null && r.fit.fit !== "insufficient").length);
 
   // Sorting (newest first by default) and pages of PAGE_SIZE.
@@ -195,7 +198,7 @@
   const pageRows = $derived(sorted.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE));
   // A new filter or order starts from the first page.
   $effect(() => {
-    void [query, family, fitsOnly, sortKey, descending];
+    void [query, family, fitsOnly, downloadedOnly, sortKey, descending];
     page = 0;
   });
   function goPage(p: number) {
@@ -300,10 +303,16 @@
         <option value="size:asc">Smallest first</option>
       </select>
     </label>
-    <label class="fits-only">
-      <input type="checkbox" bind:checked={fitsOnly} />
-      Only models that fit ({fitting})
-    </label>
+    <div class="checks">
+      <label class="fits-only">
+        <input type="checkbox" bind:checked={fitsOnly} />
+        Only models that fit ({fitting})
+      </label>
+      <label class="fits-only">
+        <input type="checkbox" bind:checked={downloadedOnly} />
+        Only downloaded models ({downloadedCount})
+      </label>
+    </div>
   </div>
 
   {#if error}<Notice onclose={() => (error = "")}>{error}</Notice>{/if}
@@ -470,20 +479,23 @@
   .ctx-help { margin: 4px 0 0; font-size: 12.5px; max-width: 900px; }
   .ctx-model { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 13px; border-top: 1px solid var(--border); padding-top: 10px; }
   .filters { display: flex; align-items: center; gap: 10px 20px; flex-wrap: wrap; margin-bottom: 4px; }
-  /* The search box takes the space the rest leaves; whatever doesn't fit
-     wraps to the next line, left-aligned. */
+  /* The search box grows with the window, between 280 and 460px; whatever
+     doesn't fit beside it wraps to the next line, left-aligned. */
   .fits-only { display: flex; gap: 8px; align-items: center; font-size: 13px; cursor: pointer; }
-  .search { position: relative; display: flex; align-items: center; flex: 1 1 240px; min-width: 0; }
+  .checks { display: flex; gap: 8px 20px; flex-wrap: wrap; }
+  .search { position: relative; display: flex; align-items: center; flex: 1 1 280px; max-width: 460px; min-width: 0; }
   .search :global(svg) { position: absolute; left: 9px; color: var(--muted); pointer-events: none; }
   .search input { width: 100%; min-width: 0; padding: 5px 8px 5px 30px; font-size: 13px; }
   .pick { display: flex; gap: 8px; align-items: center; min-width: 0; }
   .pick select { padding: 5px 8px; font-size: 13px; min-width: 0; max-width: 100%; }
-  /* Narrow: search on its own line, the two pickers share the next one. */
+  /* Narrow: the search box fills what the pickers leave of the first line
+     (the whole line once they no longer fit beside it), the pickers share a
+     line evenly, and the checkboxes go under them. */
   @media (max-width: 1100px) {
-    .search { flex-basis: 100%; }
-    .pick { flex: 1 1 180px; }
+    .search { max-width: none; }
+    .pick { flex: 1 1 170px; }
     .pick select { flex: 1; }
-    .fits-only { flex-basis: 100%; }
+    .checks { flex-basis: 100%; }
   }
   .th-sort { border: none; background: none; padding: 0; font: inherit; letter-spacing: inherit; text-transform: inherit; color: inherit; text-align: left; cursor: pointer; }
   .th-sort:hover { color: var(--text); }

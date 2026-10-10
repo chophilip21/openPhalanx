@@ -1567,6 +1567,25 @@ async fn send_invite(target: &Peer, msg: InviteMsg) -> Result<()> {
     Ok(())
 }
 
+/// Why a member running `member_version` can't take part in a split model
+/// this server hosts, or `None` when it can. Every rank must run the same
+/// release: the worker order, the image it builds and SGLang's arguments
+/// change between releases (a 0.3.0 member failed inside the worker with
+/// "the backend image … isn't on this machine").
+pub fn split_version_problem(member: &str, member_version: &str) -> Option<String> {
+    let ours = env!("CARGO_PKG_VERSION");
+    let parse = |v: &str| -> Option<Vec<u64>> { v.split('.').map(|n| n.parse().ok()).collect() };
+    match (parse(member_version), parse(ours)) {
+        (Some(m), Some(o)) if m == o => None,
+        (Some(m), Some(o)) if m > o => Some(format!(
+            "{member} runs OpenPhalanx {member_version}, newer than this server's {ours}. Update this server to the same version to split a model with it."
+        )),
+        _ => Some(format!(
+            "{member} runs OpenPhalanx {member_version}, but this server runs {ours}. Update {member} to the same version to split a model with it."
+        )),
+    }
+}
+
 /// `AB:CD:…` (first 8 bytes), as the apps show it.
 pub fn short_fingerprint(fp: &str) -> String {
     pinned_tls::short(fp)
@@ -2029,6 +2048,17 @@ async fn leave_handler(State(c): State<Arc<Cluster>>, headers: HeaderMap) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_split_needs_the_same_release_on_every_server() {
+        let ours = env!("CARGO_PKG_VERSION");
+        assert_eq!(split_version_problem("laptop", ours), None);
+        let old = split_version_problem("laptop", "0.3.0").expect("older member");
+        assert!(old.contains("laptop runs OpenPhalanx 0.3.0") && old.contains("Update laptop"), "{old}");
+        let new = split_version_problem("laptop", "99.0.0").expect("newer member");
+        assert!(new.contains("Update this server"), "{new}");
+        assert!(split_version_problem("laptop", "").is_some(), "an unknown version is refused");
+    }
 
     fn cluster() -> (tempfile::TempDir, Arc<Cluster>) {
         let dir = tempfile::tempdir().unwrap();

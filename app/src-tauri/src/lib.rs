@@ -460,6 +460,9 @@ fn plan_split(state: &AppState, settings: &Settings, pf: &mut server::Preflight)
         let members = c.members();
         for n in pool.iter().filter(|n| !n.this) {
             let Some(r) = members.iter().find(|m| m.id == n.id).and_then(|m| m.report.as_ref()) else { continue };
+            if let Some(problem) = openphalanx_core::cluster::split_version_problem(&n.name, &r.inventory.version) {
+                return Err(problem);
+            }
             if !r.inventory.nvidia_runtime {
                 return Err(format!(
                     "{} can't run GPU containers yet: install the NVIDIA Container Toolkit there \
