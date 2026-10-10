@@ -21,6 +21,8 @@ pub struct ResolvedModel {
     pub repo: Option<String>,
     pub revision: Option<String>,
     pub installed_dir: Option<PathBuf>,
+    /// The installed copy's files are damaged (what's wrong); it can't be started.
+    pub broken: Option<String>,
     pub weight_bytes: u64,
     pub arch: ArchSpec,
     pub max_context: u32,
@@ -31,6 +33,9 @@ pub struct ResolvedModel {
     pub reasoning_parser: Option<String>,
     /// SGLang `--dtype` override (catalog data).
     pub dtype: Option<String>,
+    /// Long-context mode, when the user turned it on (`settings.long_context`);
+    /// `max_context` already counts it.
+    pub yarn: Option<catalog::Yarn>,
 }
 
 /// Edit format when the catalog doesn't name one.
@@ -39,6 +44,12 @@ pub const DEFAULT_EDIT_FORMAT: &str = "diff";
 impl ResolvedModel {
     pub fn context_len(&self, wanted: u32) -> u32 {
         wanted.min(self.max_context)
+    }
+
+    /// YaRN for this context: only above the native window (it can slightly
+    /// lower quality on short inputs, so it stays off when not needed).
+    pub fn rope_override(&self, context_len: u32) -> Option<catalog::Yarn> {
+        self.yarn.filter(|y| context_len > y.original_max)
     }
 
     /// Conservative VRAM need on a GPU with the given compute capability.
@@ -53,6 +64,29 @@ impl ResolvedModel {
     }
 }
 
+#[cfg(test)]
+mod yarn_tests {
+    use super::*;
+
+    #[test]
+    fn yarn_only_above_the_native_window() {
+        let mut settings = Settings::default();
+        let key = "catalog:Qwen/Qwen2.5-Coder-14B-Instruct-AWQ";
+        // Off unless the user asks for it.
+        let off = resolve(&settings, key).unwrap();
+        assert_eq!(off.max_context, 32_768, "native window only");
+        assert!(off.yarn.is_none() && off.rope_override(65_536).is_none());
+        settings.long_context = true;
+        let m = resolve(&settings, key).unwrap();
+        assert_eq!(m.max_context, 65_536, "native × factor");
+        assert!(m.rope_override(32_768).is_none(), "off at the native window");
+        let y = m.rope_override(36_864).expect("on above it");
+        assert_eq!((y.factor, y.rope_theta), (2.0, 1e6));
+        let plain = resolve(&settings, "catalog:openai/gpt-oss-20b").unwrap();
+        assert!(plain.yarn.is_none() && plain.rope_override(131_072).is_none());
+    }
+}
+
 pub fn catalog_key(id: &str) -> String {
     format!("catalog:{id}")
 }
@@ -62,21 +96,25 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
         let e = catalog::find(id)?;
         let installed_dir = model::find_installed(&e.id, Some(&e.revision))
             .or_else(|| model::find_installed(&e.id, None));
+        // Opt-in: without the setting the model keeps its native window.
+        let yarn = e.yarn.filter(|_| settings.long_context);
         return Some(ResolvedModel {
             key: key.to_string(),
             label: e.name.clone(),
             quant: Some(e.quant.clone()),
             repo: Some(e.id.clone()),
             revision: Some(e.revision.clone()),
+            broken: installed_dir.as_deref().and_then(model::broken),
             installed_dir,
             weight_bytes: e.weight_bytes,
             arch: e.arch,
-            max_context: e.max_context,
+            max_context: yarn.map_or(e.max_context, |y| y.max_context().max(e.max_context)),
             min_compute_capability: e.min_compute_capability,
             model_id: e.id.clone(),
             edit_format: e.edit_format.clone(),
             reasoning_parser: e.reasoning_parser.clone(),
             dtype: e.dtype.clone(),
+            yarn,
         });
     }
     let c = settings.custom_models.iter().find(|c| c.key == key)?;
@@ -90,6 +128,7 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
         quant: c.quant.clone(),
         repo: c.repo.clone(),
         revision: c.revision.clone(),
+        broken: installed.then(|| model::broken(&c.dir)).flatten(),
         installed_dir: installed.then(|| c.dir.clone()),
         weight_bytes: c.weight_bytes,
         arch: c.arch,
@@ -99,6 +138,7 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
         edit_format: None,
         reasoning_parser: None,
         dtype: None,
+        yarn: None,
     })
 }
 
@@ -205,6 +245,16 @@ pub async fn preflight(settings: &Settings) -> Preflight {
         Some(m) if m.installed_dir.is_none() => {
             checks.push(Check::new("model", "Model", Fail, format!("{} is not downloaded yet.", m.label)))
         }
+        Some(m) if m.broken.is_some() => checks.push(Check::new(
+            "model",
+            "Model",
+            Fail,
+            format!(
+                "{}'s files are broken ({}). Delete it on the Models page and download it again.",
+                m.label,
+                m.broken.as_deref().unwrap_or_default()
+            ),
+        )),
         Some(m) => checks.push(Check::new("model", "Model", Pass, format!("{} · {}", m.label, m.quant.clone().unwrap_or_default()))),
     }
 
@@ -267,19 +317,26 @@ pub struct SplitStart {
     pub stage: crate::split::Stage,
 }
 
-pub async fn start(
+pub async fn start(settings: &Settings, split: Option<SplitStart>, on_progress: impl FnMut(StartProgress)) -> Result<()> {
+    start_with(settings, split, false, on_progress).await
+}
+
+/// `start`, with `force`: start although the model doesn't fit the free
+/// VRAM. The user accepted that it may fail to load or crash under load.
+pub async fn start_with(
     settings: &Settings,
     split: Option<SplitStart>,
+    force: bool,
     mut on_progress: impl FnMut(StartProgress),
 ) -> Result<()> {
     on_progress(StartProgress::Checking);
     let pf = preflight(settings).await;
     // Split: this GPU only holds its stage, checked below instead of the
-    // whole model.
+    // whole model. Forced: the VRAM check is the one being overridden.
     let blocking = pf
         .checks
         .iter()
-        .find(|c| c.status == CheckStatus::Fail && !(split.is_some() && c.id == "vram"));
+        .find(|c| c.status == CheckStatus::Fail && !((split.is_some() || force) && c.id == "vram"));
     if let Some(check) = blocking {
         bail!(check.detail.clone());
     }
@@ -319,11 +376,11 @@ pub async fn start(
         None => model.requirement(settings.context_len, gpu.compute_capability),
     };
     let fit = vram::check(&req, gpu.free_bytes);
-    if fit.fit == Fit::Insufficient {
-        bail!(fit.message);
-    }
-    let fraction = vram::mem_fraction_static(&req, gpu.free_bytes, gpu.total_bytes)
-        .ok_or_else(|| anyhow::anyhow!(fit.message.clone()))?;
+    let fraction = match vram::mem_fraction_static(&req, gpu.free_bytes, gpu.total_bytes) {
+        Some(f) if fit.fit != Fit::Insufficient => f,
+        _ if force => vram::mem_fraction_forced(&req, gpu.free_bytes),
+        _ => bail!(fit.message),
+    };
 
     let state_dir = paths::backend_state_dir();
     std::fs::create_dir_all(&state_dir)?;
@@ -356,6 +413,7 @@ pub async fn start(
         edit_format: model.edit_format.clone().unwrap_or_else(|| DEFAULT_EDIT_FORMAT.to_string()),
         reasoning_parser: model.reasoning_parser.clone(),
         dtype: model.dtype.clone(),
+        yarn: model.rope_override(req.context_len),
         pairing_ttl_days: settings.pairing_ttl_days,
         split: split.map(|s| s.rank),
     })

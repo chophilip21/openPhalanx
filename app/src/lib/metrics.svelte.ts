@@ -13,6 +13,10 @@ export type Sample = {
   tokensPerSec: number | null;
   running: number | null; // requests being generated
   queued: number | null; // requests waiting in SGLang's queue
+  waiting: number | null; // requests the gateway holds back (its per-device and server-wide limits)
+  ttftP50: number | null; // seconds to the first token, streamed requests of the last 5 minutes
+  ttftP95: number | null;
+  ttftP99: number | null;
   requestsPerMin: number | null;
   cacheHit: number | null; // share of prompt tokens served from cache in this interval
   kvUsage: number | null; // KV cache in use (0..1)
@@ -150,6 +154,10 @@ function sample(
     tokensPerSec: gateway ? (inf?.gen_throughput ?? 0) : null,
     running: gateway ? (inf?.running_requests ?? gateway.requests_active) : null,
     queued: gateway ? (inf?.queued_requests ?? 0) : null,
+    waiting: gateway ? (gateway.requests_waiting ?? 0) : null,
+    ttftP50: gateway?.ttft_p50 ?? null,
+    ttftP95: gateway?.ttft_p95 ?? null,
+    ttftP99: gateway?.ttft_p99 ?? null,
     requestsPerMin,
     cacheHit,
     kvUsage: inf?.token_usage ?? null,

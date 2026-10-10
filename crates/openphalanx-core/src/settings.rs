@@ -41,6 +41,10 @@ pub struct Settings {
     /// Days a client's pairing lasts before it must pair again; `None`:
     /// never expires. Default one week.
     pub pairing_ttl_days: Option<u32>,
+    /// Let models with a long-context mode (the catalog's `yarn`) go past
+    /// their native window. Off by default: recall beyond the window is
+    /// clearly worse than inside it (measured; see CLAUDE.md).
+    pub long_context: bool,
 }
 
 /// The choices the app offers for `pairing_ttl_days`.
@@ -57,6 +61,7 @@ impl Default for Settings {
             custom_models: Vec::new(),
             web_search: true,
             pairing_ttl_days: Some(7),
+            long_context: false,
         }
     }
 }

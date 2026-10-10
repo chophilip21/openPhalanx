@@ -1,6 +1,6 @@
 //! Clusters of Openphalanx servers on one network.
 //!
-//! Every server (the app, or the headless `openphalanx-server`) runs this
+//! Every server (the app, or the headless `oppxs`) runs this
 //! service. It announces itself on the LAN, lists the other servers it can
 //! actually reach, and can form a cluster with them:
 //!
@@ -152,6 +152,10 @@ pub struct WorkerOrder {
     /// SGLang `--dtype` override; every rank must use rank 0's.
     #[serde(default)]
     pub dtype: Option<String>,
+    /// YaRN rope scaling, as rank 0 runs it (three numbers; the member builds
+    /// the SGLang argument itself).
+    #[serde(default)]
+    pub yarn: Option<crate::catalog::Yarn>,
     /// Its rank; the member fills in its own network interface.
     pub rank: crate::docker::SplitRank,
     pub stage: crate::split::Stage,
@@ -178,6 +182,9 @@ impl WorkerOrder {
             if !["auto", "half", "float16", "bfloat16", "float", "float32"].contains(&d.as_str()) {
                 bail!("the host asked for an unknown dtype \"{d}\"");
             }
+        }
+        if let Some(y) = &self.yarn {
+            y.check().map_err(|e| anyhow::anyhow!("the host sent {e:#}"))?;
         }
         let p = &self.rank.partition;
         if p.is_empty() || !p.split(',').all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
@@ -813,6 +820,11 @@ impl Cluster {
                     .timeout(Duration::from_secs(2))
                     .send()
                     .await;
+            }
+            // Its share of a split model goes with it: the host pauses on the
+            // goodbye, and a worker left behind would only hold the GPU.
+            if self.worker.lock().unwrap().take().is_some() {
+                let _ = crate::docker::remove_worker().await;
             }
         }
     }
@@ -1555,6 +1567,25 @@ async fn send_invite(target: &Peer, msg: InviteMsg) -> Result<()> {
     Ok(())
 }
 
+/// Why a member running `member_version` can't take part in a split model
+/// this server hosts, or `None` when it can. Every rank must run the same
+/// release: the worker order, the image it builds and SGLang's arguments
+/// change between releases (a 0.3.0 member failed inside the worker with
+/// "the backend image … isn't on this machine").
+pub fn split_version_problem(member: &str, member_version: &str) -> Option<String> {
+    let ours = env!("CARGO_PKG_VERSION");
+    let parse = |v: &str| -> Option<Vec<u64>> { v.split('.').map(|n| n.parse().ok()).collect() };
+    match (parse(member_version), parse(ours)) {
+        (Some(m), Some(o)) if m == o => None,
+        (Some(m), Some(o)) if m > o => Some(format!(
+            "{member} runs OpenPhalanx {member_version}, newer than this server's {ours}. Update this server to the same version to split a model with it."
+        )),
+        _ => Some(format!(
+            "{member} runs OpenPhalanx {member_version}, but this server runs {ours}. Update {member} to the same version to split a model with it."
+        )),
+    }
+}
+
 /// `AB:CD:…` (first 8 bytes), as the apps show it.
 pub fn short_fingerprint(fp: &str) -> String {
     pinned_tls::short(fp)
@@ -1597,7 +1628,8 @@ impl Cluster {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let base = ModelSync { label: spec.label.clone(), repo: spec.repo.clone(), revision: spec.revision.clone(), ..Default::default() };
-        if crate::model::find_installed(&spec.repo, Some(&spec.revision)).is_some() {
+        // A damaged copy counts as missing: downloading again repairs it.
+        if crate::model::find_installed(&spec.repo, Some(&spec.revision)).is_some_and(|d| crate::model::broken(&d).is_none()) {
             *self.sync.lock().unwrap() = Some(ModelSync { state: "ready".into(), ..base });
             self.log(format!("{} is already on this machine", spec.label));
             return;
@@ -1820,6 +1852,9 @@ async fn start_worker(order: &WorkerOrder) -> Result<()> {
     order.check()?;
     let dir = crate::model::find_installed(&order.model.repo, Some(&order.model.revision))
         .with_context(|| format!("{} isn't on this machine yet", order.model.label))?;
+    if let Some(why) = crate::model::broken(&dir) {
+        bail!("{}'s files are broken on this machine ({why}); delete it and download it again", order.model.label);
+    }
     // Built here like on the host (the first time this downloads the SGLang
     // base image, ~16 GB); the host shows the worker as starting meanwhile.
     crate::docker::ensure_image(&order.image, |_| {}).await?;
@@ -1848,6 +1883,7 @@ async fn start_worker(order: &WorkerOrder) -> Result<()> {
         context_len: order.context_len,
         split: rank,
         dtype: order.dtype.clone(),
+        yarn: order.yarn,
         run_id: order.run_id.clone(),
     })
     .await
@@ -2012,6 +2048,17 @@ async fn leave_handler(State(c): State<Arc<Cluster>>, headers: HeaderMap) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_split_needs_the_same_release_on_every_server() {
+        let ours = env!("CARGO_PKG_VERSION");
+        assert_eq!(split_version_problem("laptop", ours), None);
+        let old = split_version_problem("laptop", "0.3.0").expect("older member");
+        assert!(old.contains("laptop runs OpenPhalanx 0.3.0") && old.contains("Update laptop"), "{old}");
+        let new = split_version_problem("laptop", "99.0.0").expect("newer member");
+        assert!(new.contains("Update this server"), "{new}");
+        assert!(split_version_problem("laptop", "").is_some(), "an unknown version is refused");
+    }
 
     fn cluster() -> (tempfile::TempDir, Arc<Cluster>) {
         let dir = tempfile::tempdir().unwrap();
@@ -2335,6 +2382,7 @@ mod tests {
             },
             image: crate::docker::default_image(),
             context_len: 32768,
+            yarn: None,
             dtype: Some("bfloat16".into()),
             rank: crate::docker::SplitRank {
                 rank: 1,
@@ -2367,6 +2415,9 @@ mod tests {
             o.check().is_err()
         };
         assert!(bad(|o| o.dtype = Some("bfloat16 --trust-remote-code".into())), "flag smuggled in dtype");
+        assert!(bad(|o| o.yarn = Some(crate::catalog::Yarn { factor: 1e9, original_max: 32768, rope_theta: 1e6 })), "absurd YaRN factor");
+        assert!(bad(|o| o.yarn = Some(crate::catalog::Yarn { factor: f32::NAN, original_max: 32768, rope_theta: 1e6 })));
+        assert!(bad(|o| o.yarn = Some(crate::catalog::Yarn { factor: 4.0, original_max: 32768, rope_theta: 0.0 })), "no RoPE base");
         assert!(bad(|o| o.rank.partition = "40,24 --trust-remote-code".into()));
         assert!(bad(|o| o.rank.partition = String::new()));
         assert!(bad(|o| o.rank.dist_init_addr = "1.2.3.4:9100 --enable-x".into()));

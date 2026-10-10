@@ -242,7 +242,7 @@
     {#if cluster.discovery_error}
       <p class="warn small">{cluster.discovery_error}</p>
     {:else if cluster.candidates.length === 0}
-      <p class="muted small">No other servers found. Start Openphalanx (or openphalanx-server) on another machine on this network.</p>
+      <p class="muted small">No other servers found. Start Openphalanx (or <span class="mono">oppxs run</span>) on another machine on this network.</p>
     {/if}
     {#each cluster.candidates as c (c.id)}
       <div class="server available" class:busy={c.busy}>

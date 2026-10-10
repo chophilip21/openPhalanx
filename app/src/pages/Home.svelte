@@ -1,7 +1,9 @@
 <script lang="ts">
   import Checklist from "../components/Checklist.svelte";
+  import ContextSlider from "../components/ContextSlider.svelte";
   import Dashboard from "../components/Dashboard.svelte";
   import Icon from "../components/Icon.svelte";
+  import Notice from "../components/Notice.svelte";
   import PairingCard from "../components/PairingCard.svelte";
   import PowerButton from "../components/PowerButton.svelte";
   import RunningModel from "../components/RunningModel.svelte";
@@ -9,12 +11,21 @@
   import { api, errorText, type Preflight } from "../lib/api";
   import { gib, tokens } from "../lib/format";
   import { app } from "../lib/store.svelte";
-  import { goto as navigate, nav } from "../lib/nav.svelte";
+  import { forceLoad, goto as navigate, nav } from "../lib/nav.svelte";
 
   let { goto }: { goto: (page: string) => void } = $props();
 
   let preflight = $state<Preflight | null>(null);
   let actionError = $state("");
+  // Closed messages stay closed until something new comes up.
+  let dismissedWarnings = $state<string[]>([]);
+  let hideDownloadAsk = $state(false);
+  let hideFetching = $state(false);
+  // A newly chosen model brings its cluster prompts back.
+  $effect(() => {
+    void wanted?.key;
+    hideDownloadAsk = hideFetching = false;
+  });
   let acting = $state(false);
 
   const snap = $derived(app.snapshot);
@@ -99,7 +110,9 @@
     try {
       if (idle) {
         if (st === "error" || st === "paused") await api.dismissError();
-        await api.start();
+        await api.start(forced);
+        forceLoad.on = false;
+        forceLoad.restore = null;
       } else {
         await api.stop();
       }
@@ -110,10 +123,69 @@
     }
   }
 
-  const canToggle = $derived(
-    !acting && (idle ? !locked && !!preflight?.can_start : st === "running" || st === "starting" || st === "external"),
-  );
   const blocking = $derived(preflight?.checks.find((c) => c.status === "fail") ?? null);
+  // Not enough VRAM is the one check the user may override, by ticking a box.
+  const forceable = $derived(
+    idle && !locked && !preflight?.running && preflight?.checks.filter((c) => c.status === "fail").every((c) => c.id === "vram") === true && blocking?.id === "vram",
+  );
+  // The tick lives outside the page (it survives a visit to another tab) and
+  // is dropped once the checks are in and no longer ask for it: the model
+  // fits now, or something else blocks the start.
+  $effect(() => {
+    if (preflight && !forceable && forceLoad.on) {
+      forceLoad.on = false;
+      forceLoad.restore = null;
+    }
+  });
+  const forced = $derived(forceable && forceLoad.on);
+  let ctxNote = $state("");
+  // Ticking it brings the context window down to the longest that fits (the 2k
+  // minimum when none does), so the server isn't asked for a window the GPU
+  // can't hold; unticking puts the earlier window back.
+  async function setForce(on: boolean) {
+    forceLoad.on = on;
+    ctxNote = "";
+    const now = snap?.settings.context_len ?? 32768;
+    if (!on) {
+      const back = forceLoad.restore;
+      forceLoad.restore = null;
+      if (back != null && back !== now) await setContext(back);
+      return;
+    }
+    try {
+      const limit = await api.contextLimit();
+      const target = Math.min(now, limit.max_fit ?? MIN_CONTEXT);
+      if (target < now) {
+        forceLoad.restore = now;
+        await setContext(target);
+        ctxNote = limit.max_fit != null
+          ? `Context window set to ${tokens(target)}, the longest ${limit.model ?? "the model"} fits right now.`
+          : `Context window set to ${tokens(target)}, the minimum: ${limit.model ?? "the model"} doesn't fit this GPU by our estimate.`;
+      }
+    } catch (e) {
+      actionError = errorText(e);
+    }
+  }
+  const MIN_CONTEXT = 2048;
+  // Forced: the VRAM check is overridden, so it reads as a warning, not a stop.
+  const checks = $derived((preflight?.checks ?? []).map((c) => (forced && c.id === "vram" ? { ...c, status: "warn" as const } : c)));
+  const canToggle = $derived(
+    !acting &&
+      (idle ? !locked && (!!preflight?.can_start || forced) : st === "running" || st === "starting" || st === "external"),
+  );
+  // The same setting as the Models page's slider; locked while a backend runs.
+  const ctxLocked = $derived(["starting", "running", "stopping", "external"].includes(st));
+  async function setContext(ctx: number) {
+    try {
+      const settings = await api.setContextLen(ctx);
+      if (app.snapshot) app.snapshot.settings = settings; // both pages see it at once
+      actionError = "";
+    } catch (e) {
+      actionError = errorText(e);
+    }
+    await refreshPreflight();
+  }
+  const passed = $derived(preflight?.checks.filter((c) => c.status === "pass").length ?? 0);
 </script>
 
 <div class="page">
@@ -140,7 +212,7 @@
         </div>
       {/if}
 
-      {#if idle && wanted && missing.length}
+      {#if idle && wanted && missing.length && !hideDownloadAsk}
         <div class="hint download-ask" role="status">
           <Icon name="download" size={16} />
           <span>
@@ -151,14 +223,16 @@
           <button class="primary" disabled={approving} onclick={approveDownload}>
             <Icon name="download" size={14} /> Download on {missing.length === 1 ? missing[0].name : "them"}
           </button>
+          <button class="ghost close" onclick={() => (hideDownloadAsk = true)} aria-label="Dismiss"><Icon name="x" size={14} /></button>
         </div>
-      {:else if idle && fetching.length}
+      {:else if idle && fetching.length && !hideFetching}
         <div class="hint info" role="status">
           <Icon name="download" size={16} />
           <span>
             {#each fetching as m, i}{i ? " · " : ""}<strong>{m.name}</strong> is downloading {wanted?.label}: {pct(m.sync!)}%{/each}.
             Start when it's done.
           </span>
+          <button class="ghost close" onclick={() => (hideFetching = true)} aria-label="Dismiss"><Icon name="x" size={14} /></button>
         </div>
       {/if}
 
@@ -180,6 +254,8 @@
           <span class="paused-note"><Icon name="alert" size={14} /> {snap.server.detail}</span>
         {:else if snap?.server.detail}
           {snap.server.detail}
+        {:else if idle && blocking && forced}
+          <span class="forced"><Icon name="alert" size={14} /> Force load is on. {blocking.detail}</span>
         {:else if idle && blocking}
           <span class="blocked"><Icon name="alert" size={14} /> {blocking.detail}</span>
         {:else if idle}
@@ -188,6 +264,16 @@
           Clients can connect with a pairing code.
         {/if}
       </p>
+
+      {#if forceable}
+        <label class="force">
+          <input type="checkbox" checked={forceLoad.on} onchange={(e) => setForce(e.currentTarget.checked)} />
+          <span>
+            <strong>Force load.</strong> I understand it may fail to load, or crash when it runs out of GPU memory, and
+            I would still like to proceed.
+          </span>
+        </label>
+      {/if}
 
       {#if showLogsHint}
       <div class="hint info" role="status">
@@ -198,11 +284,14 @@
       </div>
     {/if}
 
+    {#if ctxNote}
+        <Notice kind="warn" onclose={() => (ctxNote = "")}>{ctxNote}</Notice>
+      {/if}
     {#if actionError}
-        <div class="error-banner"><Icon name="alert" size={16} /><span class="selectable">{actionError}</span></div>
+        <Notice onclose={() => (actionError = "")}>{actionError}</Notice>
       {/if}
       {#each snap?.warnings ?? [] as w}
-        <div class="error-banner warn"><Icon name="alert" size={16} /><span>{w}</span></div>
+        {#if !dismissedWarnings.includes(w)}<Notice kind="warn" onclose={() => (dismissedWarnings = [...dismissedWarnings, w])}>{w}</Notice>{/if}
       {/each}
 
       {#if snap?.cluster?.role.role === "member"}
@@ -219,7 +308,7 @@
       <section class="setup">
         <div class="card model">
           <div class="row">
-            <span class="eyebrow">Model</span>
+            <span class="eyebrow titled"><Icon name="cpu" size={14} /> Model</span>
             <button class="ghost small" onclick={() => goto("models")}>Change</button>
           </div>
           {#if preflight?.model}
@@ -235,13 +324,17 @@
                   overhead={preflight.requirement.overhead_bytes}
                   available={gpu.free_bytes}
                   total={gpu.total_bytes}
-                  fit={preflight.fit?.fit ?? null}
+                  fit={forced ? "tight" : (preflight.fit?.fit ?? null)}
                 />
               </div>
             {/if}
           {:else}
             <div class="muted">No model selected.</div>
           {/if}
+          <div class="ctx">
+            <span class="muted small-text">Context window</span>
+            <ContextSlider compact value={snap?.settings.context_len ?? 32768} locked={ctxLocked} {forced} onchange={setContext} />
+          </div>
           <label class="toggle">
             <input type="checkbox" checked={snap?.settings.web_search ?? true}
               onchange={(e) => api.setWebSearch(e.currentTarget.checked).then(refreshPreflight)} />
@@ -254,8 +347,11 @@
 
         {#if preflight}
           <div class="card">
-            <div class="row"><span class="eyebrow">Pre-flight checks</span></div>
-            <Checklist checks={preflight.checks} />
+            <div class="row">
+              <span class="eyebrow titled"><Icon name="checklist" size={14} /> Pre-flight checks</span>
+              <span class="muted small-text">{passed} of {preflight.checks.length} passed</span>
+            </div>
+            <Checklist {checks} />
           </div>
         {/if}
       </section>
@@ -274,21 +370,32 @@
   .dot.starting, .dot.stopping, .dot.external { background: var(--busy); }
   .dot.error, .dot.paused { background: var(--bad); }
   .download-ask { border-color: var(--on); background: var(--on-soft); }
+  .force {
+    display: flex; gap: 10px; align-items: flex-start; max-width: 560px; margin: 4px auto 0; padding: 10px 14px;
+    border: 1px solid var(--busy-glow); border-radius: 10px; background: var(--busy-soft); color: var(--warn-text);
+    font-size: 13px; text-align: left; cursor: pointer;
+  }
+  .force input { margin-top: 2px; flex: none; }
   .download-ask .primary { white-space: nowrap; display: inline-flex; gap: 6px; align-items: center; }
   .running-model { display: flex; justify-content: center; margin: 2px 0 6px; }
   .locked-note { color: var(--violet); display: inline-flex; gap: 6px; align-items: baseline; max-width: 560px; }
   .paused-note { color: var(--bad); display: inline-flex; gap: 6px; align-items: baseline; max-width: 560px; font-weight: 500; }
   .headline { margin: 4px 0 0; font-size: 26px; font-weight: 650; }
   .detail { margin: 0; color: var(--muted); max-width: 460px; min-height: 20px; }
+  .forced { color: var(--warn-text); display: inline-flex; gap: 6px; align-items: flex-start; text-align: left; }
   .blocked { color: var(--bad-text); display: inline-flex; gap: 6px; align-items: flex-start; text-align: left; }
   .error-banner { max-width: 560px; text-align: left; }
   .error-banner.warn { border-color: var(--busy-glow); background: var(--busy-soft); color: var(--warn-text); }
-  .setup { width: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; align-items: start; }
+  /* Side by side, the model card and the pre-flight list are always the same height. */
+  .setup { width: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; align-items: stretch; }
+  .setup > .card { display: flex; flex-direction: column; }
+  .setup .toggle { margin-top: auto; padding-top: 14px; }
   .row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .small { padding: 3px 10px; font-size: 12.5px; }
   .model-name { font-size: 16px; font-weight: 600; }
   .small-text { font-size: 12.5px; }
   .vram { margin-top: 14px; }
+  .ctx { margin-top: 14px; display: flex; flex-direction: column; gap: 2px; }
   .toggle { display: flex; gap: 10px; align-items: flex-start; margin-top: 14px; font-size: 13px; cursor: pointer; }
   .toggle input { margin-top: 3px; }
   .toggle span { display: flex; flex-direction: column; }

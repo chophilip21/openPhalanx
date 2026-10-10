@@ -32,6 +32,8 @@ class UiState:
     hint_until = 0.0
     vi = False
     agent = None  # the agent (agent.Agent) when the agent engine runs
+    connectors = None  # the session's MCP connectors (mcp.Hub), with the agent engine
+    tools_allowed: set = set()  # connector tools the user allowed for the rest of the session
 
 
 UI = UiState()

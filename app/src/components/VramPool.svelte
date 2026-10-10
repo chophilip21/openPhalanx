@@ -1,6 +1,7 @@
 <script lang="ts">
   // Split cluster: how much VRAM each server adds to the pool, as a donut.
   // The outer ring shows the selected model's need against the pool.
+  import Icon from "./Icon.svelte";
   import type { ModelRow, PoolNode } from "../lib/api";
   import { gib } from "../lib/format";
 
@@ -48,7 +49,7 @@
     </svg>
   </div>
   <div class="legend">
-    <span class="eyebrow">Split cluster · {nodes.length} servers</span>
+    <span class="eyebrow titled"><Icon name="users" size={14} /> Split cluster · {nodes.length} servers</span>
     {#each slices as s (s.node.id)}
       <div class="row">
         <span class="sw" style="background:{s.color}"></span>

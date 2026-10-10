@@ -1,6 +1,7 @@
 <script lang="ts">
   import { ask } from "@tauri-apps/plugin-dialog";
   import Icon from "../components/Icon.svelte";
+  import Notice from "../components/Notice.svelte";
   import { api, errorText, type Device } from "../lib/api";
   import { ago, tokens, until } from "../lib/format";
   import { app } from "../lib/store.svelte";
@@ -107,7 +108,7 @@
       <span>Start the server to see and manage paired devices.</span>
     </div>
   {:else}
-    {#if error}<div class="error-banner"><Icon name="alert" size={16} /><span>{error}</span></div>{/if}
+    {#if error}<Notice onclose={() => (error = "")}>{error}</Notice>{/if}
     {#if devices.length === 0}
       <div class="card empty muted">
         <Icon name="laptop" size={28} />

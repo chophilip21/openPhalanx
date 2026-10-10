@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 
 use oppx::config::{self, Config, Server};
 use oppx::proxy::Proxy;
-use oppx::{agent, api, tls, ui};
+use oppx::{agent, api, mcp, tls, ui};
 
 #[derive(Parser)]
 #[command(
@@ -73,6 +73,8 @@ struct Launch {
     initial: Option<String>,
     print: bool,
     session: SessionChoice,
+    /// The user's connectors file, for the chat's MCP client.
+    connectors: PathBuf,
 }
 
 enum SessionChoice {
@@ -83,12 +85,13 @@ enum SessionChoice {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Pair with a server using the code shown in the OpenPhalanx app.
+    /// Pair with a server using the code shown in the OpenPhalanx app, or
+    /// with the server on this machine: `oppx pair self` (no code needed).
     Pair {
-        /// Server address, e.g. 192.168.1.77 or https://gpu.lan:9090.
+        /// Server address, e.g. 192.168.1.77 or https://gpu.lan:9090; or `self`.
         server: String,
-        /// Pairing code from the app's Server page, e.g. K7QF-M2XD.
-        code: String,
+        /// Pairing code from the app's Server page, e.g. K7QF-M2XD (not for `self`).
+        code: Option<String>,
         /// Expected certificate fingerprint (as shown in the app); skips the prompt.
         #[arg(long)]
         fingerprint: Option<String>,
@@ -164,6 +167,25 @@ enum Command {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Connectors: MCP servers whose tools the model can call in the chat.
+    ///
+    /// A connector is a program on this machine or a URL that offers tools
+    /// (GitHub, a database, a browser…). The chat lists them for the model,
+    /// and asks you before each call. In the chat, `/mcp` does the same.
+    ///
+    /// Examples:
+    ///   oppx mcp add github -e GITHUB_TOKEN=… -- npx -y @modelcontextprotocol/server-github
+    ///   oppx mcp add docs --url https://mcp.example.com/mcp -H "Authorization: Bearer …"
+    ///   oppx mcp list
+    ///   oppx mcp remove github
+    ///
+    /// Each connector's tool list is sent with every request, so on a model
+    /// with a small context window add only the ones you need.
+    #[command(verbatim_doc_comment)]
+    Mcp {
+        #[command(subcommand)]
+        action: Option<McpCommand>,
+    },
     /// List paired servers (tokens are never shown).
     Servers,
     /// Set the default server.
@@ -171,6 +193,48 @@ enum Command {
         /// Server name, as listed by `oppx servers`.
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// Add a connector: a command to run (after `--`), or a URL.
+    ///
+    /// oppx mcp add github -e GITHUB_TOKEN=… -- npx -y @modelcontextprotocol/server-github
+    /// oppx mcp add docs --url https://mcp.example.com/mcp
+    #[command(verbatim_doc_comment)]
+    Add {
+        /// A short name; the model sees its tools as <name>.<tool>.
+        name: String,
+        /// A connector reached over HTTP (MCP's streamable HTTP), instead of a command.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Environment for the command; repeat for more. `${VAR}` in a value is read from your shell at start.
+        #[arg(long, short = 'e', value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// A header for --url, e.g. "Authorization: Bearer …"; repeat for more.
+        #[arg(long, short = 'H', value_name = "NAME: VALUE")]
+        header: Vec<String>,
+        /// Save it in this repository's .mcp.json (shared with the repo) instead of your own list.
+        #[arg(long)]
+        project: bool,
+        /// Replace a connector with the same name.
+        #[arg(long)]
+        force: bool,
+        /// The command that starts the connector, and its arguments.
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+    /// Remove a connector (yours, or this repository's with --project).
+    #[command(alias = "rm")]
+    Remove {
+        name: String,
+        /// Remove it from this repository's .mcp.json.
+        #[arg(long)]
+        project: bool,
+    },
+    /// Show the connectors you added and this repository's (the default).
+    #[command(alias = "ls")]
+    List,
 }
 
 #[tokio::main]
@@ -195,6 +259,7 @@ fn welcome(cfg: &Config) {
         &[
             ("oppx", "start coding in the current repo (--no-web: no web search)"),
             ("oppx search \"query\"", "search the web through the server"),
+            ("oppx mcp add <name> -- <cmd>", "add a connector (MCP server) for the chat"),
             ("oppx status", "check the connection and the model"),
             ("oppx servers", "list paired servers"),
         ]
@@ -227,6 +292,7 @@ async fn run(cli: Cli) -> Result<()> {
                 bail!("-p needs a prompt, e.g. oppx -p \"explain src/main.rs\"");
             }
             let launch = Launch {
+                connectors: mcp::user_path(&path),
                 web: !cli.no_web,
                 classic: cli.classic,
                 engine: cli.engine.clone(),
@@ -244,7 +310,21 @@ async fn run(cli: Cli) -> Result<()> {
     };
     match command {
         Command::Pair { server, code, fingerprint, yes, device_name, alias, force } => {
-            pair(&mut cfg, &server, &code, fingerprint, yes, device_name, alias, force).await?;
+            if server == "self" {
+                // The server is on this machine: ask it for the code and the
+                // certificate fingerprint directly, so there is nothing to copy.
+                let alias = alias.unwrap_or_else(|| "local".into());
+                // Before asking: a new code replaces the one the app shows.
+                if cfg.servers.contains_key(&alias) && !force {
+                    bail!("already paired as \"{alias}\"; use --force to replace it, or --as <name> to keep both");
+                }
+                let local = local_pairing().await?;
+                let alias = Some(alias);
+                pair(&mut cfg, &local.url, &local.code, Some(local.fingerprint), yes, device_name, alias, force).await?;
+            } else {
+                let code = code.context("the pairing code is missing: oppx pair <server> <code> (or: oppx pair self)")?;
+                pair(&mut cfg, &server, &code, fingerprint, yes, device_name, alias, force).await?;
+            }
             cfg.save(&path)?;
         }
         Command::Status { name } => status(&cfg, name.as_deref()).await?,
@@ -254,6 +334,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Aider { server, no_web, web: _, args } => {
             let launch = Launch {
+                connectors: mcp::user_path(&path),
                 web: !no_web,
                 classic: true,
                 engine: "aider".into(),
@@ -266,6 +347,14 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Proxy { name, port, no_web, web: _ } => run_proxy(&cfg, name.as_deref(), port, !no_web).await?,
         Command::Search { query, max, server } => run_search(&cfg, server.as_deref(), &query.join(" "), max).await?,
+        Command::Mcp { action } => match action.unwrap_or(McpCommand::List) {
+            McpCommand::Add { name, url, env, header, project, force, command } => {
+                let spec = mcp::spec(url.as_deref(), &command, &env, &header)?;
+                mcp_add(&cfg, &path, &name, spec, project, force, !env.is_empty() || !header.is_empty()).await?
+            }
+            McpCommand::Remove { name, project } => mcp_remove(&path, &name, project)?,
+            McpCommand::List => mcp_list(&path)?,
+        },
         Command::Servers => {
             if cfg.servers.is_empty() {
                 println!("No servers paired yet. Pair with: {}", ui::accent("oppx pair <server> <code>"));
@@ -298,6 +387,128 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// The context window of the default server's model, to judge what a
+/// connector costs: from the chat when it runs us (`/mcp add`), otherwise
+/// asked from the server, briefly. `None`: not paired, or it isn't answering.
+async fn server_context(cfg: &Config) -> Option<u64> {
+    if let Some(ctx) = std::env::var("OPPX_CONTEXT").ok().and_then(|c| c.parse().ok()) {
+        return Some(ctx);
+    }
+    let (_, s) = cfg.server(None).ok()?;
+    let client = tls::pinned_client(&s.fingerprint).ok()?;
+    let ask = async {
+        match api::info(&client, &s.url, &s.token).await {
+            Ok(Some(i)) => Some(i.context_length),
+            _ => api::context_len(&client, &s.url, &s.token).await.ok().flatten(),
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(4), ask).await.ok().flatten()
+}
+
+async fn mcp_add(cfg: &Config, config: &std::path::Path, name: &str, spec: serde_json::Value, project: bool, force: bool, secrets: bool) -> Result<()> {
+    mcp::validate_name(name)?;
+    let root = mcp::project_root(&std::env::current_dir()?);
+    let user_file = mcp::user_path(config);
+    let path = if project { root.join(mcp::PROJECT_FILE) } else { user_file.clone() };
+    let mut file = mcp::File::load(&path, !project)?;
+    if file.get(name).is_some() && !force {
+        bail!("a connector named \"{name}\" is already in {}; use --force to replace it", path.display());
+    }
+    file.insert(name, spec.clone());
+    file.save()?;
+    ui::line(ui::ok("added", format!("{name}  {}", ui::dim(mcp::describe(&spec)))));
+    println!("  {}", ui::dim(format!("saved in {}", path.display())));
+    if project {
+        if secrets {
+            ui::warning(format!(
+                "{} is usually committed with the repository: keep secrets out of it. Write ${{VAR}} as the value \
+                 and set VAR in your shell.",
+                mcp::PROJECT_FILE
+            ));
+        }
+        if mcp::File::load(&user_file, true)?.get(name).is_some() {
+            ui::warning(format!("you also have your own connector named \"{name}\"; yours is the one the chat uses."));
+        }
+    }
+    // Inside the chat (/mcp add), the chat connects to it right away and
+    // reports on it with the numbers of the whole session.
+    if std::env::var_os("OPPX_IN_CHAT").is_some() {
+        return Ok(());
+    }
+    let sp = ui::spinner(format!("Starting {name}"));
+    let (probe, ctx) = tokio::join!(mcp::probe(name, &root, &user_file, project), server_context(cfg));
+    sp.clear();
+    let tokens = match &probe {
+        Some(p) if p.ok => {
+            let tools = format!("{} tool{}", p.tools, if p.tools == 1 { "" } else { "s" });
+            ui::line(ui::ok("connected", format!("{tools} · {}", mcp::cost(p.tokens, ctx))));
+            Some(p.tokens)
+        }
+        Some(p) => {
+            ui::line(ui::bad("not running", &p.error));
+            println!(
+                "  {}",
+                ui::dim(format!("It is saved as written. Fix it with: oppx mcp add {name} --force …   or drop it: oppx mcp remove {name}"))
+            );
+            None
+        }
+        None => None, // no engine yet: the chat checks it at its first start
+    };
+    if let Some(w) = mcp::context_warning(ctx, tokens) {
+        ui::warning(w);
+    }
+    println!("  Next: {} uses it in the chat  ·  {}", ui::accent("oppx"), ui::accent("oppx mcp list"));
+    Ok(())
+}
+
+fn mcp_remove(config: &std::path::Path, name: &str, project: bool) -> Result<()> {
+    let root = mcp::project_root(&std::env::current_dir()?);
+    let mut files = Vec::new();
+    if !project {
+        files.push(mcp::File::load(&mcp::user_path(config), true)?);
+    }
+    // Without --project, a name that is only in the repository's file is removed there.
+    files.push(mcp::File::load(&root.join(mcp::PROJECT_FILE), false)?);
+    for mut file in files {
+        if file.remove(name) {
+            file.save()?;
+            ui::line(ui::ok("removed", format!("{name}  {}", ui::dim(format!("from {}", file.path.display())))));
+            return Ok(());
+        }
+    }
+    bail!("no connector named \"{name}\"; `oppx mcp list` shows them");
+}
+
+fn mcp_list(config: &std::path::Path) -> Result<()> {
+    let root = mcp::project_root(&std::env::current_dir()?);
+    let user_file = mcp::user_path(config);
+    let mine = mcp::File::load(&user_file, true)?.servers();
+    let repo = mcp::File::load(&root.join(mcp::PROJECT_FILE), false)?.servers();
+    if mine.is_empty() && repo.is_empty() {
+        println!("No connectors yet. A connector is an MCP server whose tools the model can call in the chat.");
+        println!("  Add one: {}", ui::accent("oppx mcp add <name> -- <command> [args]"));
+        println!("       or: {}", ui::accent("oppx mcp add <name> --url https://…"));
+        return Ok(());
+    }
+    let mut rows = Vec::new();
+    for (name, spec) in &mine {
+        rows.push(format!("{name:<16} {} {}", ui::dim(format!("{:<10}", "yours")), mcp::describe(spec)));
+    }
+    for (name, spec) in &repo {
+        // On a shared name the user's own connector is the one that runs.
+        let hidden = mine.iter().any(|(n, _)| n == name);
+        let what = if hidden { ui::dim(format!("{} (yours is used instead)", mcp::describe(spec))) } else { mcp::describe(spec) };
+        rows.push(format!("{name:<16} {} {what}", ui::dim(format!("{:<10}", "this repo"))));
+    }
+    ui::panel("Connectors", &rows);
+    println!("  {}", ui::dim(format!("yours: {}", user_file.display())));
+    if !repo.is_empty() {
+        println!("  {}", ui::dim(format!("this repo: {}", root.join(mcp::PROJECT_FILE).display())));
+    }
+    println!("  {}", ui::dim("In the chat, /mcp shows each connector's tools and what they cost per request."));
+    Ok(())
+}
+
 /// A local server name derived from its address: `https://192.168.1.77:9090` -> `192-168-1-77`.
 fn name_for(url: &str) -> String {
     let host = url.trim_start_matches("https://");
@@ -315,6 +526,59 @@ fn name_for(url: &str) -> String {
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// What `oppx pair self` needs from the server on this machine.
+struct LocalPairing {
+    url: String,
+    code: String,
+    fingerprint: String,
+}
+
+/// Gets a pairing code and the certificate fingerprint from the OpenPhalanx
+/// server running on this machine, through its loopback admin API. The admin
+/// token is read from the backend container, so this needs Docker access:
+/// the same access that already lets a user read the token by hand.
+async fn local_pairing() -> Result<LocalPairing> {
+    let out = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{.State.Running}} {{json .Config.Env}}", "openphalanx-backend"])
+        .output()
+        .context("`oppx pair self` needs the docker command, to reach the server on this machine")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || !text.starts_with("true ") {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("permission denied") {
+            bail!("your user can't use Docker, so the local server can't be asked for a code. Pair with a code instead: oppx pair 127.0.0.1 <code>");
+        }
+        bail!("no OpenPhalanx server is running on this machine. Start it in the app (or `oppxs start`), then run `oppx pair self` again.");
+    }
+    let (token, admin, url) = local_endpoints(text.trim_start_matches("true ").trim())?;
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?;
+    let get = |method: reqwest::Method, path: &str| http.request(method, format!("{admin}{path}")).header("x-admin-token", &token);
+    let pairing: serde_json::Value = get(reqwest::Method::POST, "/admin/pairing")
+        .send()
+        .await
+        .context("the local server isn't answering yet; try again in a moment")?
+        .error_for_status()?
+        .json()
+        .await?;
+    let status: serde_json::Value = get(reqwest::Method::GET, "/admin/status").send().await?.error_for_status()?.json().await?;
+    Ok(LocalPairing {
+        url,
+        code: pairing["code"].as_str().context("the local server gave no pairing code")?.to_string(),
+        fingerprint: status["tls_fingerprint"].as_str().context("the local server gave no fingerprint")?.to_string(),
+    })
+}
+
+/// From the backend container's environment (JSON list of `NAME=value`):
+/// the admin token, the admin API's URL and the address clients pair with.
+fn local_endpoints(env_json: &str) -> Result<(String, String, String)> {
+    let env: Vec<String> = serde_json::from_str(env_json).context("unexpected docker output")?;
+    let var = |name: &str| env.iter().find_map(|e| e.strip_prefix(&format!("{name}=")).map(str::to_string));
+    let token = var("ADMIN_TOKEN").filter(|t| !t.is_empty()).context("the local server has no admin token")?;
+    let admin = format!("http://127.0.0.1:{}", var("ADMIN_PORT").unwrap_or_else(|| "9091".into()));
+    let agent = format!("127.0.0.1:{}", var("AGENT_PORT").unwrap_or_else(|| "9090".into()));
+    Ok((token, admin, agent))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -353,7 +617,7 @@ async fn pair(
     );
 
     match expected {
-        Some(e) if tls::matches(&e, &fp)? => ui::line(ui::ok("fingerprint", "matches --fingerprint")),
+        Some(e) if tls::matches(&e, &fp)? => ui::line(ui::ok("fingerprint", "matches the expected one")),
         Some(_) => bail!(
             "the server's certificate does not match --fingerprint. Do not pair: you may be talking to a \
              different machine than the one running OpenPhalanx."
@@ -727,6 +991,7 @@ async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args:
             .env("OPPX_REASONING", if info.reasoning { "1" } else { "0" })
             .env("OPPX_WEB", if web { "1" } else { "0" })
             .env("OPPX_ENGINE", &launch.engine)
+            .env("OPPX_MCP_CONFIG", &launch.connectors)
             .env("OPPX_VERSION", env!("CARGO_PKG_VERSION"))
             .env("OPPX_BIN", std::env::current_exe().unwrap_or_else(|_| "oppx".into()))
             .env("OPPX_PRINT", if launch.print { "1" } else { "0" })
@@ -760,7 +1025,17 @@ async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args:
 
 #[cfg(test)]
 mod tests {
-    use super::name_for;
+    use super::{local_endpoints, name_for};
+
+    #[test]
+    fn pair_self_reads_the_local_servers_settings() {
+        let (token, admin, agent) = local_endpoints(r#"["PATH=/usr/bin","ADMIN_TOKEN=abc","AGENT_PORT=9443"]"#).unwrap();
+        assert_eq!((token.as_str(), admin.as_str(), agent.as_str()), ("abc", "http://127.0.0.1:9091", "127.0.0.1:9443"));
+        let (_, admin, agent) = local_endpoints(r#"["ADMIN_TOKEN=t","ADMIN_PORT=1","X=ADMIN_TOKEN=no"]"#).unwrap();
+        assert_eq!((admin.as_str(), agent.as_str()), ("http://127.0.0.1:1", "127.0.0.1:9090"), "defaults, and exact names only");
+        assert!(local_endpoints(r#"["ADMIN_TOKEN="]"#).is_err(), "a backend started without a token");
+        assert!(local_endpoints("not json").is_err());
+    }
 
     #[test]
     fn derives_server_names() {

@@ -167,6 +167,14 @@ pub async fn download(
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(dest).await?;
     let total: u64 = files.iter().map(|f| f.size).sum();
+    // The size is known now: the real progress bar can replace the waiting one.
+    on_progress(Progress {
+        repo: repo.to_string(),
+        total_bytes: total,
+        done_bytes: 0,
+        current_file: "Starting…".into(),
+        bytes_per_sec: 0.0,
+    });
     let already: u64 = futures_util::future::join_all(files.iter().map(|f| async {
         let done = tokio::fs::metadata(dest.join(&f.path)).await.map(|m| m.len()).unwrap_or(0);
         let part = tokio::fs::metadata(part_path(dest, &f.path)).await.map(|m| m.len()).unwrap_or(0);
@@ -190,9 +198,21 @@ pub async fn download(
     let started = Instant::now();
     let mut transferred = 0u64;
     let mut last_emit = Instant::now() - Duration::from_secs(1);
+    // Checking files already on disk re-hashes them, which takes a while for
+    // big shards: say so, or the download looks stuck before it starts.
+    let phase = |done: u64, what: String| Progress {
+        repo: repo.to_string(),
+        total_bytes: total,
+        done_bytes: done,
+        current_file: what,
+        bytes_per_sec: 0.0,
+    };
 
     for file in files {
         let final_path = dest.join(&file.path);
+        if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
+            on_progress(phase(done_bytes, format!("Checking {} (already downloaded)…", file.path)));
+        }
         if verified_complete(&final_path, file).await? {
             done_bytes += file.size;
             continue;
@@ -201,6 +221,7 @@ pub async fn download(
         let mut hasher = Sha256::new();
         let mut have = 0u64;
         if let Ok(mut existing) = tokio::fs::File::open(&part).await {
+            on_progress(phase(done_bytes, format!("Resuming {}: checking the part already downloaded…", file.path)));
             // Re-hash what we already have so resumed files still verify.
             let mut buf = vec![0u8; 1 << 20];
             loop {

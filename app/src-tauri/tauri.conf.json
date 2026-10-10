@@ -7,6 +7,7 @@
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
+    "beforeBundleCommand": "cargo build --release -p openphalanx-server",
     "frontendDist": "../dist"
   },
   "app": {
@@ -14,9 +15,10 @@
       {
         "title": "Openphalanx",
         "width": 1180,
-        "height": 780,
+        "height": 860,
         "minWidth": 980,
-        "minHeight": 640
+        "minHeight": 640,
+        "backgroundColor": "#0a0e16"
       }
     ],
     "security": {
@@ -30,7 +32,13 @@
     "shortDescription": "Run a local coding-model server for Openphalanx clients",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.png"],
     "linux": {
-      "deb": { "depends": ["docker-ce | docker.io", "nvidia-container-toolkit"] }
+      "deb": {
+        "depends": ["docker-ce | docker.io", "nvidia-container-toolkit"],
+        "files": {
+          "/usr/bin/oppxs": "../../target/release/oppxs",
+          "/usr/lib/systemd/user/oppxs.service": "../../packaging/oppxs.service"
+        }
+      }
     }
   }
 }

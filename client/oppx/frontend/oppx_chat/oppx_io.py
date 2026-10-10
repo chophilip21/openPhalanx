@@ -322,6 +322,7 @@ class OppxIO(InputOutput):
         out(f"[{MUTED}]{'─' * width}[/]")
         text = text.strip()
         self.user_input(text)
+        self.input_logged = True  # the agent turn doesn't write it to the session file again
         return text
 
     def _toolbar(self, rel_fnames):

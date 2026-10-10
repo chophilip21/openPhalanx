@@ -20,7 +20,7 @@ Run a coding model on your own Linux GPU machine and use it from any laptop on y
 
 * ✅ **Private**: your repo, tests and git stay on your laptop. Prompts go only to your own server, over TLS pinned to its certificate, and the server keeps no code.
 * ✅ **Models that fit**: the app shows which models fit your GPU, counting the KV cache and runtime memory, not just the download size.
-* ✅ **Whole-repo agent**: the agent reads your files on demand and runs your own tests and commands (after asking).
+* ✅ **Whole-repo agent**: the agent reads your files on demand and runs your own tests and commands (after asking). Add tools from any MCP server (GitHub, a database, a browser…) as connectors; you approve each call.
 * ✅ **Managed context**: when a conversation grows, older content is trimmed or summarized automatically.
 * ✅ **Web search**: the server searches the web through its own private SearXNG when a request needs current information.
 * ✅ **Clusters**: servers on one network can form a cluster and split a model too big for one GPU across them.
@@ -36,12 +36,14 @@ curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/i
 ```
 
 Then, in the app:
-
 1. **Models:** pick a model marked **Fits** and click **Download**.
-2. **Server:** press the power button. The first start downloads the server image (about 16 GB); loading the model takes 3–4 minutes.
-3. When the button turns green, note the **pairing code** and the server address.
+2. **Server:** press the power button. The first start builds the server image (a 16 GB download, once); loading the model takes 3–4 minutes.
+3. When the button turns green, note the **pairing code** and the server address, and open port `9090/tcp` to your laptops' network.
 
-Open port `9090/tcp` to your laptops' network.
+**No desktop?** Install only `oppxs`, the same server as a command (it also comes with the app). Keep it running with `systemctl --user enable --now oppxs`, then use `oppxs models`, `oppxs download <model>`, `oppxs use <model>`, `oppxs start` and `oppxs pair`:
+```bash
+curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/install-server.sh | sh -s -- --headless
+```
 
 ### Laptop (Linux or macOS)
 
@@ -52,7 +54,7 @@ curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/i
 oppx --update                     # any time: update oppx and its engine
 ```
 
-Pair once with the address and code from the app. `oppx` prints the server's certificate fingerprint; check it matches the one in the app, then confirm:
+Pair once with the address and code from the app (on the server machine itself, just `oppx pair self`). `oppx` prints the server's certificate fingerprint; check it matches the one in the app, then confirm:
 
 ```bash
 oppx pair 192.168.1.77 ABCD-EFGH
@@ -67,6 +69,7 @@ oppx "fix the failing test"       # start with a request
 oppx -c                           # continue the last conversation (-r to pick an older one)
 oppx -p "explain src/main.rs"     # answer once and exit
 oppx --no-web                     # without automatic web search
+oppx mcp add <name> -- <command>  # add an MCP server's tools (oppx mcp list, oppx mcp remove <name>; /mcp in the chat)
 ```
 
 Edits are never committed: review them with `git diff` and commit yourself. To remove a laptop, run `oppx unpair` (or revoke it on the app's **Devices** page).
@@ -81,17 +84,15 @@ Edits are never committed: review them with `git diff` and commit yourself. To r
 | **@file** | Add a file to the conversation |
 | **!cmd** | Run a shell command |
 | **# note** | Save a note to project memory (`OPENPHALANX.md`) |
-| **/help** | All commands (`/context`, `/init`, `/undo`, `/search`, …) |
+| **/help** | All commands (`/context`, `/init`, `/undo`, `/search`, `/mcp`, …) |
 
 ## From source
 
-Needs Rust, Node.js 20+ and the WebKitGTK packages listed in [CLAUDE.md](CLAUDE.md).
-
+Needs Rust, Node.js 20+ and the WebKitGTK packages listed in [CLAUDE.md](CLAUDE.md). Testing and the rules for changes are in [CONTRIBUTING.md](CONTRIBUTING.md).
 ```bash
-git clone -b dev https://github.com/chophilip21/openPhalanx.git
-cd openPhalanx
+git clone -b dev https://github.com/chophilip21/openPhalanx.git && cd openPhalanx
 (cd app && npm install && npx tauri dev)    # server app
-cargo install --path client/oppx            # client
+cargo install --path client/oppx && cargo install --path crates/openphalanx-server   # oppx (client), oppxs (server command)
 ```
 
 ## Contributing
@@ -115,5 +116,4 @@ By contributing to this repository, you agree that your contributions will be li
 
 ## Learn more
 
-* **[CLAUDE.md](CLAUDE.md)**: architecture, security model, clusters, running without the GUI, troubleshooting
-* **[Releases](https://github.com/chophilip21/openPhalanx/releases)**: downloads and changelog
+* **[CLAUDE.md](CLAUDE.md)** (architecture, security model, clusters, connectors, troubleshooting) · **[Releases](https://github.com/chophilip21/openPhalanx/releases)** (downloads and changelog)

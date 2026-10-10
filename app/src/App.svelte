@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import Icon from "./components/Icon.svelte";
+  import UpdatePrompt from "./components/UpdatePrompt.svelte";
+  import { api, errorText, type UpdateCheck } from "./lib/api";
   import logo from "./assets/logo.svg";
   import Devices from "./pages/Devices.svelte";
   import Home from "./pages/Home.svelte";
@@ -18,10 +20,48 @@
   ];
 
   let failed = $state("");
+  let update = $state<UpdateCheck | null>(null);
+  let checking = $state(false);
+  let updateNote = $state("");
+
+  // The launch screen is plain markup in index.html, so it is on screen before
+  // any of this code has loaded. It stays at least this long after its first
+  // frame, even when the backend answers at once.
+  const SPLASH_MIN_MS = 2000;
+  const loaded = $derived(app.snapshot !== null || failed !== "");
+  let splashClosing = false;
+
+  $effect(() => {
+    if (!loaded || splashClosing) return;
+    splashClosing = true;
+    const el = document.getElementById("splash");
+    if (!el) return;
+    const shown = performance.now() - (window.__splashShownAt ?? performance.now());
+    setTimeout(() => {
+      el.classList.add("out");
+      setTimeout(() => el.remove(), 400);
+    }, Math.max(0, SPLASH_MIN_MS - shown));
+  });
 
   onMount(() => {
     connect().catch((e) => (failed = String(e)));
+    // Ask once per launch; offline or rate-limited stays quiet.
+    api.checkUpdate().then((c) => { if (c.available) update = c; }).catch(() => {});
   });
+
+  async function checkNow() {
+    checking = true;
+    updateNote = "";
+    try {
+      const c = await api.checkUpdate();
+      if (c.available) update = c;
+      else updateNote = "Up to date";
+    } catch (e) {
+      updateNote = errorText(e);
+    } finally {
+      checking = false;
+    }
+  }
 
   const st = $derived(app.snapshot?.server.state ?? "stopped");
 </script>
@@ -45,7 +85,12 @@
       <span>{theme.current === "dark" ? "Light mode" : "Dark mode"}</span>
     </button>
     <div class="version muted">v{__APP_VERSION__} · Linux</div>
+    <button class="check-update" disabled={checking} onclick={checkNow} title={updateNote}>
+      {checking ? "Checking…" : updateNote === "Up to date" ? "Up to date ✓" : "Check for updates"}
+    </button>
+    {#if updateNote && updateNote !== "Up to date"}<div class="update-error">{updateNote}</div>{/if}
   </nav>
+  {#if update}<UpdatePrompt check={update} onclose={() => (update = null)} />{/if}
 
   <main>
     {#if failed}
@@ -68,7 +113,7 @@
   .shell { display: grid; grid-template-columns: 210px 1fr; height: 100%; }
   @media (max-width: 760px) {
     .shell { grid-template-columns: 64px 1fr; }
-    .brand span:last-child, .nav-item span:not(.pip), .version { display: none; }
+    .brand span:last-child, .nav-item span:not(.pip), .version, .check-update, .update-error { display: none; }
     .nav-item { justify-content: center; padding: 10px 0; }
     .pip { position: absolute; top: 7px; right: 11px; margin: 0; }
   }
@@ -91,5 +136,8 @@
   .pip.error, .pip.paused { background: var(--bad); }
   .spacer { flex: 1; }
   .version { font-size: 11.5px; padding: 6px 12px 0; }
+  .check-update { align-self: flex-start; border: none; background: none; padding: 2px 12px; font-size: 11.5px; color: var(--muted); text-decoration: underline; text-underline-offset: 2px; }
+  .check-update:hover:not(:disabled) { color: var(--text); }
+  .update-error { font-size: 11px; color: var(--bad-text); padding: 2px 12px; overflow-wrap: anywhere; }
   main { min-width: 0; height: 100%; overflow: hidden; }
 </style>

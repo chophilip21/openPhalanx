@@ -28,6 +28,7 @@
     return () => clearInterval(t);
   });
   const lines = $derived(source === LOCAL ? app.logs : memberLines);
+  const notStarted = $derived(app.snapshot?.server.state === "stopped");
 
   // Seed with recent history the first time the page opens.
   $effect(() => {
@@ -81,7 +82,13 @@
     {#each shown as line}
       <div class={level(line)}>{line}</div>
     {:else}
-      <div class="muted">No log output yet.</div>
+      <div class="muted">
+        {#if source === LOCAL && notStarted}
+          The server hasn't been started yet. Its output shows up here once you press Start on the Server page.
+        {:else}
+          No log output yet.
+        {/if}
+      </div>
     {/each}
   </div>
 </div>
