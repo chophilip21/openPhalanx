@@ -36,12 +36,14 @@ curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/i
 ```
 
 Then, in the app:
-
 1. **Models:** pick a model marked **Fits** and click **Download**.
-2. **Server:** press the power button. The first start downloads the server image (about 16 GB); loading the model takes 3–4 minutes.
-3. When the button turns green, note the **pairing code** and the server address.
+2. **Server:** press the power button. The first start builds the server image (a 16 GB download, once); loading the model takes 3–4 minutes.
+3. When the button turns green, note the **pairing code** and the server address, and open port `9090/tcp` to your laptops' network.
 
-Open port `9090/tcp` to your laptops' network.
+**No desktop?** Install only `oppxs`, the same server as a command (it also comes with the app). Keep it running with `systemctl --user enable --now oppxs`, then use `oppxs models`, `oppxs download <model>`, `oppxs use <model>`, `oppxs start` and `oppxs pair`:
+```bash
+curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/install-server.sh | sh -s -- --headless
+```
 
 ### Laptop (Linux or macOS)
 
@@ -85,16 +87,14 @@ Edits are never committed: review them with `git diff` and commit yourself. To r
 
 ## From source
 
-Needs Rust, Node.js 20+ and the WebKitGTK packages listed in [CLAUDE.md](CLAUDE.md).
-
+Needs Rust, Node.js 20+ and the WebKitGTK packages listed in [CLAUDE.md](CLAUDE.md). Testing and the rules for changes are in [CONTRIBUTING.md](CONTRIBUTING.md).
 ```bash
-git clone -b dev https://github.com/chophilip21/openPhalanx.git
-cd openPhalanx
+git clone -b dev https://github.com/chophilip21/openPhalanx.git && cd openPhalanx
 (cd app && npm install && npx tauri dev)    # server app
-cargo install --path client/oppx            # client
+cargo install --path client/oppx && cargo install --path crates/openphalanx-server   # oppx (client), oppxs (server command)
 ```
 
 ## Learn more
 
-* **[CLAUDE.md](CLAUDE.md)**: architecture, security model, clusters, running without the GUI, troubleshooting
+* **[CLAUDE.md](CLAUDE.md)**: architecture, security model, clusters, the headless server, troubleshooting
 * **[Releases](https://github.com/chophilip21/openPhalanx/releases)**: downloads and changelog

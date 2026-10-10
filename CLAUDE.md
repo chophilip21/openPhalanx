@@ -126,6 +126,8 @@ On **Server**, check that the pre-flight list is green, then press the power but
 
 Start is disabled whenever free VRAM is below what the selected model needs. Close other GPU programs, or choose a smaller model or context length.
 
+**Closing the app stops the server** (`shutdown` in the app, on `RunEvent::Exit`): the backend and SearXNG it manages are stopped and the split orders withdrawn, so nothing keeps the GPU's memory without a window to stop it from. Ctrl-C, `kill` and logging out (SIGINT, SIGTERM, SIGHUP) are turned into a normal exit first. A member's app also stops its split worker (`Cluster::goodbye`, which `oppxs` runs on Ctrl-C and SIGTERM too). Two exceptions: a backend started by hand ("running outside the app") is left alone, and an update's relaunch keeps the backend for the new copy to adopt. An app that crashes or gets `kill -9` can't run any of this, so the gateway has a **watchdog**: the app sets `APP_WATCHDOG_S=60` on every backend it starts, the gateway notes each authenticated admin call (the app polls every 2 s), and after 60 s without one it stops the container ("No OpenPhalanx app has checked in for 61 s…" in the log). Verified with the gateway alone: stopped 16 s after start with nobody polling at a 15 s limit; stayed up through 40 s of polling, then stopped 17 s after the last call.
+
 ### 4. Updates
 
 At launch the app asks GitHub for the latest release (`app_update.rs` in core; quiet when offline). If it's newer, a dialog offers to download it; **Check for updates** under the version in the sidebar asks again.
@@ -161,7 +163,29 @@ curl -s -X POST -H "x-admin-token: $ADMIN_TOKEN" http://127.0.0.1:9091/admin/pai
 curl -s -H "x-admin-token: $ADMIN_TOKEN" http://127.0.0.1:9091/admin/status | jq .sglang
 ```
 
-Optional environment variables: `MODEL_PATH`, `CONTEXT_LENGTH`, `MEM_FRACTION_STATIC` (default `0.85`; the GUI computes it from free VRAM instead), `SGLANG_EXTRA_ARGS`. The GUI shows a container started this way as "running outside the app", and can stop it.
+Optional environment variables: `MODEL_PATH`, `CONTEXT_LENGTH`, `MEM_FRACTION_STATIC` (default `0.85`; the GUI computes it from free VRAM instead), `SGLANG_EXTRA_ARGS`. Without `APP_WATCHDOG_S` (which only the app sets) a backend started this way runs until you stop it. The GUI shows a container started this way as "running outside the app", and can stop it.
+
+## Headless server (`oppxs`)
+
+The server as a command, for machines without a desktop and for scripting. It comes inside the `.deb` (`/usr/bin/oppxs`, with a disabled systemd user unit) and as a static binary in each release; `install-server.sh --headless` installs only that, on any Linux, x86-64 or arm64.
+
+```bash
+oppxs run [--name NAME]                 # the server itself; a systemd user unit keeps it running
+oppxs models [--all]                    # catalog: download size, VRAM need at the current context, fit, state
+oppxs download <model>                  # verified, resumable; a catalog id or a unique part of one
+oppxs use <model> | oppxs context <n>   # what `start` serves (the app's settings.json)
+oppxs start | stop | status             # start follows progress until it serves or fails
+oppxs pair | devices | revoke <device>  # pairing code with the fingerprint; paired clients
+oppxs logs [-n LINES] [<member>]        # the backend's log, or a cluster member's
+oppxs servers | invite | make-host | approve | decline | remove | leave | dissolve | strategy | model
+```
+
+* **How it's built:** `core::service::Service` is the orchestrator without a UI: `start` (cluster claim, pre-flight, which refuses a model with broken files, then `server::start`), `stop`, `status` (crash detection with `diagnose_crash`, adopting a backend that already runs, `set_serving` for the cluster), pairing and devices through the admin API. `oppxs run` runs it with the cluster service and a monitor that looks every 2 s, which also feeds the gateway's watchdog. The app still has the same logic in its own command layer (`app/src-tauri/src/lib.rs`) and is to move onto `Service`.
+* **Control API** (`127.0.0.1:9094`, bearer token from `cluster/control.token`, 0600): `GET /control/server`, `POST /control/server/{start|stop|pair}`, `GET /control/devices`, `DELETE /control/devices/{id}`, plus the cluster routes. `models`, `download`, `use`, `context` and `logs` without a member need no running server: they read and write the same settings and model folders as the app.
+* **Stopping it stops the model** (`Service::shutdown` on Ctrl-C or SIGTERM), like closing the app; a killed `oppxs` leaves it to the watchdog. So `systemctl --user restart oppxs` reloads the model.
+* **Service:** `systemctl --user enable --now oppxs`; `loginctl enable-linger $USER` starts it at boot without a login. The user needs Docker access (the `docker` group).
+* **Limits for now:** it serves models that fit its own GPU and can be a cluster member; hosting a split model is started from the desktop app (`plan_split` lives there). The commands talk to `oppxs run` only, not to a running desktop app, and the two can't run on one machine at the same time (ports 9092–9094, shared state).
+* **Tested on the 3090** (scratch settings, Qwen2.5-Coder-14B-AWQ at 16k): `run`, `start` (3 min 51 s to serving, image build included), `status`, `pair` and a real `oppx pair` and `oppx status` against it, `devices`, `revoke` (the client is then refused), `logs`, `stop` (2.8 s), a second `start`, and SIGTERM to the daemon (it exited in 3 s with both containers gone and the GPU's memory free). The backend carried `APP_WATCHDOG_S=60`. Not yet run: the static musl build, the `.deb` with `oppxs` inside and `install-server.sh --headless` (they need a release), and `oppxs` as a cluster host.
 
 ## Client (`oppx`)
 
@@ -255,15 +279,15 @@ oppx servers | oppx use NAME
 
 ## Cluster
 
-Servers on one network form a cluster: one **host** and its **members**. With the split strategy they serve one model together (see **Split serving** below). The service is `cluster::Cluster` in core. It runs inside the app, or headless as `openphalanx-server run` (`crates/openphalanx-server`); both use `~/.local/share/openphalanx/cluster/`, so run one per machine.
+Servers on one network form a cluster: one **host** and its **members**. With the split strategy they serve one model together (see **Split serving** below). The service is `cluster::Cluster` in core. It runs inside the app, or headless as `oppxs run` (`crates/openphalanx-server`); both use `~/.local/share/openphalanx/cluster/`, so run one per machine.
 
 * **Discovery:** every server broadcasts a beacon (id, name, role, certificate fingerprint) on UDP `9093` every 3 s. A server is listed under **Servers on this network** only when its beacon is under 10 s old *and* a TLS health check, pinned to the fingerprint it announced, succeeds. Stopped or unreachable servers drop off within about 10 s. Broadcast only crosses one LAN segment, not Tailscale.
-  * **Fast join:** a server that starts (app opened, or `openphalanx-server run`) sends a query beacon twice; the others answer by unicast at once and check it immediately, so it is listed in about 0.3 s (measured on the 4090) instead of waiting for the next 3 s round.
+  * **Fast join:** a server that starts (app opened, or `oppxs run`) sends a query beacon twice; the others answer by unicast at once and check it immediately, so it is listed in about 0.3 s (measured on the 4090) instead of waiting for the next 3 s round.
 * **Roles** (`state.json`): standalone, host or member. A host with no members is standalone again.
   * **Clients pair with the host only:** members hide the pairing section, refuse `new_pairing_code`, and skip the start-up pairing code.
 * **Joining needs consent on both sides:**
   1. **Add to cluster:** the host sends an invitation (a single-use secret bound to that server, valid for 10 minutes).
-  2. **Approve on the invited server:** in its app, or with `openphalanx-server approve`, after checking the host's fingerprint. It then joins over a connection pinned to that certificate and gets a 256-bit member token; the host stores only its hash.
+  2. **Approve on the invited server:** in its app, or with `oppxs approve`, after checking the host's fingerprint. It then joins over a connection pinned to that certificate and gets a 256-bit member token; the host stores only its hash.
   3. **Trusted hosts:** a server remembers the hosts it approved, and accepts their invitations without asking next time.
 * **Make host (hand-over):**
   * The current host asks a server (on the network, or one of its members) to take over. That server approves ("Become host") and invites everyone in the request.
@@ -273,7 +297,7 @@ Servers on one network form a cluster: one **host** and its **members**. With th
   * **Split model** (default): one model across the servers. Bigger models, about single-GPU speed, needs every server up and a wired network.
   * **Replicas:** a full copy per server. More concurrent users and resilience, no bigger models.
 
-  It's colour-coded in the cluster panel (violet / blue) with an ⓘ tooltip; `openphalanx-server strategy split|replicas` does the same.
+  It's colour-coded in the cluster panel (violet / blue) with an ⓘ tooltip; `oppxs strategy split|replicas` does the same.
   * **Locked while serving:** `set_strategy` refuses a change while this server is serving ("Stop the server before changing the strategy"), and the panel shows the other option faded with a lock.
   * **Pooled VRAM (split):** on a host with online members, the Models page measures fits against the sum of each server's free VRAM (its GPU with the most free memory, as last reported), and every server's runtime memory is added to the need (`vram::split_across`). A donut (`VramPool.svelte`) shows each server's share and the selected model's need. The pre-flight VRAM check follows the split plan (`plan_split` in the app).
 * **Split serving** (cluster step 3, `split.rs`; pipeline parallel with SGLang `--pp-size N --nnodes N`):
@@ -293,20 +317,20 @@ Servers on one network form a cluster: one **host** and its **members**. With th
   * The cluster's model follows the host's selected model (`set_desired_model` on select, on every pre-flight check and on Start; repo plus pinned commit; local-folder models are skipped). The host sends it to members in every report reply.
   * A member that already has it (the app's models folder or the HF cache) reports "ready"; otherwise "missing". **It downloads only after the user agrees on the host:** the Server page asks "laptop-4090 doesn't have … (20.4 GB). Download it there?", and `approve_download` lets members fetch it (verified, resumable), reporting progress and errors (retried). Choosing another model resets the approval.
   * Start waits up to 8 s for members to report on a newly chosen model before checking the split, so a fresh selection doesn't fail on a stale report.
-  * The Machines table shows each member's status; headless, use `openphalanx-server model <catalog-id>|none`.
+  * The Machines table shows each member's status; headless, use `oppxs model <catalog-id>|none`.
   * Verified: the 4090 downloaded Qwen2.5-Coder-7B-AWQ (5.2 GB, about 92 MB/s, verified, marker written), and reported "already on this machine" after a restart.
-* **Member logs:** members queue log lines (their backend's `docker logs` since the last report, plus cluster events such as joins and downloads) and send up to 400 per report. The host keeps 3,000 per member. The Logs page has a machine dropdown; headless, use `openphalanx-server logs <member>`.
+* **Member logs:** members queue log lines (their backend's `docker logs` since the last report, plus cluster events such as joins and downloads) and send up to 400 per report. The host keeps 3,000 per member. The Logs page has a machine dropdown; headless, use `oppxs logs <member>`.
 * **One controller (start guard):** whoever presses Start first becomes the controller; the other side can't start too.
   * `Cluster::claim_start` runs before pre-flight. A standalone server or host just marks itself serving (refused while it is handing control to someone). A member first takes the host role over through `POST /cluster/v1/take-over`, which the host refuses with 409 while it is serving or already handing over. Both checks happen under one `Control` mutex on the host, so two simultaneous presses can't both win.
   * The app's monitor keeps `set_serving` in step with the backend (starting or running). The host sends `host_serving` in report replies; a member then has `locked_by_host` in its view, and its power button turns violet with a lock and "<host> is running the cluster". All it can do is leave the cluster (or close the app).
-* **Split pause:** with the split strategy, a host that is serving stops its backend when a member has said goodbye or hasn't reported for 12 s (`dropped_members`), and the Server page shows "Paused: <member> dropped out of the cluster…" (state `paused`, red). Start again once it's back, or remove it. Members send `POST /cluster/v1/bye` when the app exits (`RunEvent::Exit`) or `openphalanx-server` gets Ctrl-C, so a clean exit pauses at once.
+* **Split pause:** with the split strategy, a host that is serving stops its backend when a member has said goodbye or hasn't reported for 12 s (`dropped_members`), and the Server page shows "Paused: <member> dropped out of the cluster…" (state `paused`, red). Start again once it's back, or remove it. Members send `POST /cluster/v1/bye` when the app exits (`RunEvent::Exit`) or `oppxs` gets Ctrl-C, so a clean exit pauses at once.
 * **Members report** to the host every 5 s (`/cluster/v1/report`): inventory (CPUs, RAM, GPUs with load and temperature, Docker/NVIDIA runtime) and, if their backend runs, what it serves (model, gateway and inference metrics). The host shows a member offline after 20 s without a report. A member that gets 401 (removed, or the cluster was dissolved) becomes standalone.
 * **App:**
   * **Cluster panel** on the Server page: pending invitations and host requests (Approve/Decline, with the sender's fingerprint), this server's role with Rename/Leave/Dissolve, and the servers on the network (Add to cluster / Make host).
   * **In this cluster** cards: the host has a red **Remove** on each member, a member has **Leave** on its own card. A removed server shows up under "Not in this cluster" again, and **Add to cluster** brings it back without asking there (it trusts the host it approved before).
   * **Machines table:** every server, with Make host/Remove for members.
   * **Charts** show **one machine at a time** (a dropdown); the tiles sum the cluster.
-* **Headless control:** `openphalanx-server status | servers | invite <name> | make-host <name> | approve [<name>] | decline <name> | remove <name> | leave | dissolve`. These talk to the running server on `127.0.0.1:9094` with a per-start token in `control.token` (0600). Use `run --name <name>` to set the display name; it's kept.
+* **Headless control:** `oppxs status | servers | invite <name> | make-host <name> | approve [<name>] | decline <name> | remove <name> | leave | dissolve`. These talk to the running server on `127.0.0.1:9094` with a per-start token in `control.token` (0600). Use `run --name <name>` to set the display name; it's kept.
 * **Verified** between the 3090 (app and headless) and the 4090 laptop (headless), on the wired LAN:
   * discovery in both directions; a non-server machine (the HP laptop) never listed;
   * invite and approve; membership surviving restarts of both;
@@ -343,9 +367,9 @@ Servers on one network form a cluster: one **host** and its **members**. With th
 |---|---|
 | `9090/tcp` (all interfaces) | Public gateway API, TLS only. `/health` and `/v1/pair` are open. `/v1/whoami`, `/v1/unpair` (self-revoke), `/v1/info` (model id, context, edit format), `/v1/tokenize`, `/v1/search`, `/v1/models` and `/v1/chat/completions` (OpenAI-compatible, streaming) need a device token |
 | `9091/tcp` (`127.0.0.1` only) | Admin API for the GUI; needs the per-launch admin token |
-| `9092/tcp` (all interfaces, while the app or `openphalanx-server` runs) | Cluster API between servers (TLS, the server's own certificate). `health`, `invite`, `host-request` and `join` (needs an invitation secret) are open; `report` and `leave` need a member token |
+| `9092/tcp` (all interfaces, while the app or `oppxs` runs) | Cluster API between servers (TLS, the server's own certificate). `health`, `invite`, `host-request` and `join` (needs an invitation secret) are open; `report` and `leave` need a member token |
 | `9093/udp` (all interfaces) | Discovery beacons (LAN broadcast) |
-| `9094/tcp` (`127.0.0.1` only) | `openphalanx-server` control API; needs `control.token` |
+| `9094/tcp` (`127.0.0.1` only) | `oppxs` control API (backend and cluster commands); needs `control.token` |
 | `9096`, `9098` (`127.0.0.1` only), `9100`–`9116/tcp` and NCCL's ephemeral ports | Split model only: SGLang and SearXNG on the host's network, and the rendezvous and traffic between the ranks |
 | `~/.local/share/openphalanx/cluster/` | This server's certificate (`head.crt`, `head.key`, 0600), identity, role and trusted hosts (`state.json`), members as host (`members.json`, hashed tokens), and the split run's worker orders (`workers.json`). Deleting it resets the server's cluster identity |
 | `~/.config/openphalanx/settings.json` | Selected model, context length, GPU index, custom models |
@@ -426,7 +450,7 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
 * **CI** (`.github/workflows/ci.yml`, every PR and push to `dev`/`main`): app build and type check, `cargo clippy -D warnings`, `cargo test` for core and `oppx`, ruff (syntax and undefined names) for the gateway, frontend and scripts, shell syntax, and the PR title check for PRs into `main`. The GPU lifecycle test stays manual.
 * **Release** (`.github/workflows/release.yml`, a merged PR into `main` with a release prefix, or run by hand with a bump and a changelog line): `scripts/bump_version.py` bumps every version file and adds the `CHANGELOG.md` entry. The workflow commits "Release vX.Y.Z" to `main`, tags it, fast-forwards `dev` when possible, then starts **Publish** for the tag.
 * **Publish** (`.github/workflows/publish.yml`, `workflow_dispatch` with a tag; redo a release with `gh workflow run publish.yml --ref main -f tag=vX.Y.Z`). It always runs on `main` (the `github-pages` environment only deploys from `main`) and checks out the tag for everything it builds:
-  1. `oppx` for `x86_64`/`aarch64-unknown-linux-musl` (static) and `aarch64`/`x86_64-apple-darwin`, with `OPPX_RELEASE_TARGET` set; the app as `.deb` and AppImage.
+  1. `oppx` for `x86_64`/`aarch64-unknown-linux-musl` (static) and `aarch64`/`x86_64-apple-darwin`, with `OPPX_RELEASE_TARGET` set; `oppxs` for the two Linux musl targets; the app as `.deb` (with `oppxs` and its unit inside: `beforeBundleCommand` builds it, `bundle.linux.deb.files` places it) and AppImage (no `oppxs`: an AppImage is one file).
   2. A GitHub release with the archives, `SHA256SUMS`, `install.sh`, `install-server.sh`, and notes from `main`'s `CHANGELOG.md`.
   3. The docs (`scripts/gen_docs.py` + mdBook) on GitHub Pages.
 * **No backend image is published.** The app carries the build files (`docker::BUILD_FILES`: the Dockerfile, `gateway.py`, `start-sglang.sh`, `supervisord.conf`, embedded with `include_str!`) and builds `openphalanx-backend:<version>-<hash of those files>` on the first start (`docker::ensure_image`): Docker pulls the official SGLang image, pinned by digest in the Dockerfile, and adds ~45 MB on top. A changed gateway or Dockerfile gets a new tag and is rebuilt, so neither users nor developers run a stale image; older tags of ours are removed after a build. Cluster members build the same way when a split worker starts. A custom `image` setting is pulled instead.
@@ -444,6 +468,7 @@ The backend image tag follows the version in the root `Cargo.toml`, so bump both
 | Start disabled with "Needs X but only Y of VRAM is free" | Close other GPU programs (`nvidia-smi` lists them), or choose a smaller model or context |
 | Backend image build fails | The first start pulls `lmsysorg/sglang` from Docker Hub: check the network and disk space (about 55 GB free). Docker Hub allows 100 anonymous pulls per 6 hours per IP; `docker login` raises that. The full build output is in the app's start error and `docker build` can be rerun by hand (see "Run the backend without the GUI") |
 | `oppx aider` crashes with `No module named 'audioop'` / `'pyaudioop'` | An `aider` on `PATH` was installed with Python 3.13, which removed `audioop`. `oppx` only uses a `PATH` Aider at the pinned version; otherwise it uses its private 3.12 engine. Run `oppx --update`, or remove the old Aider |
+| The server stopped after the app crashed or was killed | Intended: the backend's watchdog stops it 60 s after the app goes silent, so it can't hold the GPU. Open the app and start it again |
 | Backend stops during start-up | The GUI shows the reason; the full output is on **Logs** or in `docker logs openphalanx-backend` |
 
 ## Repository layout
@@ -457,7 +482,8 @@ app/                     Tauri 2 + Svelte 5 server GUI (Linux); src-tauri/icons/
   src/                   frontend: pages, components, typed command bindings
   src-tauri/             Rust shell: Tauri commands, 2 s status monitor, log streaming
 crates/openphalanx-core/ Docker, GPU, VRAM, model catalog, downloads, pre-flight, cluster, split plan, app updates (no Tauri, unit-tested)
-crates/openphalanx-server/ openphalanx-server: headless server (cluster service + command-line control)
+crates/openphalanx-server/ oppxs: the server without the desktop app (daemon, control API and its commands)
+packaging/oppxs.service  systemd user unit for oppxs (in the .deb; install-server.sh --headless writes its own)
 crates/pinned-tls/       TLS pinned to a certificate fingerprint (shared by oppx and the cluster)
   catalog.json           curated models pinned to Hugging Face commits (built with scripts/catalog_entry.py); optional per-model
                          edit_format and reasoning_parser (passed as EDIT_FORMAT, --reasoning-parser)

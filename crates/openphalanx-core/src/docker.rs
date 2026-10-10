@@ -38,6 +38,11 @@ pub fn default_image() -> String {
     format!("{IMAGE_NAME}:{}-{}", env!("CARGO_PKG_VERSION"), &hash[..12])
 }
 pub const ADMIN_PORT: u16 = 9091;
+/// A backend the app starts stops itself when no app has called its admin
+/// API for this long (the app polls every 2 s): an app that crashed or was
+/// killed can't stop it, and it would keep the GPU's memory. Long enough for
+/// an update's relaunch, which takes a few seconds.
+pub const APP_WATCHDOG_SECS: u32 = 60;
 /// Private bridge network shared by the backend and SearXNG (no published ports for SearXNG).
 pub const NETWORK: &str = "openphalanx";
 pub const SEARXNG_CONTAINER: &str = "openphalanx-searxng";
@@ -345,6 +350,7 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
         ("AGENT_PORT", spec.agent_port.to_string()),
         ("ADMIN_PORT", ADMIN_PORT.to_string()),
         ("ADMIN_TOKEN", spec.admin_token.clone()),
+        ("APP_WATCHDOG_S", APP_WATCHDOG_SECS.to_string()),
         ("DEVICE_TTL_DAYS", spec.pairing_ttl_days.map_or_else(|| "never".to_string(), |d| d.to_string())),
         // Weights are always fetched by the GUI; never let SGLang download.
         ("HF_HUB_OFFLINE", "1".into()),
@@ -616,6 +622,15 @@ pub fn diagnose_crash(logs: &str) -> Option<String> {
     if l.contains("not enough memory") {
         return Some("SGLang could not fit the model in the memory it was given. Pick a smaller model or context.".into());
     }
+    // Corruption the quick pre-flight check can't see (bits changed inside a
+    // file of the right size) shows up when the weights are read.
+    if ["safetensorerror", "headertoolarge", "invalidheaderdeserialization", "metadataincompletebuffer",
+        "error while deserializing header", "invalid load key", "unpicklingerror"]
+        .iter()
+        .any(|sig| l.contains(sig))
+    {
+        return Some("The model's files are damaged and couldn't be loaded. Download the model again (Models page).".into());
+    }
     if l.contains("incomplete download") || l.contains("missing from") {
         return Some("Some model files are missing or unreadable inside the backend. Re-download the model.".into());
     }
@@ -690,6 +705,7 @@ mod tests {
         assert!(a.contains("-v /m:/m:ro") && a.contains("-v /blobs:/blobs:ro"));
         assert!(a.contains("-e MEM_FRACTION_STATIC=0.812"));
         assert!(a.contains("-e HF_HUB_OFFLINE=1"));
+        assert!(a.contains("-e APP_WATCHDOG_S=60"), "an orphaned backend must stop itself");
         assert!(a.contains("-e DEVICE_TTL_DAYS=7"));
         assert!(run_args(&RunSpec { pairing_ttl_days: None, ..spec() }).join(" ").contains("-e DEVICE_TTL_DAYS=never"));
         assert!(a.contains("--network openphalanx"));
@@ -770,5 +786,7 @@ mod tests {
     fn diagnoses_oom() {
         assert!(diagnose_crash("torch.OutOfMemoryError: CUDA out of memory. Tried").is_some());
         assert!(diagnose_crash("all good").is_none());
+        let damaged = diagnose_crash("safetensors_rust.SafetensorError: Error while deserializing header: HeaderTooLarge");
+        assert!(damaged.unwrap().contains("Download the model again"));
     }
 }

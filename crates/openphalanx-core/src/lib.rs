@@ -12,6 +12,7 @@ pub mod model;
 pub mod net;
 pub mod paths;
 pub mod server;
+pub mod service;
 pub mod settings;
 pub mod split;
 pub mod vram;

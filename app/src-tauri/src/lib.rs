@@ -88,6 +88,9 @@ pub struct AppState {
     cluster: Option<Arc<Cluster>>,
     /// Why the cluster service isn't available, if it isn't.
     cluster_error: Mutex<Option<String>>,
+    /// Set by an update's relaunch: the backend keeps running for the new
+    /// copy of the app to adopt. Every other exit stops it (see `shutdown`).
+    keep_backend: AtomicBool,
 }
 
 impl AppState {
@@ -759,6 +762,7 @@ async fn install_update(app: AppHandle) -> CmdResult<()> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(err)?;
+    app.state::<AppState>().keep_backend.store(true, Ordering::Relaxed);
     app.exit(0);
     Ok(())
 }
@@ -1358,7 +1362,7 @@ async fn serve_cluster(app: AppHandle) {
     let Some(c) = st.cluster.clone() else { return };
     if let Err(e) = c.run().await {
         *st.cluster_error.lock().unwrap() = Some(format!(
-            "The cluster service couldn't start ({e:#}). Is openphalanx-server or another Openphalanx app running on this machine?"
+            "The cluster service couldn't start ({e:#}). Is oppxs or another Openphalanx app running on this machine?"
         ));
     }
 }
@@ -1456,11 +1460,25 @@ pub fn run() {
                 inner: Mutex::new(Inner::default()),
                 cluster,
                 cluster_error: Mutex::new(cluster_error),
+                keep_backend: AtomicBool::new(false),
             }
         })
         .setup(|app| {
             tauri::async_runtime::spawn(monitor(app.handle().clone()));
             tauri::async_runtime::spawn(serve_cluster(app.handle().clone()));
+            // Ctrl-C, `kill` and logging out end the process without Tauri's
+            // exit event: turn them into a normal exit, so `shutdown` runs.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+                let (Ok(mut int), Ok(mut term), Ok(mut hup)) =
+                    (signal(SignalKind::interrupt()), signal(SignalKind::terminate()), signal(SignalKind::hangup()))
+                else {
+                    return;
+                };
+                tokio::select! { _ = int.recv() => {}, _ = term.recv() => {}, _ = hup.recv() => {} }
+                handle.exit(0);
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1506,12 +1524,40 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Openphalanx")
         .run(|app, event| {
-            // Tell the host this member is going away, so a split model pauses
-            // at once instead of after a timeout.
             if let tauri::RunEvent::Exit = event {
-                if let Some(c) = app.state::<AppState>().cluster.clone() {
-                    tauri::async_runtime::block_on(c.goodbye());
-                }
+                tauri::async_runtime::block_on(shutdown(&app.state::<AppState>()));
             }
         });
+}
+
+/// The app is closing: nothing it started may keep running, or the model
+/// would hold the GPU's memory with no window to stop it from.
+///
+/// * As a cluster member: tell the host (a split model then pauses at once)
+///   and stop this machine's split worker (`Cluster::goodbye`).
+/// * Stop the backend and SearXNG this app manages, and withdraw the split
+///   orders so members stop their workers. A backend started by hand
+///   ("running outside the app") is left alone.
+/// * Except for an update's relaunch, where the new copy adopts the backend.
+///
+/// An app that crashes or is killed never gets here; the gateway's watchdog
+/// (`docker::APP_WATCHDOG_SECS`) stops the backend then.
+async fn shutdown(state: &AppState) {
+    if let Some(c) = &state.cluster {
+        c.goodbye().await;
+    }
+    if state.keep_backend.load(Ordering::Relaxed) {
+        return;
+    }
+    let container = docker::inspect().await.ok().flatten();
+    if container.as_ref().is_some_and(|c| !c.managed) {
+        return;
+    }
+    let starting = matches!(state.inner.lock().unwrap().phase, Phase::Starting { .. });
+    if container.is_some() || starting {
+        if let Some(c) = state.cluster.as_ref().filter(|c| !c.is_member()) {
+            c.set_workers(HashMap::new());
+        }
+        let _ = docker::stop().await;
+    }
 }

@@ -37,6 +37,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import ssl
 import subprocess
 import time
@@ -994,9 +995,35 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
 admin = FastAPI(title="openphalanx-admin")
 
 
+# The app polls the admin API every 2 s while it is open. When it started this
+# backend it sets APP_WATCHDOG_S: if no authenticated admin call arrives for
+# that long, the app is gone without stopping us (it crashed or was killed),
+# and the backend stops itself rather than hold the GPU with nobody in charge.
+# Unset (a backend started by hand): no watchdog.
+APP_WATCHDOG_S = float(os.environ.get("APP_WATCHDOG_S") or 0)
+_last_app_call = time.monotonic()
+
+
 def require_admin(x_admin_token: str = Header(default="")) -> None:
+    global _last_app_call
     if not ADMIN_TOKEN or not hmac.compare_digest(x_admin_token, ADMIN_TOKEN):
         raise HTTPException(status_code=401, detail="invalid admin token")
+    _last_app_call = time.monotonic()
+
+
+async def watch_app() -> None:
+    """Stops the container when the app that started it has gone silent."""
+    while APP_WATCHDOG_S > 0:
+        await asyncio.sleep(5)
+        quiet = time.monotonic() - _last_app_call
+        if quiet > APP_WATCHDOG_S:
+            print(
+                f"No OpenPhalanx app has checked in for {quiet:.0f} s; stopping the backend "
+                "so it doesn't keep the GPU's memory.",
+                flush=True,
+            )
+            os.kill(1, signal.SIGTERM)  # supervisord: the whole container stops
+            return
 
 
 @admin.get("/admin/status", dependencies=[Depends(require_admin)])
@@ -1086,10 +1113,12 @@ async def main() -> None:
         uvicorn.Config(admin, host=ADMIN_HOST, port=ADMIN_PORT, log_level="warning")
     )
     flusher = asyncio.create_task(flush_devices())
+    watchdog = asyncio.create_task(watch_app())
     try:
         await asyncio.gather(public_server.serve(), admin_server.serve())
     finally:
         flusher.cancel()
+        watchdog.cancel()
         if devices.dirty:
             devices.save()
 

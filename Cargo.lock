@@ -2866,6 +2866,7 @@ dependencies = [
  "axum",
  "clap",
  "hex",
+ "libc",
  "openphalanx-core",
  "rand 0.9.5",
  "reqwest 0.12.28",

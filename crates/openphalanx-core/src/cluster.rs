@@ -1,6 +1,6 @@
 //! Clusters of Openphalanx servers on one network.
 //!
-//! Every server (the app, or the headless `openphalanx-server`) runs this
+//! Every server (the app, or the headless `oppxs`) runs this
 //! service. It announces itself on the LAN, lists the other servers it can
 //! actually reach, and can form a cluster with them:
 //!
@@ -820,6 +820,11 @@ impl Cluster {
                     .timeout(Duration::from_secs(2))
                     .send()
                     .await;
+            }
+            // Its share of a split model goes with it: the host pauses on the
+            // goodbye, and a worker left behind would only hold the GPU.
+            if self.worker.lock().unwrap().take().is_some() {
+                let _ = crate::docker::remove_worker().await;
             }
         }
     }
