@@ -10,7 +10,10 @@ Two listeners share one process (and therefore pairing/metrics state):
   everything else (``/v1/whoami``, ``/v1/info``, ``/v1/tokenize``, ``/v1/unpair`` and the OpenAI-compatible inference proxy,
   ``/v1/models`` and ``/v1/chat/completions``, and ``/v1/search``) needs a
   device token. Request bodies (prompts, i.e. client code) and search
-  queries are never logged or stored.
+  queries are never logged or stored. The request trace (``reqtrace.py``,
+  shown on the app's Trace page) lives in memory only and holds timings,
+  token counts and hashes; it keeps text only while the app's content switch
+  is on.
 * Admin API (``ADMIN_PORT``, plain HTTP): used by the Openphalanx GUI only. The
   container publishes it on the host's loopback interface, and every call must
   carry the per-launch ``ADMIN_TOKEN``.
@@ -52,6 +55,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
+
+import reqtrace
 
 SGLANG_ROOT = f"http://127.0.0.1:{os.environ.get('SGLANG_PORT', '8080')}"
 MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", "openphalanx-coder")
@@ -320,6 +325,7 @@ class Metrics:
 devices = DeviceStore(DEVICES_PATH, POLICY_PATH)
 pairing = Pairing()
 metrics = Metrics()
+trace = reqtrace.Trace()
 
 
 # --------------------------------------------------------------------------
@@ -409,6 +415,15 @@ async def sglang_metrics() -> dict:
         "running_requests": sums.get("sglang:num_running_reqs"),
         "queued_requests": sums.get("sglang:num_queue_reqs"),
         "token_usage": sums.get("sglang:token_usage"),
+        # The prefix cache's pools, for the Trace page.
+        "kv_used_tokens": sums.get("sglang:kv_used_tokens"),
+        "kv_evictable_tokens": sums.get("sglang:kv_evictable_tokens"),
+        "kv_available_tokens": sums.get("sglang:kv_available_tokens"),
+        "max_total_num_tokens": sums.get("sglang:max_total_num_tokens"),
+        "evicted_tokens_total": sums.get("sglang:evicted_tokens_total"),
+        "state_used": sums.get("sglang:mamba_used_tokens"),
+        "state_evictable": sums.get("sglang:mamba_evictable_tokens"),
+        "state_available": sums.get("sglang:mamba_available_tokens"),
     }
 
 
@@ -481,6 +496,9 @@ async def info(device: dict = Depends(require_device)) -> dict:
         "context_length": await effective_context(),
         "edit_format": EDIT_FORMAT,
         "reasoning": REASONING,
+        # This server reads `oppx_trace` labels (and strips them); clients
+        # send them only when it says so, since an older one would pass them on.
+        "trace": True,
         "web_search": bool(SEARXNG_URL),
         "ready": await sglang_ready(),
     }
@@ -876,6 +894,36 @@ def _has_token(event: bytes) -> bool:
                for c in choices)
 
 
+def _delta_text(event: bytes) -> str:
+    """The generated text in one streamed event (only read while the trace keeps content)."""
+    if not event.startswith(b"data: {"):
+        return ""
+    try:
+        choices = json.loads(event[6:]).get("choices") or []
+    except ValueError:
+        return ""
+    return "".join((c.get("delta") or {}).get("content") or "" for c in choices if isinstance(c, dict))
+
+
+def _trace_body(rec: dict, payload: bytes) -> None:
+    """Token counts (and, while content is kept, the reply) of a whole response."""
+    try:
+        obj = json.loads(payload)
+    except ValueError:
+        return
+    if not isinstance(obj, dict):
+        return
+    trace.usage(rec, obj.get("usage"))
+    # SGLang's own refusal (e.g. "Input length … exceeds"): server text, not the client's.
+    message = obj.get("message") or (obj.get("error") or {}).get("message") if isinstance(obj.get("error"), (dict, type(None))) else None
+    if isinstance(message, str) and message:
+        rec["error"] = message[:120]
+    if trace.content:
+        for c in obj.get("choices") or []:
+            if isinstance(c, dict) and isinstance(c.get("message"), dict):
+                trace.output(rec, c["message"].get("content") or "")
+
+
 def _sanitize(body: dict) -> str | None:
     """Clamps generation settings; returns an error message for requests that
     cannot possibly fit (cheap check before SGLang tokenizes them)."""
@@ -919,6 +967,10 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
     # reasoning models those carry no regex, so the flag is what keeps them
     # from being routed and searched. Never forwarded to SGLang.
     utility = bool(body.pop("oppx_utility", False))
+    # What the client says this request is (turn, step, kind of call); never
+    # forwarded either. The record holds no text unless the app asked for it.
+    rec = trace.begin(device, body, body.pop("oppx_trace", None), stream=bool(body.get("stream")))
+    rec["utility"] = utility
     auto_search = (
         request.headers.get("x-oppx-web-search", "").lower() == "auto"
         and bool(SEARXNG_URL)
@@ -941,6 +993,7 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
     try:
         await _acquire(device["id"])
     except _Busy:
+        trace.finish(rec, 503, "busy: no free slot")
         return JSONResponse(
             status_code=503,
             content={"error": {"message": "The server is busy with other requests; try again shortly.", "type": "server_busy"}},
@@ -951,17 +1004,24 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
     metrics.requests_total += 1
     metrics.requests_active += 1
     metrics.last_request_at = time.time()
+    trace.mark(rec, "queue_ms")
+    rec["state"] = "running"
     try:
         # Inside the try: any error here must give the slots back.
         devices.touch(device)
         if auto_search:
+            searches = metrics.auto_searched
             resp = await _send_with_auto_search(body, device)
+            rec["routed"] = True
+            rec["searched"] = metrics.auto_searched > searches
+            trace.mark(rec, "router_ms")
         else:
             resp = await _send(body)
     except BaseException as e:
         metrics.requests_active -= 1
         metrics.requests_failed += 1
         _release(device["id"])
+        trace.finish(rec, 503, type(e).__name__)
         if not isinstance(e, httpx.HTTPError):
             raise
         return openai_error(503, "The model is still loading; try again shortly.", "service_unavailable")
@@ -977,6 +1037,8 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
             metrics.requests_active -= 1
             _release(device["id"])
         _record_usage(device, content)
+        _trace_body(rec, content)
+        trace.finish(rec, resp.status_code)
         return Response(content, status_code=resp.status_code, media_type=media_type)
 
     done = False
@@ -992,6 +1054,8 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
         await resp.aclose()
         metrics.requests_active -= 1
         _release(device["id"])
+        # No usage event means the stream ended early: the client left.
+        trace.finish(rec, resp.status_code, None if "prompt_tokens" in rec or resp.status_code >= 400 else "cancelled")
 
     async def relay():
         # Re-frame on SSE event boundaries so the usage event can be inspected
@@ -1007,6 +1071,9 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
                     if not timed and _has_token(event):
                         timed = True
                         metrics.note_ttft(time.monotonic() - arrived)
+                        trace.mark(rec, "ttft_ms")
+                    if trace.content:
+                        trace.output(rec, _delta_text(event))
                     if event.startswith(b"data: {") and b'"usage"' in event:
                         try:
                             obj = json.loads(event[6:])
@@ -1014,6 +1081,7 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
                             obj = None
                         if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
                             usage = obj["usage"]
+                            trace.usage(rec, usage)
                             devices.add_usage(
                                 device,
                                 int(usage.get("prompt_tokens") or 0),
@@ -1025,6 +1093,8 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
                 if out:
                     yield b"".join(out)
             if buf:
+                if resp.status_code >= 400:
+                    _trace_body(rec, buf)  # a refusal comes as one JSON body
                 yield buf
         except httpx.HTTPError:
             metrics.requests_failed += 1
@@ -1088,6 +1158,38 @@ async def admin_status() -> dict:
         "devices": len(devices.devices),
         "tls_fingerprint": tls_fingerprint(),
     }
+
+
+class TraceContent(BaseModel):
+    enabled: bool
+
+
+@admin.get("/admin/trace", dependencies=[Depends(require_admin)])
+async def admin_trace(after: int = 0, limit: int = 500) -> dict:
+    """Requests newer than `after` (and unfinished older ones), with the prefix cache's pool state."""
+    out = trace.since(after, max(1, min(limit, reqtrace.MAX_RECORDS)))
+    out["pool"] = await sglang_metrics()
+    out["context"] = CONTEXT_LENGTH
+    return out
+
+
+@admin.get("/admin/trace/tree", dependencies=[Depends(require_admin)])
+async def admin_trace_tree(last: int = reqtrace.TREE_REQUESTS) -> dict:
+    """The tree of shared prompt prefixes among the latest requests."""
+    return trace.tree(max(1, min(last, reqtrace.MAX_RECORDS)))
+
+
+@admin.put("/admin/trace/content", dependencies=[Depends(require_admin)])
+async def admin_trace_content(req: TraceContent) -> dict:
+    """Keeps (or stops keeping, and drops) the latest message and the reply of each request, in memory."""
+    trace.set_content(req.enabled)
+    return {"content": trace.content}
+
+
+@admin.delete("/admin/trace", dependencies=[Depends(require_admin)])
+async def admin_trace_clear() -> dict:
+    trace.clear()
+    return {"ok": True}
 
 
 @admin.post("/admin/pairing", dependencies=[Depends(require_admin)])

@@ -17,6 +17,8 @@ import json
 import os
 import re
 import subprocess
+import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -727,6 +729,17 @@ class Agent:
     _replies: list = field(default_factory=list)  # (user message, reply), the latest few
     _trail: list = field(default_factory=list)  # this turn's actions and results, one line each
     stuck: str = ""  # why the last turn stopped early ("" when it didn't)
+    # Labels sent with every request (`oppx_trace`), for the server's Trace
+    # page: which conversation, turn and step a request belongs to and what
+    # kind of call it is. No text; a tool's title only shows there while the
+    # server's owner has switched content capture on.
+    trace: bool = False  # the server reads the labels (/v1/info says so); never sent otherwise
+    session: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    turns: int = 0
+    _step: int = 0
+    _call: dict = field(default_factory=lambda: {"kind": "other"})  # the call being made now
+    _events: dict = field(default_factory=dict)  # what happened since the last request (cuts, repeats…)
+    _prev: dict = field(default_factory=dict)  # the last action as it turned out (tool, how long it ran here)
     _called: dict = field(default_factory=dict)  # this turn's connector calls -> the step's title
 
     # ---- model calls ------------------------------------------------------
@@ -742,6 +755,7 @@ class Agent:
         self._system_text = None
         self.changed_session.clear()
         self._replies.clear()
+        self.session, self.turns = uuid.uuid4().hex[:12], 0
 
     def undone(self, names: list[str]):
         """/undo restored these files: they no longer count as changed."""
@@ -764,11 +778,25 @@ class Agent:
         memory = f"\n\nProject notes from the user (follow them):\n{self.memory.strip()[:8000]}" if self.memory.strip() else ""
         return f"{SYSTEM}{self._connector_text()}\n\n{overview}{memory}"
 
+    def _event(self, name: str, count: int = 1):
+        self._events[name] = self._events.get(name, 0) + count
+
+    def _trace_labels(self) -> dict:
+        labels = {"session": self.session, "turn": self.turns, "step": self._step, "window": self.context,
+                  "estimate": self._estimate(), **self._call, **self._prev}
+        if self._events:
+            labels["events"] = dict(self._events)
+        self._events.clear()
+        self._prev = {}
+        return labels
+
     def _body(self, extra: dict) -> dict:
         # oppx_utility: the agent has its own web_search tool, so the gateway
         # must not route these calls through its automatic search.
         body = {"model": MODEL, "messages": [{"role": "system", "content": self._system()}] + self._clean(),
                 "temperature": 0, "oppx_utility": True, **extra}
+        if self.trace:
+            body["oppx_trace"] = self._trace_labels()
         if self.reasoning:
             # Both spellings, like the router: gpt-oss reads the first, Qwen3
             # the second. With only the first, Qwen3.6 wrote its whole action
@@ -803,10 +831,13 @@ class Agent:
             return send()
         except ContextOverflow as e:
             self.ratio = max(self.ratio, e.input_tokens / max(1, self._sent_raw) * 1.05)
+            self._event("overflow")
             self._fit()
             return send()
 
     def _action(self, tools: tuple[str, ...]) -> dict:
+        self._call = {"kind": "action"}
+
         def ask(flat: bool):
             schema = action_schema(tools, flat)
             return self._sized(lambda: self._post(self._body({
@@ -934,6 +965,7 @@ class Agent:
             saved = int(len(m["content"]) // 3 * self.ratio)
             m["content"] = m["content"].split("\n", 1)[0] + "\n[output removed to save space; run the tool again if you need it]"
             m["_cut"] = True
+            self._event("cut")
             est -= saved
             if est <= budget:
                 return
@@ -944,6 +976,7 @@ class Agent:
                 drop += 1
             est -= int(sum(len(m["content"]) for m in self.messages[:drop]) // 3 * self.ratio)
             del self.messages[:drop]
+            self._event("dropped")
 
     def _raw_estimate(self) -> int:
         """The system prompt and every message, at ~3 characters a token."""
@@ -973,6 +1006,8 @@ class Agent:
         the message reads as a request for a change (None: assume it does when
         edits are on). The model decides what the message needs."""
         self._trail, self.stuck, self._called = [], "", {}
+        self.turns += 1
+        self._step, self._prev = 0, {}
         try:
             return self._turn(text, can_edit, can_edit if wants_change is None else (wants_change and can_edit))
         except Exception as e:
@@ -1042,6 +1077,7 @@ class Agent:
             self.messages.append({"role": "user", "_result": True, "content": content})
 
         for n in range(1, MAX_STEPS + 1):
+            self._step = n
             if self.hooks.interrupted():
                 return ""
             self._fit()
@@ -1108,6 +1144,7 @@ class Agent:
                 plans += 1
                 if plans > MAX_PLANS:
                     repeats += 1
+                    self._event("repeat")
                     last_repeat = "plan"
                     note("You have planned enough; act on the plan above, or answer.")
                     continue
@@ -1141,11 +1178,13 @@ class Agent:
                 if tool == "read" else None
             if seen_at:
                 repeats += 1
+                self._event("repeat")
                 last_repeat = title
                 result = (f"Those lines were already shown at step {seen_at}; they're above. "
                           "Use them, look somewhere else, or answer.")
             elif sig in done and visible(done[sig]) and tool not in ("edit", "create", "run") and tool not in extra:
                 repeats += 1
+                self._event("repeat")
                 last_repeat = title
                 result = (f"You already did exactly this at step {done[sig]}; its result is above. "
                           "Use it: answer now, or take a different action.")
@@ -1159,6 +1198,7 @@ class Agent:
                     sweep = (pattern, sweep[1] + 1) if pattern == sweep[0] and act.get("path") else (pattern, 1)
                     if sweep[1] >= SWEEP:
                         repeats += 1
+                        self._event("repeat")
                         last_repeat = title
                         result += ("\n\n[You are trying the same pattern on one file after another. Search once "
                                    "without a path (or with a folder), or use find for the name.]")
@@ -1174,6 +1214,7 @@ class Agent:
                     first = outputs.setdefault(result, n)
                     if first != n and visible(first):
                         repeats += 1
+                        self._event("repeat")
                         last_repeat = title
                         result = (f"Same result as step {first} (it's above): this search adds nothing. "
                                   "Read one of the files it names, or look for something else.")
@@ -1183,6 +1224,7 @@ class Agent:
                     # Its arguments are only known once written (in _do).
                     if result.startswith(CONNECTOR_SAME):
                         repeats += 1
+                        self._event("repeat")
                         last_repeat = tool
                     elif result.startswith(CONNECTOR_HEAD):
                         called.append(tool)
@@ -1223,6 +1265,9 @@ class Agent:
     def _think(self, prompt: str, title: str) -> str:
         """A free-text step (a plan, a rethink): written by the model, kept in
         the conversation and shown to the user as one step."""
+        kind = {"Rethink": "rethink", "Taking stock": "stock"}.get(title, "plan")
+        self._call = {"kind": kind}
+        self._event(kind)
         self.messages.append({"role": "user", "content": prompt})
         self.hooks.waiting("Planning")
         try:
@@ -1299,7 +1344,10 @@ class Agent:
         asked = _norm(user_text)
         # What it said to other messages; asking the same thing again may get the same reply.
         old = {s for q, r in self._replies if _norm(q) != asked for s in _sentences(r)}
+        self._call = {"kind": "reply"}
+        self._prev = {"prev_tool": "answer"}
         if stuck:
+            self._event("stuck")
             self.hooks.notice(f"Stuck: {stuck}. The reply below is from what was found so far.")
         prompt = ANSWER_PROMPT + (STUCK_PROMPT.format(reason=stuck) if stuck else "") + facts
         # The action that chose to answer would be the last thing the model
@@ -1314,6 +1362,7 @@ class Agent:
             reply, shown = self._held_back(old)
             if not shown and (not reply.strip() or as_action(reply) is not None):
                 what = "empty" if not reply.strip() else "a JSON action"
+                self._event("retry")
                 self.messages[-1] = {"role": "user", "content": prompt + "\n\n" + PLAIN_PROMPT.format(what=what)}
                 try:
                     reply, shown = self._held_back(old, regex=PLAIN_REGEX)
@@ -1358,6 +1407,7 @@ class Agent:
     def _do(self, act: dict) -> str:
         tool, path = act["tool"], act.get("path") or ""
         title = _title(act)
+        began = time.monotonic()
         try:
             if tool == "list":
                 res = self.ws.list(path)
@@ -1392,6 +1442,11 @@ class Agent:
             res = f"Error: {e}"
         if len(res) > RESULT_CHARS:
             res = res[:RESULT_CHARS] + "\n… (cut; ask for less)"
+        # The trace learns what the action was, and how long it ran here, with
+        # the next request (an edit's time is the model writing it: not counted).
+        self._prev = {"prev_tool": tool, "prev_title": title[:200]}
+        if tool not in ("edit", "create"):
+            self._prev["prev_ms"] = round((time.monotonic() - began) * 1000)
         self._trail.append(f"- {title} → {_summary(tool, res)[:120]}")
         self.hooks.step(title, _summary(tool, res))
         return res
@@ -1476,10 +1531,12 @@ class Agent:
         saved = last["content"] if last else ""
         if last and saved.startswith("{"):
             last["content"] = f"I'll write the change to {path} now."
+        self._call = {"kind": "edit", "tool": "edit", "title": f"Write({path})"}
         self.messages.append({"role": "user", "content": prompt})
         try:
             reply = self._text(max_tokens, stream=False)
             if not reply.strip() or as_action(reply) is not None:
+                self._event("retry")
                 self.messages[-1] = {"role": "user", "content": prompt + "\n\nYour last output was a JSON action, not "
                                      "the text. Write the text itself now, starting with the file's name or the code."}
                 try:

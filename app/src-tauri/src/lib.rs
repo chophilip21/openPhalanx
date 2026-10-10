@@ -209,7 +209,12 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
             inner.idle_free_vram.insert(g.index, g.free_bytes);
         }
         for m in st.cluster.as_ref().map(|c| c.members()).unwrap_or_default() {
-            let best = m.report.as_ref().and_then(|r| r.inventory.gpus.iter().map(|g| g.free_bytes).max());
+            // Not from a report that still carries its worker: after a stop the
+            // member's last report (they come every 5 s) was measured with the
+            // worker's memory in use, and for a few seconds the pool looked
+            // too small for the model that had just been running.
+            let idle = m.report.as_ref().filter(|r| r.worker.is_none());
+            let best = idle.and_then(|r| r.inventory.gpus.iter().map(|g| g.free_bytes).max());
             if let (true, Some(free)) = (m.online, best) {
                 inner.idle_member_free.insert(m.id, free);
             }
@@ -821,6 +826,32 @@ async fn revoke_device(id: String) -> CmdResult<()> {
 }
 
 // --------------------------------------------------------------------------
+// Commands: trace (what each request cost, and the prefix cache)
+// --------------------------------------------------------------------------
+
+#[tauri::command]
+async fn get_trace(after: Option<u64>) -> CmdResult<serde_json::Value> {
+    require_admin().await?.trace(after.unwrap_or(0)).await.map_err(err)
+}
+
+#[tauri::command]
+async fn get_trace_tree() -> CmdResult<serde_json::Value> {
+    require_admin().await?.trace_tree().await.map_err(err)
+}
+
+#[tauri::command]
+async fn clear_trace() -> CmdResult<()> {
+    require_admin().await?.clear_trace().await.map(|_| ()).map_err(err)
+}
+
+/// Content capture is the owner's choice and off by default: the gateway
+/// otherwise keeps no text a client sent.
+#[tauri::command]
+async fn set_trace_content(enabled: bool) -> CmdResult<()> {
+    require_admin().await?.set_trace_content(enabled).await.map_err(err)
+}
+
+// --------------------------------------------------------------------------
 // Commands: models
 // --------------------------------------------------------------------------
 
@@ -911,9 +942,12 @@ fn cluster_pool(state: &AppState, gpu: Option<&gpu::GpuInfo>, available: Option<
             }];
             for m in c.members().into_iter().filter(|m| m.online) {
                 let best = m.report.as_ref().and_then(|r| r.inventory.gpus.iter().max_by_key(|g| g.free_bytes).cloned());
+                // Its worker holds memory until the report after it is gone.
+                let busy = m.report.as_ref().is_some_and(|r| r.worker.is_some());
                 if let Some(g) = best {
-                    // While serving, what it had before its worker started.
-                    let available = if running { idle.get(&m.id).copied().unwrap_or(g.free_bytes) } else { g.free_bytes };
+                    // While serving (or while its worker is still there after
+                    // a stop), what it had before its worker started.
+                    let available = if running || busy { idle.get(&m.id).copied().unwrap_or(g.free_bytes) } else { g.free_bytes };
                     nodes.push(PoolNode {
                         id: m.id,
                         name: m.name,
@@ -1532,6 +1566,10 @@ pub fn run() {
             list_devices,
             set_pairing_ttl,
             revoke_device,
+            get_trace,
+            get_trace_tree,
+            clear_trace,
+            set_trace_content,
             get_models,
             select_model,
             set_context_len,

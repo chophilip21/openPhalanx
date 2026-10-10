@@ -166,6 +166,9 @@ pub struct ServerInfo {
     /// The model reasons before answering (older servers don't say: false).
     #[serde(default)]
     pub reasoning: bool,
+    /// The server reads trace labels on requests (older servers don't: false).
+    #[serde(default)]
+    pub trace: bool,
     pub web_search: bool,
     pub ready: bool,
 }

@@ -15,7 +15,7 @@ from rich.markup import escape
 from rich.text import Text
 
 from .config import (ACCENT, CONTEXT, ENGINE, EXTRA_MEMORY, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, PRINT_MODE,
-                     REASONING, RED, SERVER, TESTED_AIDER, WEB, YELLOW)
+                     REASONING, RED, SERVER, TESTED_AIDER, TRACE, WEB, YELLOW)
 from .term import EscWatcher, SESSION, SPIN, Thinking, UI, out, step
 from .render import BulletStream, hide_reasoning, show_diff, show_edits, snapshot
 from .mcp import Hub
@@ -218,7 +218,7 @@ def make_agent(coder) -> Agent:
                   confirm_tool=on_confirm_tool,
                   waiting=lambda label: SPIN.start(label), interrupted=lambda: UI.interrupted)
     agent = Agent(ws=Workspace(coder.root, getattr(coder, "repo_map", None), coder.io.encoding),
-                  hooks=hooks, context=CONTEXT, reasoning=REASONING, web=WEB, memory=_memory(coder),
+                  hooks=hooks, context=CONTEXT, reasoning=REASONING, trace=TRACE, web=WEB, memory=_memory(coder),
                   connectors=UI.connectors)
     # -c / -r: continue from the restored conversation (questions and answers).
     for m in coder.done_messages or []:
@@ -261,7 +261,10 @@ def agent_turn(coder, text: str):
     if text.startswith("/ask "):
         text, can_edit = text[5:].strip(), False
     read_only = not can_edit
-    wants_change = can_edit and wants_edit(text)
+    agent = UI.agent
+    # The ask/edit check belongs to the turn that is about to start (for the server's Trace page).
+    route = {"session": agent.session, "turn": agent.turns + 1, "step": 0, "kind": "route"}
+    wants_change = can_edit and wants_edit(text, route)
     agent = UI.agent
     if agent.memory != _memory(coder):  # # notes and /init change it
         agent.memory = _memory(coder)

@@ -175,6 +175,24 @@ class AgentLoop(unittest.TestCase):
         self.assertNotIn("answer", seen[0])
         self.assertIn("answer", seen[1])
 
+    def test_requests_carry_trace_labels_only_when_the_server_reads_them(self):
+        s = self.s
+        s.actions = [{"tool": "grep", "pattern": "def add"}, {"tool": "answer"}]
+        s.texts = ["In src/calc.py:4."]
+        s.agent.turn("where is add?", can_edit=True, wants_change=False)
+        self.assertNotIn("oppx_trace", s.agent._body({}))
+        s.agent.trace = True
+        s.agent._call = {"kind": "action"}
+        s.agent._do({"tool": "grep", "pattern": "LIMIT"})
+        labels = s.agent._body({})["oppx_trace"]
+        self.assertEqual((labels["session"], labels["turn"], labels["kind"]), (s.agent.session, 1, "action"))
+        self.assertEqual((labels["prev_tool"], labels["prev_title"]), ("grep", "Grep(LIMIT)"))
+        self.assertIn("prev_ms", labels)
+        self.assertNotIn("prev_tool", s.agent._body({})["oppx_trace"])  # told once
+        before = s.agent.session
+        s.agent.reset()
+        self.assertNotEqual(s.agent.session, before)
+
     def test_plan_mode_has_no_edit_tools(self):
         s = self.s
         s.actions = [{"tool": "edit", "path": "src/calc.py"}]

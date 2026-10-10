@@ -7,8 +7,10 @@
 # 2. Start publish.yml on main for the new tag: builds, the GitHub release,
 #    docs on GitHub Pages and (with a self-hosted runner) the backend image.
 #
-# Repository settings needed: Actions may write to contents (and push to main,
-# if main is protected), and Pages uses "GitHub Actions" as its source.
+# Repository settings needed: Actions may write to contents, and Pages uses
+# "GitHub Actions" as its source. main is protected by a ruleset, so the release
+# commit is pushed with a deploy key (secret RELEASE_DEPLOY_KEY, write access)
+# and "Deploy keys" is on the ruleset's bypass list; GITHUB_TOKEN can't be.
 name: Release
 
 on:
@@ -44,6 +46,8 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          # The pushes below go through this key (see the header).
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
       - name: Bump the version from the PR title
         id: bump
         env:
@@ -66,7 +70,8 @@ jobs:
           git add -A   # CHANGELOG.md is new on the first release
           git commit -m "Release v$VERSION"
           git tag "v$VERSION"
-          git push origin HEAD:main "v$VERSION"
+          # Atomic: a refused push to main must not leave the tag behind.
+          git push --atomic origin HEAD:main "v$VERSION"
           # Bring dev along when it hasn't moved since the merge.
           git push origin HEAD:dev || echo "::warning::dev has new commits; merge main into dev to pick up v$VERSION"
       - name: Build and publish the release
@@ -74,5 +79,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.bump.outputs.version }}
-        # A tag pushed with GITHUB_TOKEN starts no workflow, but a dispatch does.
+        # publish.yml has no tag trigger; it is started here, on main, for the tag.
         run: gh workflow run publish.yml --repo "$GITHUB_REPOSITORY" --ref main -f tag="v$VERSION"

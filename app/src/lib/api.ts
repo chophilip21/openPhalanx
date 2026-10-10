@@ -339,7 +339,67 @@ export type ContextLimit = {
   servers: number;
 };
 
+/** One chat request as the gateway saw it (`reqtrace.py`). Text fields exist only while content capture is on. */
+export type TraceRecord = {
+  seq: number;
+  at: number;
+  device: string;
+  device_name: string;
+  session?: string;
+  turn?: number;
+  step?: number;
+  kind?: string;
+  tool?: string;
+  window?: number;
+  estimate?: number;
+  events?: Record<string, number>;
+  messages: number;
+  stream: boolean;
+  constrained: string | null;
+  max_tokens: number | null;
+  state: "queued" | "running" | "done" | "failed";
+  status?: number;
+  error?: string;
+  queue_ms?: number;
+  router_ms?: number;
+  ttft_ms?: number;
+  total_ms?: number;
+  /** How long the client took to run the tool this action chose (not model time). */
+  tool_ms?: number;
+  prompt_tokens?: number;
+  cached_tokens?: number;
+  /** What the prefix cache could have held: the part of the prompt an earlier request already sent. */
+  expected_cached?: number;
+  completion_tokens?: number;
+  routed?: boolean;
+  searched?: boolean;
+  utility?: boolean;
+  title?: string;
+  input_tail?: string;
+  output?: string;
+};
+export type TracePool = {
+  kv_used_tokens?: number | null;
+  kv_evictable_tokens?: number | null;
+  kv_available_tokens?: number | null;
+  max_total_num_tokens?: number | null;
+  evicted_tokens_total?: number | null;
+  state_used?: number | null;
+  state_evictable?: number | null;
+  state_available?: number | null;
+  cache_hit_ratio?: number | null;
+  gen_throughput?: number | null;
+};
+export type TraceBatch = { latest: number; content: boolean; started_at: number; context: number; pool: TracePool; records: TraceRecord[] };
+/** A run of messages shared by every request through it; `start`/`end` are token positions in the prompt. */
+export type TraceNode = { id: string; parent: string; start: number; end: number; requests: number; ends: number[]; ended: number; first: number; last: number; last_at: number };
+export type TraceTree = { nodes: TraceNode[]; requests: number; latest: number };
+
 export const api = {
+  trace: (after: number) => invoke<TraceBatch>("get_trace", { after }),
+  traceTree: () => invoke<TraceTree>("get_trace_tree"),
+  clearTrace: () => invoke<void>("clear_trace"),
+  setTraceContent: (enabled: boolean) => invoke<void>("set_trace_content", { enabled }),
   contextLimit: () => invoke<ContextLimit>("get_context_limit"),
   snapshot: () => invoke<Snapshot>("get_snapshot"),
   checkUpdate: () => invoke<UpdateCheck>("check_update"),

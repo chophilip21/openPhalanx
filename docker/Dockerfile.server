@@ -19,6 +19,7 @@ RUN uv venv /opt/gateway --python 3.12 \
 COPY server/supervisord.conf /etc/supervisor/conf.d/openphalanx.conf
 COPY server/start-sglang.sh /opt/openphalanx/start-sglang.sh
 COPY server/gateway.py /opt/openphalanx/gateway.py
+COPY server/reqtrace.py /opt/openphalanx/reqtrace.py
 RUN chmod +x /opt/openphalanx/start-sglang.sh && mkdir -p /state
 
 ENV MODEL_PATH=Qwen/Qwen2.5-Coder-14B-Instruct-AWQ \

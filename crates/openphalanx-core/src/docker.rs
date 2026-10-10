@@ -20,6 +20,7 @@ pub const IMAGE_NAME: &str = "openphalanx-backend";
 pub const BUILD_FILES: &[(&str, &str)] = &[
     ("Dockerfile.server", include_str!("../../../docker/Dockerfile.server")),
     ("server/gateway.py", include_str!("../../../docker/server/gateway.py")),
+    ("server/reqtrace.py", include_str!("../../../docker/server/reqtrace.py")),
     ("server/start-sglang.sh", include_str!("../../../docker/server/start-sglang.sh")),
     ("server/supervisord.conf", include_str!("../../../docker/server/supervisord.conf")),
 ];

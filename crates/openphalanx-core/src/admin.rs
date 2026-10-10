@@ -144,6 +144,36 @@ impl AdminClient {
         self.call(reqwest::Method::DELETE, &format!("/admin/devices/{id}")).await
     }
 
+    /// The gateway's request trace: records newer than `after` (and unfinished
+    /// older ones) with the prefix cache's pool state. Passed through as JSON;
+    /// the app's Trace page knows the shape (`reqtrace.py`).
+    pub async fn trace(&self, after: u64) -> Result<serde_json::Value> {
+        self.call(reqwest::Method::GET, &format!("/admin/trace?after={after}")).await
+    }
+
+    /// The tree of shared prompt prefixes among the latest requests.
+    pub async fn trace_tree(&self) -> Result<serde_json::Value> {
+        self.call(reqwest::Method::GET, "/admin/trace/tree").await
+    }
+
+    pub async fn clear_trace(&self) -> Result<serde_json::Value> {
+        self.call(reqwest::Method::DELETE, "/admin/trace").await
+    }
+
+    /// Keeps the latest message and the reply of each request in the trace
+    /// (in the gateway's memory), or stops and drops what was kept.
+    pub async fn set_trace_content(&self, enabled: bool) -> Result<()> {
+        self.http
+            .put(format!("{}/admin/trace/content", self.base))
+            .header("x-admin-token", &self.token)
+            .json(&serde_json::json!({ "enabled": enabled }))
+            .send()
+            .await
+            .context("backend admin API is not reachable yet")?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// How long pairings last, for every device (`None`: never expire).
     pub async fn set_pairing_ttl(&self, days: Option<u32>) -> Result<()> {
         self.http
