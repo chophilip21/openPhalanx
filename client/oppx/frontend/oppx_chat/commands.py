@@ -379,28 +379,39 @@ def git_diff(root: str) -> str:
 
 
 def permissions_command(arg: str):
-    """/permissions: the "always" answers saved for this project."""
+    """/permissions: this project's allow and deny rules (as in Claude Code)."""
     perms = UI.permissions
     if perms is None:
         step("Permissions apply to the agent engine.", YELLOW)
         return
     word, _, rest = arg.partition(" ")
+    rule = " ".join(rest.strip().strip("`").split())
     if word == "clear":
         perms.clear()
         step("Cleared. Commands that change things are asked about again.")
-    elif word in ("remove", "rm") and rest.strip():
-        rule = rest.strip().strip("`")
+    elif word in ("remove", "rm") and rule:
         step(f"Removed {rule}." if perms.remove(rule) else f"No rule {rule}.", MUTED)
+    elif word == "allow" and rule:
+        if perms.add("run", rule):
+            step(f"Allowed without asking from now on: {escape(rule)}", GREEN)
+        else:
+            step(f"{escape(rule)} is asked every time and can't be allowed in advance.", YELLOW)
+    elif word == "deny" and rule:
+        perms.add("deny", rule)
+        step(f"Denied from now on: {escape(rule)} (refused without asking; it wins over allow rules)", YELLOW)
     else:
-        headline("Runs without asking in this project")
-        step("commands that only read: git status/log/diff/show, ls, cat, rg, grep, find, head, wc …")
-        for rule in perms.run:
-            step(f"[{GREEN}]{escape(rule)}[/] (command)")
-        for tool in perms.tools:
-            step(f"[{GREEN}]{escape(tool)}[/] (connector tool)")
-        if not perms.run and not perms.tools:
-            step("nothing else yet: answer [bold]a[/] to a question to add a rule")
-        step("/permissions remove <rule> · /permissions clear · never remembered: rm, sudo, git push, git reset …")
+        headline("Permissions in this project")
+        step("never asked: commands that only read, inside the project (git status/log/diff/show, ls, cat, rg, grep, find …)")
+        for r in perms.run:
+            step(f"[{GREEN}]allow[/] {escape(r)}")
+        for t in perms.tools:
+            step(f"[{GREEN}]allow[/] {escape(t)} [dim](connector tool)[/]")
+        for r in perms.deny:
+            step(f"[{RED}]deny[/]  {escape(r)}")
+        if not (perms.run or perms.tools or perms.deny):
+            step("no rules yet: answer [bold]a[/] to a question, or /permissions allow <command>")
+        step("asked every time: rm, sudo, chmod, git push, git reset, git clean, bash -c, eval, xargs, python -c …")
+        step(f"/permissions allow|deny|remove <rule> · /permissions clear · saved in {escape(str(perms.path))}")
 
 
 def undo_edits() -> None:

@@ -34,6 +34,7 @@ class UiState:
     agent = None  # the agent (agent.Agent) when the agent engine runs
     connectors = None  # the session's MCP connectors (mcp.Hub), with the agent engine
     permissions = None  # permissions.Permissions: what runs without asking in this project
+    read_only_turn = False  # plan mode or /ask: only commands that read may run
 
 
 UI = UiState()
