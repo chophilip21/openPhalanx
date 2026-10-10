@@ -53,7 +53,7 @@
     {#each slices as s (s.node.id)}
       <div class="row">
         <span class="sw" style="background:{s.color}"></span>
-        <span class="name">{s.node.name}{s.node.this ? " (this machine)" : ""}</span>
+        <span class="name">{s.node.this ? "This machine" : s.node.name}</span>
         <span class="muted gpu">{s.node.gpu ?? "no GPU"}</span>
         <span class="num"><strong>{gib(s.node.available_bytes)}</strong> <span class="muted">of {gib(s.node.total_bytes)} · {Math.round(s.pct)}%</span></span>
       </div>

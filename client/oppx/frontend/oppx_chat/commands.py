@@ -44,6 +44,7 @@ HELP = [
         ("!<command>", "run a shell command and share its output"),
         ("/test, /lint", "run your tests or linter and fix failures"),
         ("/mcp", "connectors (MCP servers): list, add, remove, tools, reconnect"),
+        ("/permissions", "what runs without asking in this project: list, remove <rule>, clear"),
     ]),
     ("Session", [
         ("/status", "server, model, context and mode"),
@@ -377,6 +378,31 @@ def git_diff(root: str) -> str:
         return ""
 
 
+def permissions_command(arg: str):
+    """/permissions: the "always" answers saved for this project."""
+    perms = UI.permissions
+    if perms is None:
+        step("Permissions apply to the agent engine.", YELLOW)
+        return
+    word, _, rest = arg.partition(" ")
+    if word == "clear":
+        perms.clear()
+        step("Cleared. Commands that change things are asked about again.")
+    elif word in ("remove", "rm") and rest.strip():
+        rule = rest.strip().strip("`")
+        step(f"Removed {rule}." if perms.remove(rule) else f"No rule {rule}.", MUTED)
+    else:
+        headline("Runs without asking in this project")
+        step("commands that only read: git status/log/diff/show, ls, cat, rg, grep, find, head, wc …")
+        for rule in perms.run:
+            step(f"[{GREEN}]{escape(rule)}[/] (command)")
+        for tool in perms.tools:
+            step(f"[{GREEN}]{escape(tool)}[/] (connector tool)")
+        if not perms.run and not perms.tools:
+            step("nothing else yet: answer [bold]a[/] to a question to add a rule")
+        step("/permissions remove <rule> · /permissions clear · never remembered: rm, sudo, git push, git reset …")
+
+
 def undo_edits() -> None:
     """Restores the files the last editing turn changed (nothing is committed,
     so this is a file restore, not a git revert). Works once per turn."""
@@ -479,6 +505,8 @@ def translate(coder, text: str):
         undo_edits()
     elif name == "/mcp":
         mcp_command(coder, arg)
+    elif name in ("/permissions", "/allowed-tools"):
+        permissions_command(arg)
     elif name in ("/commit", "/git"):
         step("OpenPhalanx never commits. Use git yourself: git diff, git commit.", YELLOW)
     elif name in NOT_AVAILABLE:

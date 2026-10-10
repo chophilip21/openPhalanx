@@ -125,7 +125,10 @@ export type ClusterRole = { role: "standalone" } | { role: "host" } | { role: "m
 
 export type ClusterMember = {
   id: string;
+  /** What this machine calls it: its nickname here, else its address. */
   name: string;
+  /** The name the server gives itself. */
+  announced?: string;
   url: string;
   fingerprint: string;
   joined_at: number;
@@ -136,7 +139,9 @@ export type ClusterMember = {
 
 export type ClusterCandidate = {
   id: string;
+  /** What this machine calls it: its nickname here, else its address. */
   name: string;
+  announced?: string;
   url: string;
   fingerprint: string;
   role: string;
@@ -161,6 +166,8 @@ export type ClusterState = {
   host_requests: { from: Peer; members: Peer[]; received_at: number }[];
   host_link: { connected: boolean; last_ok: number | null; error: string | null } | null;
   discovery_error: string | null;
+  /** Nicknames given on this machine, by id (other servers, paired devices). */
+  nicknames: Record<string, string>;
   desired_model: ModelSpec | null;
   /** As host: members that lack the model may download it. */
   download_approved: boolean;
@@ -395,6 +402,9 @@ export type TraceBatch = { latest: number; content: boolean; started_at: number;
 export type TraceNode = { id: string; parent: string; start: number; end: number; requests: number; ends: number[]; ended: number; first: number; last: number; last_at: number };
 export type TraceTree = { nodes: TraceNode[]; requests: number; latest: number };
 
+/** Another process listening on one of this server's ports. `ours`: an OpenPhalanx server (safe to stop). */
+export type PortHolder = { port: number; proto: string; purpose: string; pid: number | null; name: string; ours: boolean };
+
 export const api = {
   trace: (after: number) => invoke<TraceBatch>("get_trace", { after }),
   traceTree: () => invoke<TraceTree>("get_trace_tree"),
@@ -437,6 +447,11 @@ export const api = {
   clusterLeave: () => invoke<void>("cluster_leave"),
   clusterDissolve: () => invoke<void>("cluster_dissolve"),
   clusterRename: (name: string) => invoke<void>("cluster_rename", { name }),
+  /** A nickname for another server or a paired device, saved on this machine; null removes it. */
+  clusterSetNickname: (id: string, name: string | null) => invoke<void>("cluster_set_nickname", { id, name }),
+  portHolders: () => invoke<PortHolder[]>("port_holders"),
+  /** Stops other OpenPhalanx server processes holding the ports; returns [stopped, still held by others]. */
+  freePorts: () => invoke<[string[], PortHolder[]]>("free_ports"),
   clusterMemberLogs: (id: string) => invoke<string[]>("cluster_member_logs", { id }),
   clusterSetStrategy: (strategy: ClusterStrategy) => invoke<void>("cluster_set_strategy", { strategy }),
   clusterApproveDownload: () => invoke<void>("cluster_approve_download"),

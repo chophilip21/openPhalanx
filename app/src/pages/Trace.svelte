@@ -10,11 +10,19 @@
   // No text a client sent is shown unless content capture is switched on.
   import Icon from "../components/Icon.svelte";
   import Notice from "../components/Notice.svelte";
+  import NodeName from "../components/NodeName.svelte";
   import { api, errorText, type TraceNode, type TraceRecord } from "../lib/api";
   import { app } from "../lib/store.svelte";
   import { median, msPerToken, phases, refreshTrace, refreshTree, resetTrace, trace, turns } from "../lib/trace.svelte";
 
-  const serving = $derived(["running", "external"].includes(app.snapshot?.server.state ?? "stopped"));
+  // From the moment the backend starts, not only once the model is loaded:
+  // its gateway records (and takes the content switch) as soon as it is up,
+  // a few seconds in. The page used to wait for "running", so capture couldn't
+  // be switched on during the minutes a model takes to load.
+  const phase = $derived(app.snapshot?.server.state ?? "stopped");
+  const serving = $derived(["starting", "running", "external"].includes(phase));
+  /** The gateway has answered: the switches work. */
+  const ready = $derived(serving && trace.loaded && !trace.error);
   let paused = $state(false);
   let actionError = $state("");
 
@@ -35,6 +43,10 @@
   // Follows the newest turn until one is picked by hand.
   const turn = $derived(all.find((t) => t.key === picked) ?? all[0] ?? null);
   const rate = $derived(msPerToken(trace.records));
+
+  /** A client is shown by the nickname given on this machine, else the name it paired with. */
+  const nicknames = $derived(app.snapshot?.cluster?.nicknames ?? {});
+  const called = (t: { device: string; deviceId: string }) => nicknames[t.deviceId] ?? t.device;
 
   // ---- formatting -----------------------------------------------------------
   const ms = (v: number | null | undefined) =>
@@ -212,11 +224,11 @@
     </div>
     <div class="controls">
       <label class="switch" title="Keeps the latest message, the reply and tool titles of each request in the server's memory, to show here. Off: only timings, token counts and hashes are kept, and what was captured is dropped.">
-        <input type="checkbox" checked={trace.content} disabled={!serving} onchange={(e) => setContent(e.currentTarget.checked)} />
+        <input type="checkbox" checked={trace.content} disabled={!ready} onchange={(e) => setContent(e.currentTarget.checked)} />
         Capture content
       </label>
-      <button class="ghost small" disabled={!serving} onclick={() => (paused = !paused)}>{paused ? "Resume" : "Pause"}</button>
-      <button class="ghost small" disabled={!serving} onclick={clear}><Icon name="trash" size={13} /> Clear</button>
+      <button class="ghost small" disabled={!ready} onclick={() => (paused = !paused)}>{paused ? "Resume" : "Pause"}</button>
+      <button class="ghost small" disabled={!ready} onclick={clear}><Icon name="trash" size={13} /> Clear</button>
     </div>
   </header>
 
@@ -227,11 +239,13 @@
 
   {#if !serving}
     <div class="card empty muted">The trace is recorded while the server runs. Start it on the Server page.</div>
+  {:else if trace.error && !trace.records.length && phase === "starting"}
+    <div class="card empty muted">The server is starting. The trace (and the Capture content switch) is available as soon as its gateway answers, a few seconds in, well before the model has loaded.</div>
   {:else if trace.error && !trace.records.length}
     <!-- A backend started before this page existed has no trace endpoint. -->
     <div class="card empty muted">This backend isn't recording a trace: it was started with an older version of the app. Stop the server and start it again.</div>
   {:else if !trace.records.length}
-    <div class="card empty muted">{trace.loaded ? "No requests yet. Send one from a paired client." : "Loading…"}</div>
+    <div class="card empty muted">{trace.loaded ? (phase === "starting" ? "Recording. No requests yet: the model is still loading." : "No requests yet. Send one from a paired client.") : "Loading…"}</div>
   {:else}
     <div class="tiles">
       <div class="card tile"><span class="eyebrow">Requests</span><strong>{trace.records.length.toLocaleString()}</strong><span class="muted">{all.length} turns{totals.failed ? ` · ${totals.failed} failed` : ""}</span></div>
@@ -247,7 +261,7 @@
           <button class="turn" class:on={turn?.key === t.key} role="option" aria-selected={turn?.key === t.key} onclick={() => (picked = t.key)}>
             <span class="when">{clock(t.at)}</span>
             <span class="what">
-              <strong>{t.label}</strong> <span class="muted">· {t.device}{t.records[0].session ? ` · ${t.records[0].session.slice(0, 4)}` : ""}</span>
+              <strong>{t.label}</strong> <span class="muted">· {called(t)}{t.records[0].session ? ` · ${t.records[0].session.slice(0, 4)}` : ""}</span>
               <span class="muted line2">{t.records.length} request{t.records.length === 1 ? "" : "s"} · {ms(t.durationMs)} · {pct(t.cached, t.prompt)} cached</span>
             </span>
             <span class="flags">
@@ -265,6 +279,7 @@
           <div class="card">
             <div class="head">
               <div class="eyebrow">Where the time went · {turn.label}</div>
+              <span class="client muted">Client: <NodeName id={turn.deviceId} name={turn.device} /></span>
               <div class="legend">
                 <span><i class="key read"></i>Reading the prompt</span>
                 <span><i class="key write"></i>Writing</span>
@@ -280,7 +295,7 @@
               </div>
               <div class="frows">
                 {#each ticks as t}<i class="grid" style:left="{(100 * t) / line.span}%"></i>{/each}
-                <div class="frow"><div class="span root" style:left="0" style:width="100%"><b>{turn.label} · {turn.device}</b><em>{ms(turn.durationMs)}</em></div></div>
+                <div class="frow"><div class="span root" style:left="0" style:width="100%"><b>{turn.label} · {called(turn)}</b><em>{ms(turn.durationMs)}</em></div></div>
                 {#each line.rows as x (x.r.seq)}
                   {@const r = x.r}
                   {@const from = (100 * x.start) / line.span}
@@ -528,6 +543,7 @@
   .key.age.a2, .node.a2 { background: var(--a2); }
   .key.age.a3, .node.a3 { background: var(--a3); }
   .foot { margin: 10px 0 0; font-size: 12px; }
+  .client { font-size: 12px; margin-right: auto; }
 
   /* Time line, flame-graph style: a time axis, the turn's span, then one span
      per request placed on the turn's clock, coloured by what the time was. */

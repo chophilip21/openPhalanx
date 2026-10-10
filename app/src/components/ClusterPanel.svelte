@@ -3,6 +3,7 @@
   // and the Openphalanx servers on this network that this machine can reach.
   // Only running, reachable servers are listed (see core cluster.rs).
   import { ask } from "@tauri-apps/plugin-dialog";
+  import NodeName from "./NodeName.svelte";
   import Icon from "./Icon.svelte";
   import { app } from "../lib/store.svelte";
   import { api, errorText, type ClusterState, type ClusterStrategy } from "../lib/api";
@@ -19,9 +20,12 @@
   const role = $derived(cluster.role);
   const memberCount = $derived(cluster.members.length);
 
+  /** The name a server in this cluster gives itself (a tooltip beside what it is called here). */
+  const announcedOf = (id: string) => cluster.members.find((m) => m.id === id)?.announced ?? "";
+
   /** Every server in this machine's cluster, this machine first. */
   const inCluster = $derived.by(() => {
-    const me = { id: cluster.id, name: `${cluster.name} (this machine)`, url: (cluster.url ?? "").replace("https://", ""), online: true };
+    const me = { id: cluster.id, name: "This machine", url: (cluster.url ?? "").replace("https://", ""), online: true };
     if (role.role === "host") {
       return [
         { ...me, label: "Host", badge: "host" },
@@ -74,6 +78,40 @@
       const problems = await api.clusterApproveHost(fromId);
       if (problems.length) throw new Error(`This machine is now the host, but some servers couldn't be invited: ${problems.join("; ")}`);
     }, "This machine is now the host; the others join as they confirm.");
+  }
+
+  /** The cluster service can't start because another server process on this
+   *  machine holds its ports: show which, and stop it if it is one of ours. */
+  async function freePorts() {
+    busy = "ports";
+    error = "";
+    notice = "";
+    try {
+      const holders = await api.portHolders();
+      const ours = holders.filter((h) => h.ours && h.pid != null);
+      const others = holders.filter((h) => !h.ours);
+      const describe = (h: (typeof holders)[number]) =>
+        h.pid != null ? `${h.name} (pid ${h.pid}) on port ${h.port}` : `another user's process on port ${h.port}`;
+      if (!ours.length) {
+        error = others.length
+          ? `The ports are held by something that isn't OpenPhalanx: ${others.map(describe).join("; ")}. Stop it yourself; this app won't.`
+          : "Nothing is holding the ports now; the cluster service starts by itself within a few seconds.";
+        return;
+      }
+      const names = [...new Set(ours.map((h) => `${h.name} (pid ${h.pid})`))].join(", ");
+      const yes = await ask(
+        `Stop ${names}? It is another OpenPhalanx server on this machine holding the ports this app needs. If it is serving a model, that stops too.`,
+        { title: "Free the ports", kind: "warning" },
+      );
+      if (!yes) return;
+      const [stopped, left] = await api.freePorts();
+      notice = `Stopped ${stopped.join(", ")}. The cluster service starts within a few seconds.`;
+      if (left.length) error = `Still held by something else: ${left.map(describe).join("; ")}.`;
+    } catch (e) {
+      error = errorText(e);
+    } finally {
+      busy = "";
+    }
   }
 
   async function leave() {
@@ -149,8 +187,9 @@
           <button type="button" class="ghost" onclick={() => (renaming = false)}>Cancel</button>
         </form>
       {:else}
-        <span class="name">{cluster.name}</span>
-        <button class="ghost tiny-btn" title="Rename this server" onclick={() => { newName = cluster.name; renaming = true; }}>Rename</button>
+        <span class="name">This machine</span>
+        <span class="muted small" title="The name the other servers on your network show for this machine">seen by others as “{cluster.name}”</span>
+        <button class="ghost tiny-btn" title="Change the name other servers show for this machine" onclick={() => { newName = cluster.name; renaming = true; }}>Rename</button>
       {/if}
       <span class="muted small">
         {#if role.role === "host"}
@@ -215,7 +254,7 @@
         <div class="server joined" class:offline={!m.online}>
           <span class="node-icon joined-icon"><Icon name="check" size={14} stroke={2.6} /></span>
           <div class="server-text">
-            <span class="name">{m.name}</span>
+            {#if m.id === cluster.id}<span class="name">{m.name}</span>{:else}<NodeName id={m.id} name={m.name} announced={announcedOf(m.id)} />{/if}
             <span class="muted mono tiny">{m.url}</span>
           </div>
           <span class="badge {m.badge}">{m.label}</span>
@@ -248,7 +287,7 @@
       <div class="server available" class:busy={c.busy}>
         <span class="node-icon"><Icon name="server" size={15} /></span>
         <div class="server-text">
-          <span class="name">{c.name}</span>
+          <NodeName id={c.id} name={c.name} announced={c.announced ?? ""} />
           <span class="muted mono tiny">{c.url.replace("https://", "")} · {short(c.fingerprint)}</span>
         </div>
         {#if c.busy}
@@ -268,7 +307,12 @@
 
   {#if notice}<p class="ok small">{notice}</p>{/if}
   {#if error}<p class="err small">{error}</p>{/if}
-  {#if cluster.error}<p class="err small">{cluster.error}</p>{/if}
+  {#if cluster.error}
+    <p class="err small">
+      {cluster.error}
+      <button class="ghost tiny-btn" disabled={!!busy} onclick={freePorts}>Free the ports…</button>
+    </p>
+  {/if}
 </div>
 
 <style>

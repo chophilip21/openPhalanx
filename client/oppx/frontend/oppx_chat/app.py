@@ -20,6 +20,7 @@ from .term import EscWatcher, SESSION, SPIN, Thinking, UI, out, step
 from .render import BulletStream, hide_reasoning, show_diff, show_edits, snapshot
 from .mcp import Hub
 from .agent import Agent, Hooks, Workspace
+from .permissions import Permissions
 from .routing import wants_edit
 from .context import CONTEXT_MGR, PRI_EDITED, _check_tokens, _fitted_format_messages
 from .oppx_io import OppxIO
@@ -179,33 +180,47 @@ def make_agent(coder) -> Agent:
         show_diff(rel, before or "", after)
         SPIN.start()
 
+    perms = UI.permissions = Permissions(coder.root)
+
     def on_confirm(command: str) -> bool:
+        """Commands that only read run without a question, and so does
+        anything a saved rule covers. The rest is asked once: yes, no, or
+        always (a rule for this project, kept between sessions). Asking for
+        every `git log` taught people to press y without reading."""
+        if perms.allows(command):
+            return True
+        rules = perms.offer(command)
         SPIN.stop()
-        if SESSION.watcher:
-            SESSION.watcher.pause()
-        try:
-            return coder.io.confirm_ask("Run this command?", subject=command, explicit_yes_required=True)
-        finally:
-            if SESSION.watcher:
-                SESSION.watcher.resume()
-            SPIN.start()
+        out(f"\n[{YELLOW}]⏺[/] [bold]Run this command?[/]")
+        for line in command.splitlines():
+            out(f"  [{MUTED}]│[/] {escape(line)}")
+        always = f", a = always allow {', '.join(f'`{r}`' for r in rules)} in this project" if rules else ""
+        answer = coder.io._ask_line(f"  Allow? (y/N{always}) ").strip().lower()
+        ok = answer in ("y", "yes") or (bool(rules) and answer in ("a", "always"))
+        if ok and answer in ("a", "always"):
+            perms.allow_always(command)
+            step(f"Allowed, and from now on without asking: {', '.join(rules)} (/permissions to change)", GREEN)
+        else:
+            step("Allowed" if ok else "Declined", GREEN if ok else MUTED)
+        SPIN.start()
+        return ok
 
     def on_confirm_tool(name: str, arguments: str, read_only: bool) -> bool:
         """A connector tool reaches outside the repository, so each call is
-        the user's to allow: once, or for the rest of the session."""
-        if name in UI.tools_allowed:
+        the user's to allow: once, or always (saved for this project)."""
+        if perms.tool_allowed(name):
             return True
         SPIN.stop()
         note = f" [{MUTED}](its connector says it only reads)[/]" if read_only else ""
         out(f"\n[{YELLOW}]⏺[/] [bold]Call this connector tool?[/]{note}")
         for line in f"{name} {arguments}".splitlines()[:30]:
             out(f"  [{MUTED}]│[/] {escape(line)}")
-        answer = coder.io._ask_line("  Allow? (y/N, a = always in this session) ").strip().lower()
+        answer = coder.io._ask_line(f"  Allow? (y/N, a = always allow {name} in this project) ").strip().lower()
         ok = answer in ("y", "yes", "a", "always")
         if answer in ("a", "always"):
-            UI.tools_allowed.add(name)
-        step(("Allowed for this session" if name in UI.tools_allowed else "Allowed") if ok else "Declined",
-             GREEN if ok else MUTED)
+            perms.allow_tool(name)
+        step(("Allowed, and from now on without asking (/permissions to change)" if perms.tool_allowed(name) else "Allowed")
+             if ok else "Declined", GREEN if ok else MUTED)
         SPIN.start()
         return ok
 

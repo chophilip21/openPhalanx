@@ -46,6 +46,12 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Show what holds this server's ports and stop it if it is another OpenPhalanx server (a leftover oppxs, the desktop app). Never stops anything else.
+    FreePorts {
+        /// Don't ask before stopping.
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// The catalog: what each model needs, whether it fits this GPU, what is downloaded.
     Models {
         /// Also list models that don't fit this GPU.
@@ -101,6 +107,13 @@ enum Command {
     /// it. A catalog id (e.g. Qwen/Qwen2.5-Coder-14B-Instruct-AWQ), or `none`.
     /// (The app sets this when its server starts.)
     Model { model: String },
+    /// Give another server a nickname on this machine (shown here in place of
+    /// its address; saved). Without a name: remove the nickname.
+    Nickname {
+        /// The server: its address, current nickname, own name or id.
+        server: String,
+        name: Option<String>,
+    },
     /// The backend's log, or a cluster member's recent lines.
     Logs {
         member: Option<String>,
@@ -204,6 +217,22 @@ async fn ctl_model(State((c, token)): State<Ctl>, headers: HeaderMap, Json(req):
     }
 }
 
+#[derive(serde::Deserialize)]
+struct NicknameReq {
+    id: String,
+    name: Option<String>,
+}
+
+async fn ctl_nickname(State((c, token)): State<Ctl>, headers: HeaderMap, Json(req): Json<NicknameReq>) -> Response {
+    if !authorized(&headers, &token) {
+        return fail(StatusCode::UNAUTHORIZED, "bad control token");
+    }
+    match c.set_nickname(&req.id, req.name.as_deref()) {
+        Ok(()) => Json(serde_json::json!({})).into_response(),
+        Err(e) => fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    }
+}
+
 async fn ctl_logs(State((c, token)): State<Ctl>, headers: HeaderMap, UrlPath(id): UrlPath<String>) -> Response {
     if !authorized(&headers, &token) {
         return fail(StatusCode::UNAUTHORIZED, "bad control token");
@@ -272,13 +301,14 @@ async fn run(name: Option<String>) -> Result<()> {
         .route("/control/status", get(ctl_status))
         .route("/control/{action}/{id}", post(ctl_action))
         .route("/control/model", post(ctl_model))
+        .route("/control/nickname", post(ctl_nickname))
         .route("/control/logs/{id}", get(ctl_logs))
         .with_state((cluster.clone(), token))
         .merge(backend);
     tokio::spawn(service.clone().monitor());
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], CONTROL_PORT)))
         .await
-        .with_context(|| format!("port {CONTROL_PORT} is in use; is oppxs or the OpenPhalanx app already running?"))?;
+        .with_context(|| format!("port {CONTROL_PORT} is in use: oppxs or the OpenPhalanx app is already running on this machine. `oppxs free-ports` shows what holds it and stops it"))?;
     tokio::spawn(async move { axum::serve(listener, control).await });
 
     println!("OpenPhalanx server \"{}\" ({})", cluster.name(), cluster.id());
@@ -295,6 +325,46 @@ async fn run(name: Option<String>) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `oppxs free-ports`: what holds this server's ports, and stopping it when it
+/// is one of ours. The app and `oppxs` share the ports, so a copy left running
+/// keeps the next one from starting; waiting never fixes that.
+async fn free_ports(yes: bool) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+    let holders = openphalanx_core::ports::holders().await?;
+    if holders.is_empty() {
+        println!("Nothing holds the server's ports (9092, 9093/udp, 9094). `oppxs run` or the app can start.");
+        return Ok(());
+    }
+    for h in &holders {
+        println!("{}", h.describe());
+    }
+    let mut ours: Vec<String> = holders.iter().filter(|h| h.ours).filter_map(|h| h.pid.map(|p| format!("{} (pid {p})", h.name))).collect();
+    ours.sort();
+    ours.dedup();
+    if ours.is_empty() {
+        bail!("none of these is an OpenPhalanx server, so nothing was stopped; stop it yourself");
+    }
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!("would stop {}; run again with --yes", ours.join(", "));
+        }
+        print!("Stop {}? If it is serving a model, that stops too. [y/N] ", ours.join(", "));
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Nothing was stopped.");
+            return Ok(());
+        }
+    }
+    let (stopped, left) = openphalanx_core::ports::free().await?;
+    println!("Stopped {}.", stopped.join(", "));
+    for h in &left {
+        println!("Still: {}", h.describe());
+    }
+    Ok(())
 }
 
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
@@ -474,7 +544,7 @@ async fn control(cmd: Command) -> Result<()> {
             if st.state == "running" {
                 println!("clients      {} paired · pair at {}", st.devices, st.endpoint.as_deref().unwrap_or("?"));
             }
-            println!("{} ({}) · {}", view.name, view.id, describe_role(&view.role));
+            println!("This machine (others see it as \"{}\", {}) · {}", view.name, view.id, describe_role(&view.role));
             println!("certificate  {}", short(&view.fingerprint));
             println!("strategy     {}", serde_json::to_value(view.strategy)?.as_str().unwrap_or("?"));
             if let Some(m) = &view.desired_model {
@@ -574,6 +644,26 @@ async fn control(cmd: Command) -> Result<()> {
             ctl.act("dissolve", "-").await?;
             println!("Cluster dissolved; its members are standalone again.");
         }
+        Command::Nickname { server, name } => {
+            // By what it is called here (nickname or address), its own name, or its id.
+            let mut known: Vec<(String, String, String)> = view.members.iter().map(|m| (m.id.clone(), m.name.clone(), m.announced.clone())).collect();
+            known.extend(view.candidates.iter().map(|c| (c.id.clone(), c.name.clone(), c.announced.clone())));
+            if let Role::Member { host, .. } = &view.role {
+                known.push((host.id.clone(), host.name.clone(), String::new()));
+            }
+            let id = pick("server", &server, known.iter().map(|(id, name, _)| (id.as_str(), name.as_str())))
+                .or_else(|e| pick("server", &server, known.iter().map(|(id, _, own)| (id.as_str(), own.as_str()))).map_err(|_| e))?;
+            let resp = ctl.client.post(format!("http://127.0.0.1:{CONTROL_PORT}/control/nickname")).bearer_auth(&ctl.token)
+                .json(&serde_json::json!({ "id": id, "name": name })).send().await?;
+            if !resp.status().is_success() {
+                let v: serde_json::Value = resp.json().await.unwrap_or_default();
+                bail!("{}", v["error"].as_str().unwrap_or("failed"));
+            }
+            match name.filter(|n| !n.trim().is_empty()) {
+                Some(n) => println!("{server} is now shown as \"{}\" on this machine.", n.trim()),
+                None => println!("Nickname removed; {server} is shown by its address again."),
+            }
+        }
         Command::Model { model } => {
             let body = if model.eq_ignore_ascii_case("none") { serde_json::json!({ "model": null }) } else { serde_json::json!({ "model": model }) };
             let resp = ctl.client.post(format!("http://127.0.0.1:{CONTROL_PORT}/control/model")).bearer_auth(&ctl.token).json(&body).send().await?;
@@ -603,6 +693,7 @@ async fn control(cmd: Command) -> Result<()> {
             println!("Strategy set to {}.", strategy.to_lowercase());
         }
         Command::Run { .. }
+        | Command::FreePorts { .. }
         | Command::Models { .. }
         | Command::Download { .. }
         | Command::Use { .. }
@@ -819,6 +910,7 @@ async fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Run { name } => run(name).await,
+        Command::FreePorts { yes } => free_ports(yes).await,
         Command::Models { all } => models(all).await,
         Command::Download { model } => download_model(&model).await,
         Command::Use { model } => use_model(&model),

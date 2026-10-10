@@ -65,7 +65,9 @@ export function resetTrace() {
 export type Turn = {
   key: string;
   label: string;
+  /** The client's name as it paired, and its id (a nickname given here goes by the id). */
   device: string;
+  deviceId: string;
   at: number;
   records: TraceRecord[];
   durationMs: number;
@@ -95,6 +97,7 @@ export function turns(records: TraceRecord[]): Turn[] {
       key,
       label: first.session ? `Turn ${first.turn}` : "Request",
       device: first.device_name || first.device,
+      deviceId: first.device,
       at: first.at,
       records: recs,
       durationMs: Math.max(0, end - first.at * 1000),

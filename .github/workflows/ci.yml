@@ -5,6 +5,9 @@ name: CI
 
 on:
   pull_request:
+    # edited: a corrected PR title must re-run the title check (a re-run of the
+    # old run keeps the old title).
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [dev, main]
 
@@ -26,6 +29,14 @@ jobs:
         env:
           TITLE: ${{ github.event.pull_request.title }}
         run: python3 scripts/bump_version.py --check --title "$TITLE"
+      - name: Prefixes are read in any case
+        run: |
+          python3 - <<'PY'
+          import importlib.util as u
+          s = u.spec_from_file_location("b", "scripts/bump_version.py"); b = u.module_from_spec(s); s.loader.exec_module(b)
+          for title, want in (("[Bug] x", "patch"), ("[FEATURE] x", "minor"), ("[ Feature ] x", "minor"), ("[Major] x", "major"), ("[Docs] x", None), ("[bug]x", "patch")):
+              assert b.parse_title(title)[0] == want, title
+          PY
 
   rust:
     runs-on: ubuntu-22.04
@@ -73,6 +84,8 @@ jobs:
         run: python3 scripts/test_agent.py
       - name: Request trace tests (the gateway's trace module; no dependencies)
         run: python3 scripts/test_reqtrace.py
+      - name: Command allowlist tests (what the agent may run without asking; no dependencies)
+        run: python3 scripts/test_permissions.py
       - name: Shell syntax
         # Each script with its own interpreter (bash scripts use arrays).
         run: |

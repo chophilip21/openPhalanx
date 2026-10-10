@@ -23,6 +23,8 @@ Modules, lowest layer first (each imports only from the ones above it):
     context    ContextManager: fit every request into the context window
     mcp        connectors: MCP servers the user added, as extra tools (no UI
                code; also run alone by `oppx mcp add` to check a connector)
+    permissions  what may run without asking: commands that only read, and
+               the user's saved "always" answers (no UI code)
     agent      the agent engine: the model reads the repository on demand with
                tools (no UI code; app.py connects it to the terminal)
     oppx_io    Aider's InputOutput restyled: prompt, keys, confirmations

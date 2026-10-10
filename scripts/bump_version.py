@@ -33,7 +33,8 @@ PREFIXES = {
     "major": "major", "breaking": "major",
 }
 NO_RELEASE = {"docs", "doc", "ci", "chore", "test", "refactor"}
-TITLE = re.compile(r"^\s*\[(?P<kind>[A-Za-z]+)\]\s*(?P<rest>.+)$")
+# The prefix in any case, with or without spaces inside the brackets: [Bug], [FEATURE], [ feature ].
+TITLE = re.compile(r"^\s*\[\s*(?P<kind>[A-Za-z]+)\s*\]\s*(?P<rest>.+)$")
 
 
 def parse_title(title: str):

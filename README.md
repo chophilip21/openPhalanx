@@ -27,64 +27,64 @@ Run a coding model on your own Linux GPU machine and use it from any laptop on y
 
 ## Quick Start
 
-### Server (Linux x86-64 + NVIDIA GPU)
+Every GPU machine needs Linux, a working `nvidia-smi` (24 GB or above VRAM recommended, 8GB absolute minimum), Docker (your user in the `docker` group) and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). The installers check these first.
 
-You need a working `nvidia-smi` (24 GB or above VRAM recommended, 8GB absolute minimum), Docker with your user in the `docker` group, and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Install the app (Debian/Ubuntu; the installer checks these first):
+### A. One GPU machine with a desktop (the app)
 
 ```bash
 curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/install-server.sh | sh
 ```
+1. Open **Openphalanx**. On **Models**, pick a model marked **Fits** and click **Download**.
+2. On **Server**, press the power button. The first start downloads the server image (16 GB, once); loading a model takes 3–4 minutes.
+3. When the button is green, a **pairing code** appears. Open port `9090/tcp` to your laptops and go to [Laptop](#laptop-linux-or-macos).
 
-Then, in the app:
-1. **Models:** pick a model marked **Fits** and click **Download**.
-2. **Server:** press the power button. The first start builds the server image (a 16 GB download, once); loading the model takes 3–4 minutes.
-3. When the button turns green, note the **pairing code** and the server address, and open port `9090/tcp` to your laptops' network.
+### B. One GPU machine without a desktop (`oppxs`)
 
-**No desktop?** Install only `oppxs`, the same server as a command (it also comes with the app). Keep it running with `systemctl --user enable --now oppxs`, then use `oppxs models`, `oppxs download <model>`, `oppxs use <model>`, `oppxs start` and `oppxs pair`:
 ```bash
 curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/install-server.sh | sh -s -- --headless
+systemctl --user enable --now oppxs    # the server process; keeps running
+oppxs models                           # what fits this GPU
+oppxs download <model> && oppxs use <model>
+oppxs start                            # serves the model; `oppxs stop` to stop
+oppxs pair                             # prints the pairing code for a laptop
 ```
+
+### C. Several GPU machines as one (a model too big for one GPU)
+
+One machine is the **host**: you start the model there and laptops pair with it. It must run **the app** (A). Every other machine is a **member**: install the app, or `oppxs` with the first command of B. All on the same version and the same wired network.
+
+| Step | On the host (app, **Server** page) | On each member |
+|---|---|---|
+| 1 | | Open the app, or `systemctl --user enable --now oppxs` |
+| 2 | Under **Servers on this network**, click **Add to cluster** | |
+| 3 | | Click **Approve** in the app, or run `oppxs approve` |
+| 4 | Pick the model on **Models** (it now counts every machine's VRAM) | |
+| 5 | Press the power button. If a member lacks the model, click **Download on <its name>** | Nothing: it starts its share by itself |
+
+Between the machines, allow `9092/tcp`, `9093/udp` and `9100–9116/tcp`, and keep them on a network you trust. `oppxs status` on a member shows its host and anything waiting for approval; `oppxs leave` takes it out again. A machine that doesn't show up usually has a second server process holding its ports (the app and `oppxs` can't both run): `oppxs free-ports`, or **Free the ports** in the app, stops the leftover.
 
 ### Laptop (Linux or macOS)
 
-Install `oppx`. It sets up its own coding engine, so there's nothing else to install:
-
 ```bash
 curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/install.sh | sh
-oppx --update                     # any time: update oppx and its engine
-```
-
-Pair once with the address and code from the app (on the server machine itself, just `oppx pair self`). `oppx` prints the server's certificate fingerprint; check it matches the one in the app, then confirm:
-
-```bash
-oppx pair 192.168.1.77 ABCD-EFGH
+oppx pair 192.168.1.77 ABCD-EFGH  # the host's address and pairing code (on the server itself: oppx pair self)
 oppx status                       # certificate, device and model all ✓
 ```
 
-Then, in any git repo:
-
+`oppx pair` prints the server's certificate fingerprint; check it matches the one in the app (or `oppxs pair`). Then, in any git repo:
 ```bash
 oppx                              # start a conversation
 oppx "fix the failing test"       # start with a request
 oppx -c                           # continue the last conversation (-r to pick an older one)
 oppx -p "explain src/main.rs"     # answer once and exit
-oppx --no-web                     # without automatic web search
-oppx mcp add <name> -- <command>  # add an MCP server's tools (oppx mcp list, oppx mcp remove <name>; /mcp in the chat)
+oppx --update                     # update oppx and its engine
+oppx mcp add <name> -- <command>  # add an MCP server's tools (/mcp in the chat)
 ```
+Edits are never committed: review them with `git diff` and commit yourself. `oppx unpair` removes a laptop (or revoke it on the app's **Devices** page).
 
-Edits are never committed: review them with `git diff` and commit yourself. To remove a laptop, run `oppx unpair` (or revoke it on the app's **Devices** page).
+## Keys in the chat
 
-## Keys and commands
-
-| Key | Action |
-|---|---|
-| **Shift+Tab** | Plan mode (answers only, no edits) |
-| **Esc** | Interrupt the model |
-| **Ctrl-C** twice on an empty line | Exit |
-| **@file** | Add a file to the conversation |
-| **!cmd** | Run a shell command |
-| **# note** | Save a note to project memory (`OPENPHALANX.md`) |
-| **/help** | All commands (`/context`, `/init`, `/undo`, `/search`, `/mcp`, …) |
+**Shift+Tab** plan mode (no edits) · **Esc** interrupt · **Ctrl-C** twice exits · **@file** add a file · **!cmd** run a command · **# note** save to project memory · **/help** all commands
 
 ## From source
 

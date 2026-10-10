@@ -65,7 +65,7 @@ export function nodesOf(snap: Snapshot | null): NodeView[] {
   const c = snap.cluster;
   const self: NodeView = {
     id: LOCAL_NODE,
-    name: c ? `${c.name} (this machine)` : "This machine",
+    name: "This machine",
     role: "this",
     online: true,
     detail: null,

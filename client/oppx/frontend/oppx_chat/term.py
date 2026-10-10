@@ -33,7 +33,7 @@ class UiState:
     vi = False
     agent = None  # the agent (agent.Agent) when the agent engine runs
     connectors = None  # the session's MCP connectors (mcp.Hub), with the agent engine
-    tools_allowed: set = set()  # connector tools the user allowed for the rest of the session
+    permissions = None  # permissions.Permissions: what runs without asking in this project
 
 
 UI = UiState()
