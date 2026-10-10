@@ -5,7 +5,7 @@ import re
 
 import httpx
 
-from .config import MODEL_LABEL, REASONING
+from .config import MODEL_LABEL, REASONING, TRACE
 
 
 INTENT_PROMPT = """Classify the programmer's message to a coding assistant.
@@ -31,7 +31,7 @@ Message: Make the parser faster. -> edit
 Reply with exactly one word: ask or edit."""
 
 
-def ask_choice(system: str, text: str, choices: tuple[str, ...]) -> str | None:
+def ask_choice(system: str, text: str, choices: tuple[str, ...], trace: dict | None = None) -> str | None:
     """A one-word decision from the server's model, through the proxy.
 
     Non-reasoning models answer in one regex-constrained token (~40 ms).
@@ -47,6 +47,8 @@ def ask_choice(system: str, text: str, choices: tuple[str, ...]) -> str | None:
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": text[-2000:]}],
         "temperature": 0,
     }
+    if trace and TRACE:
+        body["oppx_trace"] = trace  # the server's Trace page: this call belongs to that turn
     if REASONING:
         # oppx_utility: the gateway never routes or searches these (servers
         # that report `reasoning` understand the flag).
@@ -64,8 +66,8 @@ def ask_choice(system: str, text: str, choices: tuple[str, ...]) -> str | None:
     return m.group(1) if m else None
 
 
-def wants_edit(text: str) -> bool:
+def wants_edit(text: str, trace: dict | None = None) -> bool:
     """Does this message ask for a change, or only for information? Questions
     then run without edits, as in Claude Code. Falls back to "edit" when the
     model gives no answer."""
-    return ask_choice(INTENT_PROMPT, text, ("ask", "edit")) != "ask"
+    return ask_choice(INTENT_PROMPT, text, ("ask", "edit"), trace) != "ask"

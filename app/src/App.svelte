@@ -7,6 +7,7 @@
   import Devices from "./pages/Devices.svelte";
   import Home from "./pages/Home.svelte";
   import Logs from "./pages/Logs.svelte";
+  import Trace from "./pages/Trace.svelte";
   import Models from "./pages/Models.svelte";
   import { app, connect } from "./lib/store.svelte";
   import { theme, toggleTheme } from "./lib/theme.svelte";
@@ -17,6 +18,7 @@
     { id: "devices", label: "Client", icon: "laptop" },
     { id: "models", label: "Models", icon: "box" },
     { id: "logs", label: "Logs", icon: "terminal" },
+    { id: "trace", label: "Trace", icon: "activity" },
   ];
 
   let failed = $state("");
@@ -103,6 +105,8 @@
       <Models />
     {:else if nav.page === "devices"}
       <Devices />
+    {:else if nav.page === "trace"}
+      <Trace />
     {:else}
       <Logs />
     {/if}

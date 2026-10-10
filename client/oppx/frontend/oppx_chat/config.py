@@ -21,6 +21,8 @@ OPPX_BIN = os.environ.get("OPPX_BIN", "oppx")
 PRINT_MODE = os.environ.get("OPPX_PRINT") == "1"
 # The server's model reasons before answering (from /v1/info); see routing.ask_choice.
 REASONING = os.environ.get("OPPX_REASONING") == "1"
+# The server reads trace labels on requests (which turn and step, what kind of call) for its Trace page.
+TRACE = os.environ.get("OPPX_TRACE") == "1"
 MODEL_LABEL = "openphalanx-coder"  # the name the gateway serves any model under
 # What the server actually runs (a Hugging Face id or a path); shown to the user.
 MODEL_NAME = os.environ.get("OPPX_MODEL_ID", "").rstrip("/").rsplit("/", 1)[-1] or MODEL_LABEL

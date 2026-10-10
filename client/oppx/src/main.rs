@@ -783,6 +783,8 @@ struct ModelInfo {
     model_id: String,
     edit_format: String,
     reasoning: bool,
+    /// The server reads trace labels (its Trace page).
+    trace: bool,
 }
 
 async fn preflight(name: &str, s: &Server) -> Result<ModelInfo> {
@@ -816,11 +818,12 @@ async fn preflight_inner(name: &str, s: &Server) -> Result<ModelInfo> {
             model_id: i.model_id,
             edit_format: i.edit_format,
             reasoning: i.reasoning,
+            trace: i.trace,
         });
     }
     // Older server without /v1/info.
     let ctx = api::context_len(&client, &s.url, &s.token).await?.unwrap_or(32_768);
-    Ok(ModelInfo { ctx, model_id: agent::AIDER_MODEL.trim_start_matches("openai/").into(), edit_format: "diff".into(), reasoning: false })
+    Ok(ModelInfo { ctx, model_id: agent::AIDER_MODEL.trim_start_matches("openai/").into(), edit_format: "diff".into(), reasoning: false, trace: false })
 }
 
 async fn run_search(cfg: &Config, name: Option<&str>, query: &str, max: u8) -> Result<()> {
@@ -989,6 +992,7 @@ async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args:
             .env("OPPX_CONTEXT", ctx.to_string())
             .env("OPPX_MODEL_ID", &info.model_id)
             .env("OPPX_REASONING", if info.reasoning { "1" } else { "0" })
+            .env("OPPX_TRACE", if info.trace { "1" } else { "0" })
             .env("OPPX_WEB", if web { "1" } else { "0" })
             .env("OPPX_ENGINE", &launch.engine)
             .env("OPPX_MCP_CONFIG", &launch.connectors)
