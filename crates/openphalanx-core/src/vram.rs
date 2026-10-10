@@ -29,6 +29,9 @@ pub const KV_HEADROOM: f64 = 1.25;
 /// 14B AWQ model (measured 2.35 GiB before activation peaks).
 pub const RUNTIME_BASE: u64 = 2 * GIB;
 pub const RUNTIME_PER_WEIGHT: f64 = 0.15;
+/// The lean runtime share behind the "tight" range: what a model can run
+/// with, not what is comfortable (2.8 GiB for the 14B AWQ model).
+pub const RUNTIME_PER_WEIGHT_MIN: f64 = 0.08;
 /// Below this much spare VRAM, starting is allowed but flagged as risky.
 pub const TIGHT_MARGIN: u64 = 3 * GIB / 2;
 /// Never hand SGLang more than this fraction of the card.
@@ -101,6 +104,20 @@ pub struct Requirement {
     pub fp8_upcast: bool,
 }
 
+impl Requirement {
+    /// The runtime reserve a model can just run with.
+    pub fn min_overhead_bytes(&self) -> u64 {
+        RUNTIME_BASE + (self.weight_bytes as f64 * RUNTIME_PER_WEIGHT_MIN) as u64
+    }
+
+    /// The least VRAM this model starts with: the weights, a KV cache for one
+    /// context window (no headroom) and the lean runtime reserve. Below it,
+    /// it doesn't fit; between it and `total_bytes`, it is tight.
+    pub fn min_bytes(&self) -> u64 {
+        self.weight_bytes + (self.kv_bytes as f64 / KV_HEADROOM) as u64 + self.min_overhead_bytes()
+    }
+}
+
 /// Conservative VRAM need for serving `context_len` tokens. `quant` is the
 /// model's quantization label (e.g. "AWQ 4-bit", "fp8") and
 /// `compute_capability` the target GPU's, when known.
@@ -169,10 +186,11 @@ pub struct FitCheck {
 /// Smallest context the app offers.
 pub const MIN_CONTEXT: u32 = 2048;
 
-/// The longest context (in steps of 1,024 tokens, up to `max_context`) whose
-/// requirement still fits in `free_bytes`; `None` if not even `MIN_CONTEXT` does.
+/// The longest context (in steps of 1,024 tokens, up to `max_context`) the
+/// model can start with in `free_bytes` (tight counts, as in `check`);
+/// `None` if not even `MIN_CONTEXT` does.
 pub fn max_fitting_context(max_context: u32, free_bytes: u64, need: impl Fn(u32) -> Requirement) -> Option<u32> {
-    let fits = |ctx: u32| need(ctx).total_bytes <= free_bytes;
+    let fits = |ctx: u32| need(ctx).min_bytes() <= free_bytes;
     if max_context < MIN_CONTEXT || !fits(MIN_CONTEXT) {
         return None;
     }
@@ -192,15 +210,28 @@ pub fn max_fitting_context(max_context: u32, free_bytes: u64, need: impl Fn(u32)
     Some(lo * 1024)
 }
 
+/// Fits (the comfortable need plus a margin), tight (anything down to the
+/// least the model starts with) or insufficient (below that).
 pub fn check(req: &Requirement, free_bytes: u64) -> FitCheck {
     let headroom = free_bytes as i64 - req.total_bytes as i64;
-    let (fit, message) = if headroom < 0 {
+    let (fit, message) = if free_bytes < req.min_bytes() {
         (
             Fit::Insufficient,
             format!(
-                "Needs {} but only {} of VRAM is free. Pick a smaller model or a shorter context.",
+                "Needs at least {} ({} to be comfortable) but only {} of VRAM is free. Pick a smaller model or a shorter context.",
+                fmt_gib(req.min_bytes()),
                 fmt_gib(req.total_bytes),
                 fmt_gib(free_bytes)
+            ),
+        )
+    } else if headroom < 0 {
+        (
+            Fit::Tight,
+            format!(
+                "Fits only just: {} free, {} would be comfortable. It starts with less spare KV cache and runtime \
+                 memory, so close other GPU apps; a shorter context gives it more room.",
+                fmt_gib(free_bytes),
+                fmt_gib(req.total_bytes)
             ),
         )
     } else if (headroom as u64) < TIGHT_MARGIN {
@@ -223,18 +254,32 @@ pub fn check(req: &Requirement, free_bytes: u64) -> FitCheck {
     }
 }
 
-/// `--mem-fraction-static` for SGLang: everything currently free minus the
-/// runtime overhead, so the static pool can never claim memory another process
-/// already holds. Returns `None` when the model does not fit.
+/// `--mem-fraction-static` for SGLang, which keeps `free × (1 − fraction)` of
+/// the memory free at start as its runtime reserve and gives the rest to the
+/// weights and KV cache. So the fraction is taken of what is free, not of the
+/// card: taken of the card, memory other programs hold was subtracted twice
+/// (a 2.8 GiB reserve became 6.2 GiB, and the KV cache 14.9k tokens at 32k).
+/// In the tight range the reserve shrinks first, down to the lean one.
+/// Returns `None` when the model does not fit.
 pub fn mem_fraction_static(req: &Requirement, free_bytes: u64, total_bytes: u64) -> Option<f64> {
-    if total_bytes == 0 || free_bytes < req.total_bytes {
+    if total_bytes == 0 || free_bytes < req.min_bytes() {
         return None;
     }
-    let budget = (free_bytes - req.overhead_bytes) as f64;
-    let fraction = (budget / total_bytes as f64).min(MAX_MEM_FRACTION);
+    let short = req.total_bytes.saturating_sub(free_bytes);
+    let reserve = req.overhead_bytes.saturating_sub(short).max(req.min_overhead_bytes());
+    let fraction = ((free_bytes - reserve) as f64 / free_bytes as f64).min(MAX_MEM_FRACTION);
     // The cap can only bite on cards far larger than the model; still verify.
-    let static_needed = (req.weight_bytes + req.kv_bytes) as f64 / total_bytes as f64;
-    (fraction >= static_needed).then(|| (fraction * 1000.0).floor() / 1000.0)
+    let static_needed = (req.min_bytes() - req.min_overhead_bytes()) as f64;
+    (free_bytes as f64 * fraction >= static_needed * 0.999).then(|| (fraction * 1000.0).floor() / 1000.0)
+}
+
+/// The fraction for a forced start of a model that doesn't fit: the lean
+/// runtime reserve, and whatever is left for the weights and KV cache.
+/// SGLang may still fail to load it, or run out of memory under load.
+pub fn mem_fraction_forced(req: &Requirement, free_bytes: u64) -> f64 {
+    let rest = free_bytes.saturating_sub(req.min_overhead_bytes()) as f64;
+    let fraction = (rest / free_bytes.max(1) as f64).clamp(0.5, MAX_MEM_FRACTION);
+    (fraction * 1000.0).floor() / 1000.0
 }
 
 pub fn fmt_gib(bytes: u64) -> String {
@@ -282,22 +327,54 @@ mod tests {
         let free = RTX3090_TOTAL - GIB;
         let frac = mem_fraction_static(&r, free, RTX3090_TOTAL).unwrap();
         assert!(frac > 0.75 && frac <= MAX_MEM_FRACTION, "frac={frac}");
-        let outside_pool = free as f64 - frac * RTX3090_TOTAL as f64;
+        let outside_pool = free as f64 * (1.0 - frac);
         assert!(outside_pool >= r.overhead_bytes as f64 * 0.99);
     }
 
     #[test]
-    fn refuses_when_free_memory_is_short() {
+    fn a_forced_start_keeps_the_lean_reserve() {
         let r = qwen14b_awq();
-        let free = r.total_bytes - 1;
+        let free = r.min_bytes() - 2 * GIB; // doesn't fit
+        assert_eq!(mem_fraction_static(&r, free, RTX3090_TOTAL), None);
+        let frac = mem_fraction_forced(&r, free);
+        assert!(free as f64 * (1.0 - frac) >= r.min_overhead_bytes() as f64 * 0.99, "frac={frac}");
+        assert!(mem_fraction_forced(&r, GIB) >= 0.5, "never a nonsense fraction");
+    }
+
+    #[test]
+    fn refuses_below_the_least_the_model_starts_with() {
+        let r = qwen14b_awq();
+        let free = r.min_bytes() - 1;
         assert_eq!(check(&r, free).fit, Fit::Insufficient);
         assert_eq!(mem_fraction_static(&r, free, RTX3090_TOTAL), None);
+    }
+
+    #[test]
+    fn the_least_need_drops_the_spare_parts_only() {
+        let r = qwen14b_awq();
+        // 14B AWQ at 32k: about 20.7 GiB comfortable, about 18.6 GiB at least.
+        assert!(r.min_bytes() < r.total_bytes - 2 * GIB && r.min_bytes() > r.total_bytes - 3 * GIB, "{}", fmt_gib(r.min_bytes()));
+        let one_window = (r.kv_bytes as f64 / KV_HEADROOM) as u64;
+        assert_eq!(r.min_bytes(), r.weight_bytes + one_window + r.min_overhead_bytes());
+        assert!(r.min_overhead_bytes() > 27 * GIB / 10, "above the 2.35 GiB measured for this model");
     }
 
     #[test]
     fn tight_band() {
         let r = qwen14b_awq();
         assert_eq!(check(&r, r.total_bytes + GIB).fit, Fit::Tight);
+        assert_eq!(check(&r, r.total_bytes + TIGHT_MARGIN).fit, Fit::Ok);
+        // Short of the comfortable need, down to the least: tight, and startable.
+        for free in [r.total_bytes - 1, r.min_bytes()] {
+            let c = check(&r, free);
+            assert_eq!(c.fit, Fit::Tight);
+            assert!(c.headroom_bytes < 0 && c.message.starts_with("Fits only just"), "{}", c.message);
+            let frac = mem_fraction_static(&r, free, RTX3090_TOTAL).expect("startable");
+            let pool = frac * free as f64;
+            let outside = free as f64 - pool;
+            assert!(outside >= r.min_overhead_bytes() as f64 * 0.99, "the lean reserve stays outside the pool");
+            assert!(pool >= (r.weight_bytes as f64 + r.kv_bytes as f64 / KV_HEADROOM) * 0.99, "weights and one window fit");
+        }
         assert_eq!(check(&r, r.total_bytes + 2 * GIB).fit, Fit::Ok);
     }
 
@@ -336,7 +413,8 @@ mod tests {
         let need = |ctx| requirement(9_980_170_584, Some("AWQ 4-bit"), &ArchSpec::dense(48, 8, 128), ctx, Some(8.6));
         let free = 24 * GIB;
         let best = max_fitting_context(131_072, free, need).unwrap();
-        assert!(need(best).total_bytes <= free && need(best + 1024).total_bytes > free);
+        assert!(need(best).min_bytes() <= free && need(best + 1024).min_bytes() > free);
+        assert_ne!(check(&need(best), free).fit, Fit::Insufficient, "the longest context is one the model starts with");
         assert_eq!(max_fitting_context(32_768, 100 * GIB, need), Some(32_768));
         assert_eq!(max_fitting_context(32_768, GIB, need), None);
     }

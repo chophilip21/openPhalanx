@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn yarn_reaches_sglang_as_one_argument() {
-        let yarn = crate::catalog::Yarn { factor: 4.0, original_max: 32768 };
+        let yarn = crate::catalog::Yarn { factor: 4.0, original_max: 32768, rope_theta: 1e6 };
         let a = run_args(&RunSpec { yarn: Some(yarn), ..spec() });
         // One docker argument (no shell, no splitting), not in SGLANG_EXTRA_ARGS.
         let arg = a.iter().find(|x| x.starts_with("JSON_MODEL_OVERRIDE_ARGS=")).expect("override passed");
@@ -682,6 +682,7 @@ mod tests {
         assert_eq!(json["rope_scaling"]["factor"], 4.0);
         assert_eq!(json["rope_scaling"]["original_max_position_embeddings"], 32768);
         assert_eq!(json["rope_scaling"]["rope_type"], "yarn");
+        assert_eq!(json["rope_scaling"]["rope_theta"], 1e6, "the model's base, or SGLang falls back to 10000");
         assert_eq!(json["max_position_embeddings"], 131_072, "SGLang derives the limit from it");
         assert!(!a.iter().any(|x| x.starts_with("SGLANG_EXTRA_ARGS=") && x.contains("rope")));
         assert!(!run_args(&spec()).iter().any(|x| x.starts_with("JSON_MODEL_OVERRIDE_ARGS")), "off by default");
@@ -740,7 +741,7 @@ mod tests {
             context_len: 32768,
             split: split_rank(1),
             dtype: Some("bfloat16".into()),
-            yarn: Some(crate::catalog::Yarn { factor: 4.0, original_max: 32768 }),
+            yarn: Some(crate::catalog::Yarn { factor: 4.0, original_max: 32768, rope_theta: 1e6 }),
             run_id: "r1".into(),
         };
         assert!(worker_run_args(&w).iter().any(|x| x.starts_with("JSON_MODEL_OVERRIDE_ARGS={")), "same YaRN as rank 0");

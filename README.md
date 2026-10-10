@@ -54,7 +54,7 @@ curl -fsSL https://github.com/chophilip21/openPhalanx/releases/latest/download/i
 oppx --update                     # any time: update oppx and its engine
 ```
 
-Pair once with the address and code from the app. `oppx` prints the server's certificate fingerprint; check it matches the one in the app, then confirm:
+Pair once with the address and code from the app (on the server machine itself, just `oppx pair self`). `oppx` prints the server's certificate fingerprint; check it matches the one in the app, then confirm:
 
 ```bash
 oppx pair 192.168.1.77 ABCD-EFGH

@@ -14,6 +14,11 @@
       "kv_layers": 28,
       "kv_heads": 4,
       "head_dim": 128
+    },
+    "yarn": {
+      "factor": 2.0,
+      "original_max_position_embeddings": 32768,
+      "rope_theta": 1000000.0
     }
   },
   {
@@ -31,6 +36,11 @@
       "kv_layers": 28,
       "kv_heads": 4,
       "head_dim": 128
+    },
+    "yarn": {
+      "factor": 2.0,
+      "original_max_position_embeddings": 32768,
+      "rope_theta": 1000000.0
     }
   },
   {
@@ -50,7 +60,12 @@
       "head_dim": 128
     },
     "tested": true,
-    "notes": "Tested end to end on an RTX 3090 (24 GB)."
+    "notes": "Tested end to end on an RTX 3090 (24 GB).",
+    "yarn": {
+      "factor": 2.0,
+      "original_max_position_embeddings": 32768,
+      "rope_theta": 1000000.0
+    }
   },
   {
     "id": "Qwen/Qwen2.5-Coder-14B-Instruct",
@@ -67,6 +82,11 @@
       "kv_layers": 48,
       "kv_heads": 8,
       "head_dim": 128
+    },
+    "yarn": {
+      "factor": 2.0,
+      "original_max_position_embeddings": 32768,
+      "rope_theta": 1000000.0
     }
   },
   {
@@ -84,6 +104,11 @@
       "kv_layers": 64,
       "kv_heads": 8,
       "head_dim": 128
+    },
+    "yarn": {
+      "factor": 2.0,
+      "original_max_position_embeddings": 32768,
+      "rope_theta": 1000000.0
     }
   },
   {

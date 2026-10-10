@@ -85,6 +85,10 @@ pub struct Yarn {
     pub factor: f32,
     #[serde(rename = "original_max_position_embeddings")]
     pub original_max: u32,
+    /// The model's own RoPE base (`rope_theta` in its `config.json`). SGLang
+    /// reads the base from the same block the override replaces, so it has to
+    /// be sent along (see `override_json`).
+    pub rope_theta: f64,
 }
 
 impl Yarn {
@@ -97,16 +101,23 @@ impl Yarn {
     pub fn check(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.factor.is_finite() && (1.0..=16.0).contains(&self.factor), "invalid YaRN factor {}", self.factor);
         anyhow::ensure!((1024..=1 << 20).contains(&self.original_max), "invalid YaRN native window {}", self.original_max);
+        anyhow::ensure!(self.rope_theta.is_finite() && (1e3..=1e9).contains(&self.rope_theta), "invalid RoPE base {}", self.rope_theta);
         Ok(())
     }
 
-    /// SGLang's `--json-model-override-args`, built here from the two numbers
+    /// SGLang's `--json-model-override-args`, built here from the three numbers
     /// (never from text a host or a catalog could slip flags into).
     ///
     /// `max_position_embeddings` is raised too: SGLang 0.5.21 takes the context
     /// limit from it and ignores the factor when `original_max_position_embeddings`
     /// is present (`get_context_length`), so Qwen's snippet alone still capped
     /// at 32k. The YaRN math reads only `factor` and the original window.
+    ///
+    /// `rope_theta` goes inside the block: with transformers 5, `rope_scaling`
+    /// is an alias of `rope_parameters`, which also holds the base, so an
+    /// override without it dropped the model's base and SGLang fell back to
+    /// 10000 (`get_rope_config`). On Qwen2.5 (base 1e6) that scrambled every
+    /// position: recall 0/3 at 26k tokens.
     pub fn override_json(&self) -> String {
         serde_json::json!({
           "max_position_embeddings": self.max_context(),
@@ -115,6 +126,7 @@ impl Yarn {
             "type": "yarn",
             "factor": self.factor,
             "original_max_position_embeddings": self.original_max,
+            "rope_theta": self.rope_theta,
         } })
         .to_string()
     }

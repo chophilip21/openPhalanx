@@ -522,7 +522,10 @@ fn plan_split(state: &AppState, settings: &Settings, pf: &mut server::Preflight)
 }
 
 #[tauri::command]
-async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+/// `force`: start although the model doesn't fit the free VRAM (the user
+/// ticked "I understand the risk"). Only the VRAM check can be overridden.
+async fn start_server(app: AppHandle, state: State<'_, AppState>, force: Option<bool>) -> CmdResult<()> {
+    let force = force.unwrap_or(false);
     {
         let inner = state.inner.lock().unwrap();
         if matches!(inner.phase, Phase::Starting { .. } | Phase::Stopping) {
@@ -570,12 +573,13 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
     }
     let mut pf = server::preflight(&settings).await;
     let plan = plan_split(&state, &settings, &mut pf);
-    if !pf.can_start {
+    let blocked = pf.running || pf.checks.iter().any(|c| c.status == CheckStatus::Fail && !(force && c.id == "vram"));
+    if blocked {
         release(&state);
         return Err(pf
             .checks
             .iter()
-            .find(|c| c.status == CheckStatus::Fail)
+            .find(|c| c.status == CheckStatus::Fail && !(force && c.id == "vram"))
             .map(|c| c.detail.clone())
             .unwrap_or_else(|| "The backend is already running.".into()));
     }
@@ -628,7 +632,7 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
 
     tauri::async_runtime::spawn(async move {
         let progress_app = app.clone();
-        let result = server::start(&settings, split_start, move |p| {
+        let result = server::start_with(&settings, split_start, force, move |p| {
             let detail = match &p {
                 StartProgress::Checking => "Checking GPU memory…".to_string(),
                 StartProgress::PullingImage { line } => format!("Downloading backend image… {line}"),
@@ -963,6 +967,12 @@ impl VramBudget {
     }
 }
 
+/// The selected model's long-context mode from the catalog, on or not.
+fn catalog_yarn(settings: &Settings) -> Option<catalog::Yarn> {
+    let id = settings.selected_model.as_deref()?.strip_prefix("catalog:")?;
+    catalog::find(id)?.yarn
+}
+
 /// The selected model's context ceiling, for the slider.
 #[derive(Debug, Clone, Serialize)]
 struct ContextLimit {
@@ -974,6 +984,10 @@ struct ContextLimit {
     by_model: bool,
     /// Above this the model runs in its long-context mode (YaRN); `None`: it has none.
     native_max: Option<u32>,
+    /// How far the long-context mode reaches (whether it's on or not); `None`: it has none.
+    long_context_max: Option<u32>,
+    /// The user turned the long-context mode on (`settings.long_context`).
+    long_context: bool,
     available_bytes: Option<u64>,
     basis: &'static str,
     servers: u32,
@@ -984,12 +998,15 @@ async fn context_limit(state: &AppState, settings: &Settings) -> ContextLimit {
     let model = settings.selected_model.as_deref().and_then(|k| server::resolve(settings, k));
     let max_fit = model.as_ref().and_then(|m| budget.max_fit(m));
     let model_max = model.as_ref().map(|m| m.max_context);
+    let yarn = catalog_yarn(settings);
     ContextLimit {
         model: model.as_ref().map(|m| m.label.clone()),
         max_fit,
         model_max,
         by_model: matches!((max_fit, model_max), (Some(f), Some(m)) if f >= m),
-        native_max: model.as_ref().and_then(|m| m.yarn).map(|y| y.original_max),
+        native_max: yarn.map(|y| y.original_max),
+        long_context_max: yarn.map(|y| y.max_context()),
+        long_context: settings.long_context,
         available_bytes: budget.available,
         basis: budget.basis,
         servers: budget.servers,
@@ -1112,6 +1129,25 @@ async fn set_context_len(state: State<'_, AppState>, context_len: u32) -> CmdRes
         }
     }
     state.update_settings(|s| s.context_len = context_len)
+}
+
+/// Turns the long-context mode (YaRN) on or off for models that have one.
+/// Locked like the context window. Turning it off brings a context above the
+/// selected model's native window back down to it.
+#[tauri::command]
+async fn set_long_context(state: State<'_, AppState>, on: bool) -> CmdResult<Settings> {
+    let starting = matches!(state.inner.lock().unwrap().phase, Phase::Starting { .. } | Phase::Stopping);
+    let running = docker::inspect().await.ok().flatten().is_some_and(|c| c.state.running);
+    if starting || running {
+        return Err("Stop the server to change the long-context mode; it applies at the next start.".into());
+    }
+    let native = catalog_yarn(&state.settings()).map(|y| y.original_max);
+    state.update_settings(|s| {
+        s.long_context = on;
+        if let (false, Some(native)) = (on, native) {
+            s.context_len = s.context_len.min(native);
+        }
+    })
 }
 
 #[tauri::command]
@@ -1496,6 +1532,7 @@ pub fn run() {
             get_models,
             select_model,
             set_context_len,
+            set_long_context,
             set_gpu,
             set_web_search,
             download_model,

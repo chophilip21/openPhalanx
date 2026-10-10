@@ -118,6 +118,14 @@ def build(spec: dict) -> dict:
     for k, v in spec.items():
         if k not in entry and k not in ("revision", "base_model"):
             entry[k] = v
+    if entry.get("yarn"):
+        # The model's own RoPE base: SGLang loses it when rope_scaling is
+        # overridden, so the override has to carry it (see catalog.rs).
+        c = config.get("text_config", config)
+        theta = c.get("rope_theta") or (c.get("rope_parameters") or {}).get("rope_theta")
+        if not theta:
+            sys.exit(f"{repo}: yarn needs rope_theta, and config.json has none")
+        entry["yarn"] = {**entry["yarn"], "rope_theta": float(theta)}
     return entry
 
 
@@ -130,10 +138,10 @@ def main():
         bad = 0
         for e in json.loads(CATALOG.read_text()):
             fresh = build({**e, "revision": e["revision"]})
-            for k in ("weight_bytes", "arch", "max_context"):
-                if fresh[k] != e[k]:
+            for k in ("weight_bytes", "arch", "max_context", "yarn"):
+                if fresh.get(k) != e.get(k):
                     bad += 1
-                    print(f"{e['id']}: {k} is {e[k]}, Hugging Face says {fresh[k]}")
+                    print(f"{e['id']}: {k} is {e.get(k)}, Hugging Face says {fresh.get(k)}")
         print("catalog matches Hugging Face" if not bad else f"{bad} mismatches")
         sys.exit(1 if bad else 0)
     specs = json.load(open(args.specs))

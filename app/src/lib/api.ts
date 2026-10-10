@@ -70,6 +70,8 @@ export type Settings = {
   web_search: boolean;
   /** Days a client pairing lasts; null: never expires. */
   pairing_ttl_days: number | null;
+  /** Models with a long-context mode (YaRN) may go past their native window. */
+  long_context: boolean;
 };
 
 /** A server's hardware, as it reports it. */
@@ -321,6 +323,10 @@ export type ContextLimit = {
   by_model: boolean;
   /** Above this the model runs in its long-context mode (YaRN); null: it has none. */
   native_max: number | null;
+  /** How far the long-context mode reaches, on or not; null: the model has none. */
+  long_context_max: number | null;
+  /** The long-context mode is turned on. */
+  long_context: boolean;
   available_bytes: number | null;
   basis: string;
   servers: number;
@@ -332,7 +338,8 @@ export const api = {
   checkUpdate: () => invoke<UpdateCheck>("check_update"),
   installUpdate: () => invoke<void>("install_update"),
   preflight: () => invoke<Preflight>("get_preflight"),
-  start: () => invoke<void>("start_server"),
+  /** `force`: start although the model doesn't fit the free VRAM. */
+  start: (force = false) => invoke<void>("start_server", { force }),
   stop: () => invoke<void>("stop_server"),
   dismissError: () => invoke<void>("dismiss_error"),
   logs: (tail: number) => invoke<string>("get_logs", { tail }),
@@ -344,6 +351,7 @@ export const api = {
   models: () => invoke<ModelsView>("get_models"),
   selectModel: (key: string) => invoke<Settings>("select_model", { key }),
   setContextLen: (contextLen: number) => invoke<Settings>("set_context_len", { contextLen }),
+  setLongContext: (on: boolean) => invoke<Settings>("set_long_context", { on }),
   setGpu: (index: number) => invoke<Settings>("set_gpu", { index }),
   setWebSearch: (enabled: boolean) => invoke<Settings>("set_web_search", { enabled }),
   download: (key: string) => invoke<void>("download_model", { key }),

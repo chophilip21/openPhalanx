@@ -64,8 +64,9 @@ impl Service {
     }
 
     /// Starts the selected model. Returns once it is launching; follow
-    /// `status` for progress. Refused when a pre-flight check fails.
-    pub async fn start(self: &Arc<Self>) -> Result<()> {
+    /// `status` for progress. Refused when a pre-flight check fails; `force`
+    /// overrides the VRAM check only (it may then fail to load or crash).
+    pub async fn start(self: &Arc<Self>, force: bool) -> Result<()> {
         {
             let mut inner = self.inner.lock().unwrap();
             if matches!(inner.phase, Phase::Starting(_) | Phase::Stopping) {
@@ -73,7 +74,7 @@ impl Service {
             }
             inner.phase = Phase::Starting("Checking…".into());
         }
-        let result = self.begin_start().await;
+        let result = self.begin_start(force).await;
         if result.is_err() {
             self.inner.lock().unwrap().phase = Phase::Idle;
             if let Some(c) = &self.cluster {
@@ -83,7 +84,7 @@ impl Service {
         result
     }
 
-    async fn begin_start(self: &Arc<Self>) -> Result<()> {
+    async fn begin_start(self: &Arc<Self>, force: bool) -> Result<()> {
         // One controller per cluster: a member takes the host role over first.
         if let Some(c) = &self.cluster {
             c.claim_start().await?;
@@ -93,7 +94,7 @@ impl Service {
         if pf.running {
             bail!("The server is already running.");
         }
-        if let Some(check) = pf.checks.iter().find(|c| c.status == CheckStatus::Fail) {
+        if let Some(check) = pf.checks.iter().find(|c| c.status == CheckStatus::Fail && !(force && c.id == "vram")) {
             // Splitting a model across a cluster is planned by the desktop app.
             let hint = if check.id == "vram" && self.cluster.as_ref().is_some_and(|c| !c.members().is_empty()) {
                 " To split it across this cluster, start it from the desktop app on the host."
@@ -105,7 +106,7 @@ impl Service {
         let me = self.clone();
         tokio::spawn(async move {
             let progress = me.clone();
-            let result = server::start(&settings, None, move |p| {
+            let result = server::start_with(&settings, None, force, move |p| {
                 let detail = match p {
                     StartProgress::Checking => "Checking GPU memory…".to_string(),
                     StartProgress::PullingImage { .. } => "Downloading the backend image…".to_string(),
@@ -217,7 +218,10 @@ impl Service {
             Phase::Idle => ("stopped", None),
         };
         let key = container.as_ref().filter(|_| running).and_then(|c| c.model_key.clone()).or(settings.selected_model.clone());
-        let model = key.and_then(|k| server::resolve(&settings, &k)).map(|m| match &m.quant {
+        let resolved = key.and_then(|k| server::resolve(&settings, &k));
+        // Stopped: what a start would serve, never more than the model's own maximum.
+        let wanted = resolved.as_ref().map_or(settings.context_len, |m| m.context_len(settings.context_len));
+        let model = resolved.map(|m| match &m.quant {
             Some(q) => format!("{} · {q}", m.label),
             None => m.label,
         });
@@ -225,7 +229,7 @@ impl Service {
             state: state.into(),
             detail,
             model,
-            context_len: container.as_ref().filter(|_| running).and_then(|c| c.context_len).or(Some(settings.context_len)),
+            context_len: container.as_ref().filter(|_| running).and_then(|c| c.context_len).or(Some(wanted)),
             endpoint: net::lan_ip().map(|ip| format!("{ip}:{}", settings.agent_port)),
             fingerprint: admin_status.as_ref().map(|a| a.tls_fingerprint.clone()),
             pairing: admin_status.as_ref().map(|a| a.pairing.clone()),

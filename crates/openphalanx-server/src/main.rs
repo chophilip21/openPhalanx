@@ -1,7 +1,7 @@
 //! `oppxs`: an OpenPhalanx server without the desktop app.
 //!
 //!   oppxs run                       run the server (keep it running; a systemd unit does this)
-//!   oppxs models | download <model> | use <model> | context <tokens>
+//!   oppxs models | download <model> | use <model> | context <tokens> | long-context on|off
 //!   oppxs start | stop | status     the backend that serves the selected model
 //!   oppxs pair | devices | revoke <device>
 //!   oppxs logs [<member>]
@@ -58,8 +58,15 @@ enum Command {
     Use { model: String },
     /// Set the context window in tokens (e.g. 32768).
     Context { tokens: u32 },
+    /// Let models with a long-context mode (YaRN) go past their native window: on or off.
+    LongContext { mode: String },
     /// Start serving the selected model.
-    Start,
+    Start {
+        /// Start although the model doesn't fit the free VRAM. It may fail
+        /// to load, or crash when it runs out of GPU memory.
+        #[arg(long)]
+        force: bool,
+    },
     /// Stop serving.
     Stop,
     /// A new pairing code for a client (`oppx pair <server> <code>`).
@@ -147,7 +154,8 @@ async fn ctl_server_action(State(b): State<Backend>, headers: HeaderMap, UrlPath
         return fail(StatusCode::UNAUTHORIZED, "bad control token");
     }
     match action.as_str() {
-        "start" => reply(b.service.start().await),
+        "start" => reply(b.service.start(false).await),
+        "start-force" => reply(b.service.start(true).await),
         "stop" => reply(b.service.stop().await),
         "pair" => reply(b.service.new_pairing().await),
         _ => fail(StatusCode::NOT_FOUND, "unknown action"),
@@ -397,8 +405,12 @@ async fn control(cmd: Command) -> Result<()> {
     let view = ctl.view().await?;
     let short = |fp: &str| openphalanx_core::cluster::short_fingerprint(fp);
     match cmd {
-        Command::Start => {
-            ctl.call::<serde_json::Value>(reqwest::Method::POST, "server/start").await?;
+        Command::Start { force } => {
+            let action = if force { "server/start-force" } else { "server/start" };
+            if force && refuse_while_running("it").await.is_ok() {
+                fit_context_for_force().await?;
+            }
+            ctl.call::<serde_json::Value>(reqwest::Method::POST, action).await?;
             // Follow it until it serves or fails (Ctrl-C only stops watching).
             let mut last = String::new();
             loop {
@@ -594,7 +606,8 @@ async fn control(cmd: Command) -> Result<()> {
         | Command::Models { .. }
         | Command::Download { .. }
         | Command::Use { .. }
-        | Command::Context { .. } => unreachable!("handled in main"),
+        | Command::Context { .. }
+        | Command::LongContext { .. } => unreachable!("handled in main"),
     }
     Ok(())
 }
@@ -646,6 +659,9 @@ async fn models(all: bool) -> Result<()> {
             None => "?",
         };
         let state = match (settings.selected_model.as_deref() == Some(key.as_str()), m.installed_dir.is_some()) {
+            // Damaged files: the server can't start with it (the app shows "Broken").
+            (true, true) if m.broken.is_some() => "selected, broken: download it again",
+            (false, true) if m.broken.is_some() => "broken: download it again",
             (true, true) => "selected",
             (true, false) => "selected, not downloaded",
             (false, true) => "downloaded",
@@ -690,14 +706,99 @@ fn use_model(wanted: &str) -> Result<()> {
     Ok(())
 }
 
-fn set_context(tokens: u32) -> Result<()> {
+/// The running model keeps the settings it started with (as in the app).
+async fn refuse_while_running(what: &str) -> Result<()> {
+    if openphalanx_core::docker::inspect().await.ok().flatten().is_some_and(|c| c.state.running) {
+        bail!("stop the server to change {what} (`oppxs stop`); it applies at the next start");
+    }
+    Ok(())
+}
+
+/// The selected model, and the longest context it fits in the VRAM free on
+/// this GPU now (`None`: not even the minimum, or no GPU to measure).
+async fn context_fit(settings: &Settings) -> Option<(server::ResolvedModel, Option<u32>)> {
+    let m = server::resolve(settings, settings.selected_model.as_deref()?)?;
+    let gpu = gpu::query().await.unwrap_or_default().into_iter().find(|g| g.index == settings.gpu_index);
+    let fit = gpu.and_then(|g| vram::max_fitting_context(m.max_context, g.free_bytes, |c| m.requirement(c, g.compute_capability)));
+    Some((m, fit))
+}
+
+/// The selected model's long-context mode from the catalog, on or not.
+fn catalog_yarn(settings: &Settings) -> Option<catalog::Yarn> {
+    catalog::find(settings.selected_model.as_deref()?.strip_prefix("catalog:")?)?.yarn
+}
+
+/// The same limits as the app's slider: the model's own maximum, and what
+/// fits the VRAM free now.
+async fn set_context(tokens: u32) -> Result<()> {
     if !(2048..=262_144).contains(&tokens) {
         bail!("the context must be between 2,048 and 262,144 tokens");
     }
+    refuse_while_running("the context window").await?;
     let mut settings = Settings::load();
+    if let Some((m, fit)) = context_fit(&settings).await {
+        if tokens > m.max_context {
+            let more = match catalog_yarn(&settings) {
+                Some(y) if !settings.long_context => {
+                    format!(" `oppxs long-context on` allows up to {} (recall is weaker past {}).", y.max_context(), y.original_max)
+                }
+                _ => String::new(),
+            };
+            bail!("{} supports up to {} tokens of context.{more}", m.label, m.max_context);
+        }
+        if let Some(max) = fit.filter(|max| tokens > *max) {
+            bail!("{} fits up to {max} tokens of context in the VRAM free on this GPU; a longer context would run out of memory", m.label);
+        }
+    }
     settings.context_len = tokens;
     settings.save()?;
     println!("Context window set to {tokens} tokens; it applies the next time the server starts.");
+    Ok(())
+}
+
+async fn set_long_context(mode: &str) -> Result<()> {
+    let on = match mode {
+        "on" => true,
+        "off" => false,
+        _ => bail!("use `oppxs long-context on` or `oppxs long-context off`"),
+    };
+    refuse_while_running("the long-context mode").await?;
+    let mut settings = Settings::load();
+    settings.long_context = on;
+    let yarn = catalog_yarn(&settings);
+    match (on, yarn) {
+        (true, Some(y)) => println!(
+            "Long-context mode on: the selected model can go up to {} tokens (`oppxs context <tokens>`). Past {} it finds details in the prompt about half as reliably in our tests; at {} and below nothing changes.",
+            y.max_context(), y.original_max, y.original_max
+        ),
+        (true, None) => println!("Long-context mode on. The selected model has no such mode (YaRN), so nothing changes for it."),
+        (false, Some(y)) if settings.context_len > y.original_max => {
+            // As in the app: back into the native window.
+            settings.context_len = y.original_max;
+            println!("Long-context mode off; the context window is back to {} tokens, the selected model's native window.", y.original_max);
+        }
+        (false, _) => println!("Long-context mode off: models keep their native window."),
+    }
+    settings.save()?;
+    Ok(())
+}
+
+/// `start --force`, as ticking "Force load" in the app: the context window
+/// comes down to the longest the model fits now, or to the minimum when none
+/// does, so the server isn't asked for a window the GPU can't hold.
+async fn fit_context_for_force() -> Result<()> {
+    let mut settings = Settings::load();
+    let Some((m, fit)) = context_fit(&settings).await else { return Ok(()) };
+    let now = m.context_len(settings.context_len);
+    let target = now.min(fit.unwrap_or(vram::MIN_CONTEXT));
+    if target < now {
+        settings.context_len = target;
+        settings.save()?;
+        match fit {
+            Some(_) => println!("Context window set to {target} tokens, the longest {} fits right now.", m.label),
+            None => println!("Context window set to {target} tokens, the minimum: {} doesn't fit this GPU by our estimate.", m.label),
+        }
+    }
     Ok(())
 }
 
@@ -721,7 +822,8 @@ async fn main() {
         Command::Models { all } => models(all).await,
         Command::Download { model } => download_model(&model).await,
         Command::Use { model } => use_model(&model),
-        Command::Context { tokens } => set_context(tokens),
+        Command::Context { tokens } => set_context(tokens).await,
+        Command::LongContext { mode } => set_long_context(&mode).await,
         Command::Logs { member: None, lines } => backend_logs(lines).await,
         other => control(other).await,
     };

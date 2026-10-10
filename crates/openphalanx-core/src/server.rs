@@ -33,7 +33,8 @@ pub struct ResolvedModel {
     pub reasoning_parser: Option<String>,
     /// SGLang `--dtype` override (catalog data).
     pub dtype: Option<String>,
-    /// Long-context mode; `max_context` already counts it.
+    /// Long-context mode, when the user turned it on (`settings.long_context`);
+    /// `max_context` already counts it.
     pub yarn: Option<catalog::Yarn>,
 }
 
@@ -69,14 +70,18 @@ mod yarn_tests {
 
     #[test]
     fn yarn_only_above_the_native_window() {
-        let settings = Settings::default();
-        // No catalog entry uses YaRN today (it broke recall in SGLang 0.5.21; see
-        // CLAUDE.md), so set it by hand to check the plumbing.
-        let mut m = resolve(&settings, "catalog:Qwen/Qwen2.5-Coder-14B-Instruct-AWQ").unwrap();
-        assert_eq!(m.max_context, 32_768, "native window only");
-        m.yarn = Some(catalog::Yarn { factor: 4.0, original_max: 32_768 });
+        let mut settings = Settings::default();
+        let key = "catalog:Qwen/Qwen2.5-Coder-14B-Instruct-AWQ";
+        // Off unless the user asks for it.
+        let off = resolve(&settings, key).unwrap();
+        assert_eq!(off.max_context, 32_768, "native window only");
+        assert!(off.yarn.is_none() && off.rope_override(65_536).is_none());
+        settings.long_context = true;
+        let m = resolve(&settings, key).unwrap();
+        assert_eq!(m.max_context, 65_536, "native × factor");
         assert!(m.rope_override(32_768).is_none(), "off at the native window");
-        assert_eq!(m.rope_override(36_864).map(|y| y.factor), Some(4.0));
+        let y = m.rope_override(36_864).expect("on above it");
+        assert_eq!((y.factor, y.rope_theta), (2.0, 1e6));
         let plain = resolve(&settings, "catalog:openai/gpt-oss-20b").unwrap();
         assert!(plain.yarn.is_none() && plain.rope_override(131_072).is_none());
     }
@@ -91,6 +96,8 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
         let e = catalog::find(id)?;
         let installed_dir = model::find_installed(&e.id, Some(&e.revision))
             .or_else(|| model::find_installed(&e.id, None));
+        // Opt-in: without the setting the model keeps its native window.
+        let yarn = e.yarn.filter(|_| settings.long_context);
         return Some(ResolvedModel {
             key: key.to_string(),
             label: e.name.clone(),
@@ -101,13 +108,13 @@ pub fn resolve(settings: &Settings, key: &str) -> Option<ResolvedModel> {
             installed_dir,
             weight_bytes: e.weight_bytes,
             arch: e.arch,
-            max_context: e.yarn.map_or(e.max_context, |y| y.max_context().max(e.max_context)),
+            max_context: yarn.map_or(e.max_context, |y| y.max_context().max(e.max_context)),
             min_compute_capability: e.min_compute_capability,
             model_id: e.id.clone(),
             edit_format: e.edit_format.clone(),
             reasoning_parser: e.reasoning_parser.clone(),
             dtype: e.dtype.clone(),
-            yarn: e.yarn,
+            yarn,
         });
     }
     let c = settings.custom_models.iter().find(|c| c.key == key)?;
@@ -310,19 +317,26 @@ pub struct SplitStart {
     pub stage: crate::split::Stage,
 }
 
-pub async fn start(
+pub async fn start(settings: &Settings, split: Option<SplitStart>, on_progress: impl FnMut(StartProgress)) -> Result<()> {
+    start_with(settings, split, false, on_progress).await
+}
+
+/// `start`, with `force`: start although the model doesn't fit the free
+/// VRAM. The user accepted that it may fail to load or crash under load.
+pub async fn start_with(
     settings: &Settings,
     split: Option<SplitStart>,
+    force: bool,
     mut on_progress: impl FnMut(StartProgress),
 ) -> Result<()> {
     on_progress(StartProgress::Checking);
     let pf = preflight(settings).await;
     // Split: this GPU only holds its stage, checked below instead of the
-    // whole model.
+    // whole model. Forced: the VRAM check is the one being overridden.
     let blocking = pf
         .checks
         .iter()
-        .find(|c| c.status == CheckStatus::Fail && !(split.is_some() && c.id == "vram"));
+        .find(|c| c.status == CheckStatus::Fail && !((split.is_some() || force) && c.id == "vram"));
     if let Some(check) = blocking {
         bail!(check.detail.clone());
     }
@@ -362,11 +376,11 @@ pub async fn start(
         None => model.requirement(settings.context_len, gpu.compute_capability),
     };
     let fit = vram::check(&req, gpu.free_bytes);
-    if fit.fit == Fit::Insufficient {
-        bail!(fit.message);
-    }
-    let fraction = vram::mem_fraction_static(&req, gpu.free_bytes, gpu.total_bytes)
-        .ok_or_else(|| anyhow::anyhow!(fit.message.clone()))?;
+    let fraction = match vram::mem_fraction_static(&req, gpu.free_bytes, gpu.total_bytes) {
+        Some(f) if fit.fit != Fit::Insufficient => f,
+        _ if force => vram::mem_fraction_forced(&req, gpu.free_bytes),
+        _ => bail!(fit.message),
+    };
 
     let state_dir = paths::backend_state_dir();
     std::fs::create_dir_all(&state_dir)?;

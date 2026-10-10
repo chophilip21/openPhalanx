@@ -39,12 +39,12 @@ The first start builds the backend image (a 16 GB download, once). Changes to th
 
 ## Test the client
 
-The client needs a running server; the one on your own machine is fine. Take the pairing code from the app's Server page.
+The client needs a running server; the one on your own machine is fine.
 
 ```bash
 cargo build -p oppx
 export OPPX_CONFIG=/tmp/opx-test/oppx.json           # a scratch pairing, away from your real one
-target/debug/oppx pair 127.0.0.1 <code> --yes
+target/debug/oppx pair self                          # pairs with the server on this machine
 target/debug/oppx status
 ```
 

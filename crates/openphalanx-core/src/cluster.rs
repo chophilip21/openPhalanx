@@ -152,7 +152,7 @@ pub struct WorkerOrder {
     /// SGLang `--dtype` override; every rank must use rank 0's.
     #[serde(default)]
     pub dtype: Option<String>,
-    /// YaRN rope scaling, as rank 0 runs it (two numbers; the member builds
+    /// YaRN rope scaling, as rank 0 runs it (three numbers; the member builds
     /// the SGLang argument itself).
     #[serde(default)]
     pub yarn: Option<crate::catalog::Yarn>,
@@ -2385,8 +2385,9 @@ mod tests {
             o.check().is_err()
         };
         assert!(bad(|o| o.dtype = Some("bfloat16 --trust-remote-code".into())), "flag smuggled in dtype");
-        assert!(bad(|o| o.yarn = Some(crate::catalog::Yarn { factor: 1e9, original_max: 32768 })), "absurd YaRN factor");
-        assert!(bad(|o| o.yarn = Some(crate::catalog::Yarn { factor: f32::NAN, original_max: 32768 })));
+        assert!(bad(|o| o.yarn = Some(crate::catalog::Yarn { factor: 1e9, original_max: 32768, rope_theta: 1e6 })), "absurd YaRN factor");
+        assert!(bad(|o| o.yarn = Some(crate::catalog::Yarn { factor: f32::NAN, original_max: 32768, rope_theta: 1e6 })));
+        assert!(bad(|o| o.yarn = Some(crate::catalog::Yarn { factor: 4.0, original_max: 32768, rope_theta: 0.0 })), "no RoPE base");
         assert!(bad(|o| o.rank.partition = "40,24 --trust-remote-code".into()));
         assert!(bad(|o| o.rank.partition = String::new()));
         assert!(bad(|o| o.rank.dist_init_addr = "1.2.3.4:9100 --enable-x".into()));

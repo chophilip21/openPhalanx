@@ -12,15 +12,16 @@
   import { onMount } from "svelte";
   import Icon from "./Icon.svelte";
   import Notice from "./Notice.svelte";
-  import { api, type ContextLimit } from "../lib/api";
+  import { api, errorText, type ContextLimit } from "../lib/api";
   import { gib, tokens } from "../lib/format";
 
   let {
     value,
     locked = false,
     compact = false,
+    forced = false,
     onchange,
-  }: { value: number; locked?: boolean; compact?: boolean; onchange: (ctx: number) => void | Promise<void> } = $props();
+  }: { value: number; locked?: boolean; compact?: boolean; forced?: boolean; onchange: (ctx: number) => void | Promise<void> } = $props();
 
   const STEPS = [4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608, 262144];
   const LAST = STEPS.length - 1;
@@ -74,6 +75,19 @@
     // The thumb follows the snapped position, not where the pointer let go.
     el.value = String(dragging.pos);
   }
+  // The long-context mode (YaRN) is the user's choice, off by default.
+  let modeError = $state("");
+  async function setLongContext(on: boolean) {
+    modeError = "";
+    try {
+      // Turning it off: first bring the context back into the native window.
+      if (!on && limit?.native_max != null && value > limit.native_max) await onchange(limit.native_max);
+      await api.setLongContext(on);
+    } catch (e) {
+      modeError = errorText(e);
+    }
+    await load();
+  }
   async function commit(el: HTMLInputElement) {
     const ctx = dragging?.ctx;
     blocked = false;
@@ -126,12 +140,19 @@
       </span>
     {/each}
   </div>
-  {#if !locked && limit?.native_max != null && shown > limit.native_max}
-    <!-- Not a warning: the publisher's documented setting, turned on only up here. -->
-    <p class="cap">
-      Above {tokens(limit.native_max)}, {limit.model} uses its long-context mode (YaRN, as its publisher documents);
-      quality on short prompts can dip slightly, so it stays off at {tokens(limit.native_max)} and below.
-    </p>
+  {#if limit?.long_context_max != null && limit.native_max != null}
+    <label class="mode" class:disabled={locked}>
+      <input type="checkbox" checked={limit.long_context} disabled={locked}
+        onchange={(e) => setLongContext(e.currentTarget.checked)} />
+      <span>
+        Allow up to {tokens(limit.long_context_max)} with the long-context mode (YaRN, experimental)
+        <span class="muted">
+          · {limit.model} was trained for {tokens(limit.native_max)}. Past that it finds details in the prompt
+          about half as reliably in our tests; at {tokens(limit.native_max)} and below nothing changes.
+        </span>
+      </span>
+    </label>
+    {#if modeError}<div class="note-box"><Notice onclose={() => (modeError = "")}>{modeError}</Notice></div>{/if}
   {/if}
   {#if byModel && !locked && max != null && shown >= max}
     <!-- An explanation, not a prompt: shown while the slider sits at the model's
@@ -152,6 +173,9 @@
       {/if}
       <button class="ghost small" onclick={() => onchange(max!)}>Use {tokens(max ?? 0)}</button>
     </p>
+  {:else if !locked && noFit && forced}
+    <!-- "Force load" is ticked: the user chose to try anyway. -->
+    <p class="warn forced">{limit?.model} doesn't fit {gib(limit?.available_bytes ?? 0)} {where} by our estimate, even at a 2k context. Force load will try it anyway.</p>
   {:else if !locked && noFit}
     <p class="warn">{limit?.model} doesn't fit even a 2k context in {gib(limit?.available_bytes ?? 0)} {where}. Pick a smaller model or free some VRAM.</p>
   {/if}
@@ -231,6 +255,10 @@
   }
   .locked .ticks span.on { color: var(--muted); }
   .note-box { margin-top: 8px; font-size: 12.5px; }
+  .mode { display: flex; gap: 8px; align-items: flex-start; margin-top: 10px; font-size: 12.5px; cursor: pointer; }
+  .mode.disabled { cursor: not-allowed; opacity: 0.6; }
+  .mode input { margin-top: 2px; flex: none; }
   .cap { margin: 6px 0 0; font-size: 12.5px; color: var(--muted); }
+  .warn.forced { color: var(--warn-text); }
   .warn { margin: 6px 0 0; font-size: 12.5px; color: var(--bad-text); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 </style>

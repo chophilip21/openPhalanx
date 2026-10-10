@@ -83,12 +83,13 @@ enum SessionChoice {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Pair with a server using the code shown in the OpenPhalanx app.
+    /// Pair with a server using the code shown in the OpenPhalanx app, or
+    /// with the server on this machine: `oppx pair self` (no code needed).
     Pair {
-        /// Server address, e.g. 192.168.1.77 or https://gpu.lan:9090.
+        /// Server address, e.g. 192.168.1.77 or https://gpu.lan:9090; or `self`.
         server: String,
-        /// Pairing code from the app's Server page, e.g. K7QF-M2XD.
-        code: String,
+        /// Pairing code from the app's Server page, e.g. K7QF-M2XD (not for `self`).
+        code: Option<String>,
         /// Expected certificate fingerprint (as shown in the app); skips the prompt.
         #[arg(long)]
         fingerprint: Option<String>,
@@ -244,7 +245,21 @@ async fn run(cli: Cli) -> Result<()> {
     };
     match command {
         Command::Pair { server, code, fingerprint, yes, device_name, alias, force } => {
-            pair(&mut cfg, &server, &code, fingerprint, yes, device_name, alias, force).await?;
+            if server == "self" {
+                // The server is on this machine: ask it for the code and the
+                // certificate fingerprint directly, so there is nothing to copy.
+                let alias = alias.unwrap_or_else(|| "local".into());
+                // Before asking: a new code replaces the one the app shows.
+                if cfg.servers.contains_key(&alias) && !force {
+                    bail!("already paired as \"{alias}\"; use --force to replace it, or --as <name> to keep both");
+                }
+                let local = local_pairing().await?;
+                let alias = Some(alias);
+                pair(&mut cfg, &local.url, &local.code, Some(local.fingerprint), yes, device_name, alias, force).await?;
+            } else {
+                let code = code.context("the pairing code is missing: oppx pair <server> <code> (or: oppx pair self)")?;
+                pair(&mut cfg, &server, &code, fingerprint, yes, device_name, alias, force).await?;
+            }
             cfg.save(&path)?;
         }
         Command::Status { name } => status(&cfg, name.as_deref()).await?,
@@ -317,6 +332,59 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// What `oppx pair self` needs from the server on this machine.
+struct LocalPairing {
+    url: String,
+    code: String,
+    fingerprint: String,
+}
+
+/// Gets a pairing code and the certificate fingerprint from the OpenPhalanx
+/// server running on this machine, through its loopback admin API. The admin
+/// token is read from the backend container, so this needs Docker access:
+/// the same access that already lets a user read the token by hand.
+async fn local_pairing() -> Result<LocalPairing> {
+    let out = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{.State.Running}} {{json .Config.Env}}", "openphalanx-backend"])
+        .output()
+        .context("`oppx pair self` needs the docker command, to reach the server on this machine")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || !text.starts_with("true ") {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("permission denied") {
+            bail!("your user can't use Docker, so the local server can't be asked for a code. Pair with a code instead: oppx pair 127.0.0.1 <code>");
+        }
+        bail!("no OpenPhalanx server is running on this machine. Start it in the app (or `oppxs start`), then run `oppx pair self` again.");
+    }
+    let (token, admin, url) = local_endpoints(text.trim_start_matches("true ").trim())?;
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?;
+    let get = |method: reqwest::Method, path: &str| http.request(method, format!("{admin}{path}")).header("x-admin-token", &token);
+    let pairing: serde_json::Value = get(reqwest::Method::POST, "/admin/pairing")
+        .send()
+        .await
+        .context("the local server isn't answering yet; try again in a moment")?
+        .error_for_status()?
+        .json()
+        .await?;
+    let status: serde_json::Value = get(reqwest::Method::GET, "/admin/status").send().await?.error_for_status()?.json().await?;
+    Ok(LocalPairing {
+        url,
+        code: pairing["code"].as_str().context("the local server gave no pairing code")?.to_string(),
+        fingerprint: status["tls_fingerprint"].as_str().context("the local server gave no fingerprint")?.to_string(),
+    })
+}
+
+/// From the backend container's environment (JSON list of `NAME=value`):
+/// the admin token, the admin API's URL and the address clients pair with.
+fn local_endpoints(env_json: &str) -> Result<(String, String, String)> {
+    let env: Vec<String> = serde_json::from_str(env_json).context("unexpected docker output")?;
+    let var = |name: &str| env.iter().find_map(|e| e.strip_prefix(&format!("{name}=")).map(str::to_string));
+    let token = var("ADMIN_TOKEN").filter(|t| !t.is_empty()).context("the local server has no admin token")?;
+    let admin = format!("http://127.0.0.1:{}", var("ADMIN_PORT").unwrap_or_else(|| "9091".into()));
+    let agent = format!("127.0.0.1:{}", var("AGENT_PORT").unwrap_or_else(|| "9090".into()));
+    Ok((token, admin, agent))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn pair(
     cfg: &mut Config,
@@ -353,7 +421,7 @@ async fn pair(
     );
 
     match expected {
-        Some(e) if tls::matches(&e, &fp)? => ui::line(ui::ok("fingerprint", "matches --fingerprint")),
+        Some(e) if tls::matches(&e, &fp)? => ui::line(ui::ok("fingerprint", "matches the expected one")),
         Some(_) => bail!(
             "the server's certificate does not match --fingerprint. Do not pair: you may be talking to a \
              different machine than the one running OpenPhalanx."
@@ -760,7 +828,17 @@ async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args:
 
 #[cfg(test)]
 mod tests {
-    use super::name_for;
+    use super::{local_endpoints, name_for};
+
+    #[test]
+    fn pair_self_reads_the_local_servers_settings() {
+        let (token, admin, agent) = local_endpoints(r#"["PATH=/usr/bin","ADMIN_TOKEN=abc","AGENT_PORT=9443"]"#).unwrap();
+        assert_eq!((token.as_str(), admin.as_str(), agent.as_str()), ("abc", "http://127.0.0.1:9091", "127.0.0.1:9443"));
+        let (_, admin, agent) = local_endpoints(r#"["ADMIN_TOKEN=t","ADMIN_PORT=1","X=ADMIN_TOKEN=no"]"#).unwrap();
+        assert_eq!((admin.as_str(), agent.as_str()), ("http://127.0.0.1:1", "127.0.0.1:9090"), "defaults, and exact names only");
+        assert!(local_endpoints(r#"["ADMIN_TOKEN="]"#).is_err(), "a backend started without a token");
+        assert!(local_endpoints("not json").is_err());
+    }
 
     #[test]
     fn derives_server_names() {

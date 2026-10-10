@@ -11,7 +11,7 @@
   import { api, errorText, type Preflight } from "../lib/api";
   import { gib, tokens } from "../lib/format";
   import { app } from "../lib/store.svelte";
-  import { goto as navigate, nav } from "../lib/nav.svelte";
+  import { forceLoad, goto as navigate, nav } from "../lib/nav.svelte";
 
   let { goto }: { goto: (page: string) => void } = $props();
 
@@ -110,7 +110,9 @@
     try {
       if (idle) {
         if (st === "error" || st === "paused") await api.dismissError();
-        await api.start();
+        await api.start(forced);
+        forceLoad.on = false;
+        forceLoad.restore = null;
       } else {
         await api.stop();
       }
@@ -121,10 +123,56 @@
     }
   }
 
-  const canToggle = $derived(
-    !acting && (idle ? !locked && !!preflight?.can_start : st === "running" || st === "starting" || st === "external"),
-  );
   const blocking = $derived(preflight?.checks.find((c) => c.status === "fail") ?? null);
+  // Not enough VRAM is the one check the user may override, by ticking a box.
+  const forceable = $derived(
+    idle && !locked && !preflight?.running && preflight?.checks.filter((c) => c.status === "fail").every((c) => c.id === "vram") === true && blocking?.id === "vram",
+  );
+  // The tick lives outside the page (it survives a visit to another tab) and
+  // is dropped once the checks are in and no longer ask for it: the model
+  // fits now, or something else blocks the start.
+  $effect(() => {
+    if (preflight && !forceable && forceLoad.on) {
+      forceLoad.on = false;
+      forceLoad.restore = null;
+    }
+  });
+  const forced = $derived(forceable && forceLoad.on);
+  let ctxNote = $state("");
+  // Ticking it brings the context window down to the longest that fits (the 2k
+  // minimum when none does), so the server isn't asked for a window the GPU
+  // can't hold; unticking puts the earlier window back.
+  async function setForce(on: boolean) {
+    forceLoad.on = on;
+    ctxNote = "";
+    const now = snap?.settings.context_len ?? 32768;
+    if (!on) {
+      const back = forceLoad.restore;
+      forceLoad.restore = null;
+      if (back != null && back !== now) await setContext(back);
+      return;
+    }
+    try {
+      const limit = await api.contextLimit();
+      const target = Math.min(now, limit.max_fit ?? MIN_CONTEXT);
+      if (target < now) {
+        forceLoad.restore = now;
+        await setContext(target);
+        ctxNote = limit.max_fit != null
+          ? `Context window set to ${tokens(target)}, the longest ${limit.model ?? "the model"} fits right now.`
+          : `Context window set to ${tokens(target)}, the minimum: ${limit.model ?? "the model"} doesn't fit this GPU by our estimate.`;
+      }
+    } catch (e) {
+      actionError = errorText(e);
+    }
+  }
+  const MIN_CONTEXT = 2048;
+  // Forced: the VRAM check is overridden, so it reads as a warning, not a stop.
+  const checks = $derived((preflight?.checks ?? []).map((c) => (forced && c.id === "vram" ? { ...c, status: "warn" as const } : c)));
+  const canToggle = $derived(
+    !acting &&
+      (idle ? !locked && (!!preflight?.can_start || forced) : st === "running" || st === "starting" || st === "external"),
+  );
   // The same setting as the Models page's slider; locked while a backend runs.
   const ctxLocked = $derived(["starting", "running", "stopping", "external"].includes(st));
   async function setContext(ctx: number) {
@@ -206,6 +254,8 @@
           <span class="paused-note"><Icon name="alert" size={14} /> {snap.server.detail}</span>
         {:else if snap?.server.detail}
           {snap.server.detail}
+        {:else if idle && blocking && forced}
+          <span class="forced"><Icon name="alert" size={14} /> Force load is on. {blocking.detail}</span>
         {:else if idle && blocking}
           <span class="blocked"><Icon name="alert" size={14} /> {blocking.detail}</span>
         {:else if idle}
@@ -214,6 +264,16 @@
           Clients can connect with a pairing code.
         {/if}
       </p>
+
+      {#if forceable}
+        <label class="force">
+          <input type="checkbox" checked={forceLoad.on} onchange={(e) => setForce(e.currentTarget.checked)} />
+          <span>
+            <strong>Force load.</strong> I understand it may fail to load, or crash when it runs out of GPU memory, and
+            I would still like to proceed.
+          </span>
+        </label>
+      {/if}
 
       {#if showLogsHint}
       <div class="hint info" role="status">
@@ -224,6 +284,9 @@
       </div>
     {/if}
 
+    {#if ctxNote}
+        <Notice kind="warn" onclose={() => (ctxNote = "")}>{ctxNote}</Notice>
+      {/if}
     {#if actionError}
         <Notice onclose={() => (actionError = "")}>{actionError}</Notice>
       {/if}
@@ -261,7 +324,7 @@
                   overhead={preflight.requirement.overhead_bytes}
                   available={gpu.free_bytes}
                   total={gpu.total_bytes}
-                  fit={preflight.fit?.fit ?? null}
+                  fit={forced ? "tight" : (preflight.fit?.fit ?? null)}
                 />
               </div>
             {/if}
@@ -270,7 +333,7 @@
           {/if}
           <div class="ctx">
             <span class="muted small-text">Context window</span>
-            <ContextSlider compact value={snap?.settings.context_len ?? 32768} locked={ctxLocked} onchange={setContext} />
+            <ContextSlider compact value={snap?.settings.context_len ?? 32768} locked={ctxLocked} {forced} onchange={setContext} />
           </div>
           <label class="toggle">
             <input type="checkbox" checked={snap?.settings.web_search ?? true}
@@ -288,7 +351,7 @@
               <span class="eyebrow titled"><Icon name="checklist" size={14} /> Pre-flight checks</span>
               <span class="muted small-text">{passed} of {preflight.checks.length} passed</span>
             </div>
-            <Checklist checks={preflight.checks} />
+            <Checklist {checks} />
           </div>
         {/if}
       </section>
@@ -307,12 +370,19 @@
   .dot.starting, .dot.stopping, .dot.external { background: var(--busy); }
   .dot.error, .dot.paused { background: var(--bad); }
   .download-ask { border-color: var(--on); background: var(--on-soft); }
+  .force {
+    display: flex; gap: 10px; align-items: flex-start; max-width: 560px; margin: 4px auto 0; padding: 10px 14px;
+    border: 1px solid var(--busy-glow); border-radius: 10px; background: var(--busy-soft); color: var(--warn-text);
+    font-size: 13px; text-align: left; cursor: pointer;
+  }
+  .force input { margin-top: 2px; flex: none; }
   .download-ask .primary { white-space: nowrap; display: inline-flex; gap: 6px; align-items: center; }
   .running-model { display: flex; justify-content: center; margin: 2px 0 6px; }
   .locked-note { color: var(--violet); display: inline-flex; gap: 6px; align-items: baseline; max-width: 560px; }
   .paused-note { color: var(--bad); display: inline-flex; gap: 6px; align-items: baseline; max-width: 560px; font-weight: 500; }
   .headline { margin: 4px 0 0; font-size: 26px; font-weight: 650; }
   .detail { margin: 0; color: var(--muted); max-width: 460px; min-height: 20px; }
+  .forced { color: var(--warn-text); display: inline-flex; gap: 6px; align-items: flex-start; text-align: left; }
   .blocked { color: var(--bad-text); display: inline-flex; gap: 6px; align-items: flex-start; text-align: left; }
   .error-banner { max-width: 560px; text-align: left; }
   .error-banner.warn { border-color: var(--busy-glow); background: var(--busy-soft); color: var(--warn-text); }
