@@ -1,10 +1,9 @@
 <script lang="ts">
   // "Update available" dialog: asked once per launch when GitHub has a newer
   // release, or when the user checks by hand from the sidebar.
-  import { openUrl } from "@tauri-apps/plugin-opener";
   import Icon from "./Icon.svelte";
   import Notice from "./Notice.svelte";
-  import { api, errorText, events, type UpdateCheck, type UpdateProgress } from "../lib/api";
+  import { api, errorText, events, openLink, type UpdateCheck, type UpdateProgress } from "../lib/api";
 
   let { check, onclose }: { check: UpdateCheck; onclose: () => void } = $props();
 
@@ -37,7 +36,7 @@
       Openphalanx <strong>{check.latest}</strong> is available; you have {check.current}.
       {#if check.can_install}Would you like to download it?{/if}
     </p>
-    <button class="link" onclick={() => openUrl(check.url)}>What's new <Icon name="external" size={12} /></button>
+    <button class="link" onclick={() => openLink(check.url).catch((e) => (error = errorText(e)))}>What's new <Icon name="external" size={12} /></button>
 
     {#if check.note}
       <p class="muted note">{check.note}</p>

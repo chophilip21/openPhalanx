@@ -466,6 +466,19 @@ export const events = {
 };
 
 /** Tauri rejects with the Rust error string. */
+/** Opens a link in the user's browser. Only GitHub and Hugging Face are
+ *  allowed (capabilities/default.json): the permission needs a URL scope, and
+ *  without one every link in the app was refused without a word. Throws with a
+ *  message that says so. */
+export async function openLink(url: string): Promise<void> {
+  const { openUrl } = await import("@tauri-apps/plugin-opener");
+  try {
+    await openUrl(url);
+  } catch (e) {
+    throw new Error(`Couldn't open ${url} in your browser (${errorText(e)}).`);
+  }
+}
+
 export function errorText(e: unknown): string {
   return typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
 }

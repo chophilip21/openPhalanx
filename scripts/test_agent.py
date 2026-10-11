@@ -193,6 +193,51 @@ class AgentLoop(unittest.TestCase):
         s.agent.reset()
         self.assertNotEqual(s.agent.session, before)
 
+    def test_a_plan_is_shown_without_the_action_tacked_onto_it(self):
+        self.assertEqual(A.strip_action('1. change LIMIT\n2. done\n\n{"enough": false, "missing": "apply", "tool": "edit", "path": "a.py"}'),
+                         "1. change LIMIT\n2. done")
+        self.assertEqual(A.strip_action('Plan:\n- edit a.py\n```json\n{"tool": "edit", "path": "a.py"}\n```'), "Plan:\n- edit a.py")
+        self.assertEqual(A.strip_action('Set {"limit": 4} in config.json.'), 'Set {"limit": 4} in config.json.')
+        self.assertEqual(A.strip_action("Use a dict: {\n  x\n}"), "Use a dict: {\n  x\n}")
+        s = self.s
+        s.actions = [{"tool": "plan"}, {"tool": "answer"}]
+        s.texts = ['Look in src.\n{"enough": false, "missing": "x", "tool": "read", "path": "src/calc.py"}', "Nothing."]
+        s.agent.turn("where is add?", can_edit=True, wants_change=False)
+        self.assertEqual([d for t, d in s.steps if t == "Plan"], ["Look in src."])
+
+    @needs_aider
+    def test_an_edit_nobody_checked_is_reported_as_unverified(self):
+        s = self.s
+        edit = {"tool": "edit", "path": "src/calc.py"}
+        block = "src/calc.py\n<<<<<<< SEARCH\nLIMIT = 3\n=======\nLIMIT = 4\n>>>>>>> REPLACE"
+        s.actions = [edit, {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = [block, "LIMIT is 4 now (not verified)."]
+        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
+        nudge = [m["content"] for m in s.agent.messages if "haven't run anything to check" in m["content"]]
+        self.assertEqual(len(nudge), 1)
+        self.assertIn("Nothing was run to check these changes", s.prompts[-1][0])
+        # With a check run after the edit, the reply is told how it ended.
+        s2 = Scripted(str(self.root))
+        s2.agent.hooks.confirm_run = lambda c: True
+        s2.actions = [dict(edit), {"tool": "run", "command": "python3 -c 'import sys; sys.exit(3)'"}, {"tool": "answer"}, {"tool": "answer"}]
+        s2.texts = [block.replace("LIMIT = 3", "LIMIT = 4").replace("=======\nLIMIT = 4", "=======\nLIMIT = 5"), "The check failed."]
+        s2.agent.turn("make the limit 5 in src/calc.py", can_edit=True)
+        self.assertIn("ended with exit code 3", s2.prompts[-1][0])
+        self.assertFalse(any("haven't run anything" in m["content"] for m in s2.agent.messages))
+
+    def test_a_refused_command_tells_the_model_why(self):
+        s = self.s
+        seen = []
+        s.agent.hooks.confirm_run = lambda c: "The user declined to run this command and said: use pytest -q instead"
+        s.agent._action = lambda tools: (seen.append(tools), {"tool": "run", "command": "pytest"} if len(seen) == 1 else {"tool": "answer"})[1]
+        s.texts = ["Not run."]
+        s.agent.turn("run the tests", can_edit=False)
+        self.assertIn("run", seen[0], "plan mode can still look with commands; the app lets only reading ones through")
+        self.assertNotIn("edit", seen[0])
+        results = [m["content"] for m in s.agent.messages if m.get("_result")]
+        self.assertTrue(any("use pytest -q instead" in r for r in results))
+        self.assertFalse(any(r.startswith("exit code") for r in results), "it never ran")
+
     def test_plan_mode_has_no_edit_tools(self):
         s = self.s
         s.actions = [{"tool": "edit", "path": "src/calc.py"}]

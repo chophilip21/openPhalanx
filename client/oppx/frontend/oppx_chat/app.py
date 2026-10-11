@@ -91,7 +91,7 @@ def welcome(coder):
 INTERRUPT_NOTE = "I see that you interrupted my previous reply."
 # Plan mode and /ask take the editing tools away; without being told, a model
 # asked for a change "answers" that it made it.
-READ_ONLY_NOTE = ("(Read-only request: you can't change files this time. If a change is asked for, "
+READ_ONLY_NOTE = ("(Read-only request: you can't change files this time, and only commands that read will run. If a change is asked for, "
                   "explain what you would change and where, and say that nothing was changed yet.)")
 
 
@@ -182,32 +182,35 @@ def make_agent(coder) -> Agent:
 
     perms = UI.permissions = Permissions(coder.root)
 
-    def on_confirm(command: str) -> bool:
+    def on_confirm(command: str) -> bool | str:
         """Commands that only read run without a question, and so does
         anything a saved rule covers. The rest is asked once: yes, no, or
         always (a rule for this project, kept between sessions). Asking for
         every `git log` taught people to press y without reading."""
-        if perms.allows(command):
+        verdict, why = perms.judge(command, UI.read_only_turn)
+        if verdict == "run":
             return True
+        if verdict == "refuse":
+            step("Not run: " + ("a deny rule forbids it" if "deny rule" in why else "edits are off, and it doesn't only read"), MUTED)
+            return why
         rules = perms.offer(command)
         SPIN.stop()
         out(f"\n[{YELLOW}]⏺[/] [bold]Run this command?[/]")
         for line in command.splitlines():
             out(f"  [{MUTED}]│[/] {escape(line)}")
-        always = f", a = always allow {', '.join(f'`{r}`' for r in rules)} in this project" if rules else ""
-        answer = coder.io._ask_line(f"  Allow? (y/N{always}) ").strip().lower()
-        ok = answer in ("y", "yes") or (bool(rules) and answer in ("a", "always"))
-        if ok and answer in ("a", "always"):
-            perms.allow_always(command)
-            step(f"Allowed, and from now on without asking: {', '.join(rules)} (/permissions to change)", GREEN)
-        else:
-            step("Allowed" if ok else "Declined", GREEN if ok else MUTED)
+        always = f"a = always allow {', '.join(f'`{r}`' for r in rules)} in this project, " if rules else ""
+        said = coder.io._ask_line(f"  Allow? (y = yes, {always}N = no, or type what to do instead) ").strip()
         SPIN.start()
-        return ok
+        result, shown = perms.answered(command, said)
+        step(shown, GREEN if result is True else MUTED)
+        return result
 
-    def on_confirm_tool(name: str, arguments: str, read_only: bool) -> bool:
+    def on_confirm_tool(name: str, arguments: str, read_only: bool) -> bool | str:
         """A connector tool reaches outside the repository, so each call is
         the user's to allow: once, or always (saved for this project)."""
+        if perms.tool_denied(name):
+            step(f"Refused by your deny rule: {escape(name)}", MUTED)
+            return "The user's deny rule forbids this tool."
         if perms.tool_allowed(name):
             return True
         SPIN.stop()
@@ -215,14 +218,19 @@ def make_agent(coder) -> Agent:
         out(f"\n[{YELLOW}]⏺[/] [bold]Call this connector tool?[/]{note}")
         for line in f"{name} {arguments}".splitlines()[:30]:
             out(f"  [{MUTED}]│[/] {escape(line)}")
-        answer = coder.io._ask_line(f"  Allow? (y/N, a = always allow {name} in this project) ").strip().lower()
-        ok = answer in ("y", "yes", "a", "always")
+        said = coder.io._ask_line(
+            f"  Allow? (y = yes, a = always allow {name} in this project, N = no, or type what to do instead) ").strip()
+        answer = said.lower()
+        SPIN.start()
         if answer in ("a", "always"):
             perms.allow_tool(name)
-        step(("Allowed, and from now on without asking (/permissions to change)" if perms.tool_allowed(name) else "Allowed")
-             if ok else "Declined", GREEN if ok else MUTED)
-        SPIN.start()
-        return ok
+            step("Allowed, and from now on without asking (/permissions to change)", GREEN)
+            return True
+        if answer in ("y", "yes"):
+            step("Allowed", GREEN)
+            return True
+        step("Declined" + ("" if answer in ("", "n", "no") else ", with your note"), MUTED)
+        return False if answer in ("", "n", "no") else f"The user said: {said}"
 
     def on_notice(text: str):
         SPIN.stop()
@@ -275,7 +283,7 @@ def agent_turn(coder, text: str):
     can_edit = not UI.plan_mode
     if text.startswith("/ask "):
         text, can_edit = text[5:].strip(), False
-    read_only = not can_edit
+    read_only = UI.read_only_turn = not can_edit
     agent = UI.agent
     # The ask/edit check belongs to the turn that is about to start (for the server's Trace page).
     route = {"session": agent.session, "turn": agent.turns + 1, "step": 0, "kind": "route"}
