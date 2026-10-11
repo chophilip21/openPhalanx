@@ -246,7 +246,7 @@ impl Service {
     }
 
     fn admin_of(container: Option<&docker::ContainerInfo>) -> Option<AdminClient> {
-        container.filter(|c| c.state.running && c.managed).and_then(|c| c.admin_token.clone()).map(AdminClient::new)
+        container.filter(|c| c.state.running && c.managed).and_then(|c| c.admin_token.clone().map(|t| AdminClient::new(t, c.admin_port)))
     }
 
     async fn admin(&self) -> Result<AdminClient> {

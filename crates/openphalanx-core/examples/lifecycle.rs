@@ -15,8 +15,8 @@ async fn main() -> anyhow::Result<()> {
     }
     server::start(&settings, None, |p| println!("progress: {p:?}")).await?;
 
-    let token = docker::inspect().await?.and_then(|c| c.admin_token).expect("admin token");
-    let admin = AdminClient::new(token);
+    let container = docker::inspect().await?.expect("backend container");
+    let admin = AdminClient::new(container.admin_token.expect("admin token"), container.admin_port);
     let t0 = std::time::Instant::now();
     loop {
         match admin.status().await {

@@ -335,14 +335,6 @@
             <span class="muted small-text">Context window</span>
             <ContextSlider compact value={snap?.settings.context_len ?? 32768} locked={ctxLocked} {forced} onchange={setContext} />
           </div>
-          <label class="toggle">
-            <input type="checkbox" checked={snap?.settings.web_search ?? true}
-              onchange={(e) => api.setWebSearch(e.currentTarget.checked).then(refreshPreflight)} />
-            <span>
-              Web search for clients
-              <span class="muted small-text">private SearXNG on this server</span>
-            </span>
-          </label>
         </div>
 
         {#if preflight}
@@ -389,16 +381,12 @@
   /* Side by side, the model card and the pre-flight list are always the same height. */
   .setup { width: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; align-items: stretch; }
   .setup > .card { display: flex; flex-direction: column; }
-  .setup .toggle { margin-top: auto; padding-top: 14px; }
   .row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .small { padding: 3px 10px; font-size: 12.5px; }
   .model-name { font-size: 16px; font-weight: 600; }
   .small-text { font-size: 12.5px; }
   .vram { margin-top: 14px; }
   .ctx { margin-top: 14px; display: flex; flex-direction: column; gap: 2px; }
-  .toggle { display: flex; gap: 10px; align-items: flex-start; margin-top: 14px; font-size: 13px; cursor: pointer; }
-  .toggle input { margin-top: 3px; }
-  .toggle span { display: flex; flex-direction: column; }
   .hint {
     position: relative;
     display: flex;

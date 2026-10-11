@@ -29,7 +29,11 @@ use openphalanx_core::settings::Settings;
 use openphalanx_core::{catalog, download, gpu, model, paths, server, vram};
 use rand::Rng;
 
-const CONTROL_PORT: u16 = 9094;
+/// The control API's port (`settings.control_port`, default 9094), read once.
+fn control_port() -> u16 {
+    static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *PORT.get_or_init(|| Settings::load().control_port)
+}
 
 #[derive(Parser)]
 #[command(name = "oppxs", version, about = "Run an OpenPhalanx server without the desktop app")]
@@ -66,6 +70,13 @@ enum Command {
     Context { tokens: u32 },
     /// Let models with a long-context mode (YaRN) go past their native window: on or off.
     LongContext { mode: String },
+    /// Show the movable ports, or move one: `port <n>` (the client API, default
+    /// 9090), `port admin <n>` (9091), `port control <n>` (9094). Applies at the next start.
+    Port { args: Vec<String> },
+    /// The server's ports, what each is for, and who listens on it now.
+    Ports,
+    /// Run a private SearXNG so clients' models can search the web: on or off. Applies at the next start.
+    WebSearch { mode: String },
     /// Start serving the selected model.
     Start {
         /// Start although the model doesn't fit the free VRAM. It may fail
@@ -306,9 +317,9 @@ async fn run(name: Option<String>) -> Result<()> {
         .with_state((cluster.clone(), token))
         .merge(backend);
     tokio::spawn(service.clone().monitor());
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], CONTROL_PORT)))
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], control_port())))
         .await
-        .with_context(|| format!("port {CONTROL_PORT} is in use: oppxs or the OpenPhalanx app is already running on this machine. `oppxs free-ports` shows what holds it and stops it"))?;
+        .with_context(|| format!("port {} is in use: oppxs or the OpenPhalanx app is already running on this machine. `oppxs free-ports` shows what holds it and stops it", control_port()))?;
     tokio::spawn(async move { axum::serve(listener, control).await });
 
     println!("OpenPhalanx server \"{}\" ({})", cluster.name(), cluster.id());
@@ -334,7 +345,7 @@ async fn free_ports(yes: bool) -> Result<()> {
     use std::io::{IsTerminal, Write};
     let holders = openphalanx_core::ports::holders().await?;
     if holders.is_empty() {
-        println!("Nothing holds the server's ports (9092, 9093/udp, 9094). `oppxs run` or the app can start.");
+        println!("Nothing holds the server's ports (9092, 9093/udp, {}). `oppxs run` or the app can start.", control_port());
         return Ok(());
     }
     for h in &holders {
@@ -406,7 +417,7 @@ impl Control {
     async fn view(&self) -> Result<ClusterView> {
         let resp = self
             .client
-            .get(format!("http://127.0.0.1:{CONTROL_PORT}/control/status"))
+            .get(format!("http://127.0.0.1:{}/control/status", control_port()))
             .bearer_auth(&self.token)
             .send()
             .await
@@ -423,7 +434,7 @@ impl Control {
     async fn call<T: serde::de::DeserializeOwned>(&self, method: reqwest::Method, path: &str) -> Result<T> {
         let resp = self
             .client
-            .request(method, format!("http://127.0.0.1:{CONTROL_PORT}/control/{path}"))
+            .request(method, format!("http://127.0.0.1:{}/control/{path}", control_port()))
             .bearer_auth(&self.token)
             .send()
             .await
@@ -443,7 +454,7 @@ impl Control {
     async fn act(&self, action: &str, id: &str) -> Result<serde_json::Value> {
         let resp = self
             .client
-            .post(format!("http://127.0.0.1:{CONTROL_PORT}/control/{action}/{id}"))
+            .post(format!("http://127.0.0.1:{}/control/{action}/{id}", control_port()))
             .bearer_auth(&self.token)
             .send()
             .await?;
@@ -653,7 +664,7 @@ async fn control(cmd: Command) -> Result<()> {
             }
             let id = pick("server", &server, known.iter().map(|(id, name, _)| (id.as_str(), name.as_str())))
                 .or_else(|e| pick("server", &server, known.iter().map(|(id, _, own)| (id.as_str(), own.as_str()))).map_err(|_| e))?;
-            let resp = ctl.client.post(format!("http://127.0.0.1:{CONTROL_PORT}/control/nickname")).bearer_auth(&ctl.token)
+            let resp = ctl.client.post(format!("http://127.0.0.1:{}/control/nickname", control_port())).bearer_auth(&ctl.token)
                 .json(&serde_json::json!({ "id": id, "name": name })).send().await?;
             if !resp.status().is_success() {
                 let v: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -666,7 +677,7 @@ async fn control(cmd: Command) -> Result<()> {
         }
         Command::Model { model } => {
             let body = if model.eq_ignore_ascii_case("none") { serde_json::json!({ "model": null }) } else { serde_json::json!({ "model": model }) };
-            let resp = ctl.client.post(format!("http://127.0.0.1:{CONTROL_PORT}/control/model")).bearer_auth(&ctl.token).json(&body).send().await?;
+            let resp = ctl.client.post(format!("http://127.0.0.1:{}/control/model", control_port())).bearer_auth(&ctl.token).json(&body).send().await?;
             if !resp.status().is_success() {
                 let v: serde_json::Value = resp.json().await.unwrap_or_default();
                 bail!("{}", v["error"].as_str().unwrap_or("failed"));
@@ -678,7 +689,7 @@ async fn control(cmd: Command) -> Result<()> {
             let id = pick("member", &member, view.members.iter().map(|m| (m.id.as_str(), m.name.as_str())))?;
             let lines: Vec<String> = ctl
                 .client
-                .get(format!("http://127.0.0.1:{CONTROL_PORT}/control/logs/{id}"))
+                .get(format!("http://127.0.0.1:{}/control/logs/{id}", control_port()))
                 .bearer_auth(&ctl.token)
                 .send()
                 .await?
@@ -698,7 +709,10 @@ async fn control(cmd: Command) -> Result<()> {
         | Command::Download { .. }
         | Command::Use { .. }
         | Command::Context { .. }
-        | Command::LongContext { .. } => unreachable!("handled in main"),
+        | Command::LongContext { .. }
+        | Command::Port { .. }
+        | Command::Ports
+        | Command::WebSearch { .. } => unreachable!("handled in main"),
     }
     Ok(())
 }
@@ -874,6 +888,81 @@ async fn set_long_context(mode: &str) -> Result<()> {
     Ok(())
 }
 
+/// `oppxs port [admin|control] [<n>]`: the same rules as the app's Settings page.
+async fn set_port(args: &[String]) -> Result<()> {
+    use openphalanx_core::ports::{port_problem, Movable};
+    let mut settings = Settings::load();
+    let (kind, value) = match args {
+        [] => {
+            println!("client API   {}   (oppxs port <n>)", settings.agent_port);
+            println!("admin API    {}   (oppxs port admin <n>; this machine only)", settings.admin_port);
+            println!("control API  {}   (oppxs port control <n>; this machine only)", settings.control_port);
+            println!("The cluster's ports (9092, 9093/udp) and the split model's are fixed: every server must use the same ones.");
+            return Ok(());
+        }
+        [n] => (Movable::Agent, n),
+        [which, n] => (
+            match which.as_str() {
+                "client" | "agent" => Movable::Agent,
+                "admin" => Movable::Admin,
+                "control" => Movable::Control,
+                _ => bail!("use `oppxs port <n>`, `oppxs port admin <n>` or `oppxs port control <n>`"),
+            },
+            n,
+        ),
+        _ => bail!("use `oppxs port <n>`, `oppxs port admin <n>` or `oppxs port control <n>`"),
+    };
+    let port: u16 = value.parse().with_context(|| format!("{value} isn't a port number"))?;
+    if kind == Movable::Control {
+        if !openphalanx_core::net::port_is_free(settings.control_port) {
+            bail!("`oppxs run` (or the app) is running on port {}; stop it first, then change the port.", settings.control_port);
+        }
+    } else {
+        refuse_while_running("the port").await?;
+    }
+    if let Some(problem) = port_problem(kind, port, &settings) {
+        bail!("{problem}");
+    }
+    match kind {
+        Movable::Agent => settings.agent_port = port,
+        Movable::Admin => settings.admin_port = port,
+        Movable::Control => settings.control_port = port,
+    }
+    settings.save()?;
+    match kind {
+        Movable::Agent => println!("The client API will listen on port {port} from the next start. Clients pair again with the new address (oppx pair <address>:{port} <code>)."),
+        Movable::Admin => println!("The admin API will listen on port {port} (this machine only) from the next start."),
+        Movable::Control => println!("`oppxs run` will listen on port {port} for its commands from its next start."),
+    }
+    Ok(())
+}
+
+async fn show_ports() -> Result<()> {
+    let settings = Settings::load();
+    for p in openphalanx_core::ports::overview(&settings).await? {
+        let port = match p.last {
+            Some(last) => format!("{}-{}/{}", p.port, last, p.proto),
+            None => format!("{}/{}", p.port, p.proto),
+        };
+        let who = if p.holders.is_empty() { "free".to_string() } else { p.holders.join(", ") };
+        println!("{port:<15} {:<52} {:<13} {:<20} {who}", p.purpose, p.reach, p.when);
+    }
+    Ok(())
+}
+
+fn set_web_search(mode: &str) -> Result<()> {
+    let on = match mode {
+        "on" => true,
+        "off" => false,
+        _ => bail!("use `oppxs web-search on` or `oppxs web-search off`"),
+    };
+    let mut settings = Settings::load();
+    settings.web_search = on;
+    settings.save()?;
+    println!("Web search {} from the next start.", if on { "on" } else { "off" });
+    Ok(())
+}
+
 /// `start --force`, as ticking "Force load" in the app: the context window
 /// comes down to the longest the model fits now, or to the minimum when none
 /// does, so the server isn't asked for a window the GPU can't hold.
@@ -916,6 +1005,9 @@ async fn main() {
         Command::Use { model } => use_model(&model),
         Command::Context { tokens } => set_context(tokens).await,
         Command::LongContext { mode } => set_long_context(&mode).await,
+        Command::Port { args } => set_port(&args).await,
+        Command::Ports => show_ports().await,
+        Command::WebSearch { mode } => set_web_search(&mode),
         Command::Logs { member: None, lines } => backend_logs(lines).await,
         other => control(other).await,
     };
