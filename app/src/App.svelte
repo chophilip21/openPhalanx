@@ -9,8 +9,10 @@
   import Logs from "./pages/Logs.svelte";
   import Trace from "./pages/Trace.svelte";
   import Models from "./pages/Models.svelte";
+  import Settings from "./pages/Settings.svelte";
+  import { setIpMasking } from "./lib/privacy";
   import { app, connect } from "./lib/store.svelte";
-  import { theme, toggleTheme } from "./lib/theme.svelte";
+  import { adoptTheme, theme, toggleTheme } from "./lib/theme.svelte";
   import { goto, nav } from "./lib/nav.svelte";
 
   const NAV = [
@@ -19,6 +21,7 @@
     { id: "models", label: "Models", icon: "box" },
     { id: "logs", label: "Logs", icon: "terminal" },
     { id: "trace", label: "Trace", icon: "activity" },
+    { id: "settings", label: "Settings", icon: "settings" },
   ];
 
   const REPO = "https://github.com/chophilip21/openPhalanx";
@@ -67,6 +70,23 @@
   }
 
   const st = $derived(app.snapshot?.server.state ?? "stopped");
+
+  // Settings that change the whole window: IP masking and the saved theme
+  // (settings.json is the record; it survives updates).
+  const hideIps = $derived(app.snapshot?.settings.hide_ips ?? false);
+  $effect(() => setIpMasking(hideIps));
+  const savedTheme = $derived(app.snapshot ? (app.snapshot.settings.theme ?? null) : undefined);
+  $effect(() => { if (savedTheme !== undefined) adoptTheme(savedTheme); });
+
+  async function flipTheme() {
+    toggleTheme();
+    try {
+      const s = await api.setTheme(theme.current);
+      if (app.snapshot) app.snapshot.settings = s;
+    } catch {
+      // Not saved: it still applies to this window.
+    }
+  }
 </script>
 
 <div class="shell">
@@ -83,7 +103,7 @@
       </button>
     {/each}
     <div class="spacer"></div>
-    <button class="nav-item theme" onclick={toggleTheme} title="Switch between light and dark">
+    <button class="nav-item theme" onclick={flipTheme} title="Switch between light and dark">
       <Icon name={theme.current === "dark" ? "sun" : "moon"} size={18} />
       <span>{theme.current === "dark" ? "Light mode" : "Dark mode"}</span>
     </button>
@@ -109,6 +129,8 @@
       <Devices />
     {:else if nav.page === "trace"}
       <Trace />
+    {:else if nav.page === "settings"}
+      <Settings />
     {:else}
       <Logs />
     {/if}

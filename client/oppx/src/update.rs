@@ -16,7 +16,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::{agent, engine, ui};
+use crate::{agent, browser, engine, ui};
 
 /// GitHub repository that publishes releases.
 pub const REPO: &str = "chophilip21/openPhalanx";
@@ -152,6 +152,10 @@ pub async fn run() -> Result<()> {
             ui::spinner("").done(format!("Coding engine is current (Aider {v})"))
         }
         _ => engine::install().await?,
+    }
+    // The browser, only when it was installed before (otherwise on first use).
+    if browser::installed_version().is_some_and(|v| v != browser::MCP_VERSION) {
+        browser::install()?;
     }
     // The version that runs next, read from the binary itself: the header
     // above shows the one that started this update.

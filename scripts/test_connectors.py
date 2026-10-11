@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "client/oppx/frontend"))
 
 from oppx_chat import agent as A  # noqa: E402
+from oppx_chat import browser  # noqa: E402
 from oppx_chat import mcp  # noqa: E402
 
 # An MCP server over stdio: two pages of tools, a note board in a file.
@@ -236,9 +237,11 @@ class InTheAgent(Sandbox):
         self.assertEqual(schema["required"], ["title", "body"])
         self.assertNotIn("$schema", schema)
         self.assertIn("Now write the arguments for notes.add_note", self.bodies[1]["messages"][-1]["content"])
-        # Kept in the conversation: the action with its arguments, and the result marked untrusted.
+        # Kept in the conversation: the arguments with the result (not inside the action, which the
+        # next argument call copied), and the result marked untrusted.
         said = [m["content"] for m in ag.messages]
-        self.assertTrue(any('"arguments": {"title": "Deploy", "body": "Friday"}' in s for s in said))
+        self.assertTrue(any('Called notes.add_note with {"title": "Deploy", "body": "Friday"}' in s for s in said))
+        self.assertFalse(any(s.startswith("{") and '"arguments"' in s for s in said))
         self.assertTrue(any(A.CONNECTOR_HEAD + "Saved Deploy" in s for s in said))
         self.assertFalse(any("Now write the arguments" in s for s in said), "the instruction isn't kept")
         self.assertEqual(self.steps[0], ('notes.add_note("title": "Deploy", "body": "Friday")', "Saved Deploy"))
@@ -263,6 +266,28 @@ class InTheAgent(Sandbox):
         ag.turn("Save notes A and B")
         self.assertEqual((self.dir / "notes.txt").read_text(), "A\nB\n")
         self.assertEqual(sum(A.CONNECTOR_SAME in m["content"] for m in ag.messages), 1)
+
+    def test_arguments_written_inside_an_action_are_unwrapped(self):
+        pick = {"enough": False, "missing": "save it", "tool": "notes.add_note"}
+        wrapped = {"enough": False, "missing": "save it", "tool": "notes.add_note", "arguments": {"title": "W", "body": "x"}}
+        ag = self.agent([pick, {"why": "done", "tool": "answer"}], [wrapped])
+        ag.turn("Save a note W")
+        self.assertEqual((self.dir / "notes.txt").read_text(), "W\n")
+        self.assertEqual(self.asked[0][1], {"title": "W", "body": "x"})
+        self.assertIn("I'll call notes.add_note now.", json.dumps(self.bodies[1]["messages"][-2]),
+                      "the action reads as a sentence during the argument call")
+        self.assertEqual(A.clean_arguments({"tool": "x", "q": 1}, {"properties": {"q": {}}}), {"q": 1})
+        self.assertEqual(A.clean_arguments({"tool": "x", "q": 1}, {"properties": {"tool": {}, "q": {}}}), {"tool": "x", "q": 1},
+                         "a tool that really has a `tool` field keeps it")
+
+    def test_a_failed_call_is_not_tried_again_unchanged(self):
+        pick = {"why": "break", "tool": "notes.fail"}
+        ag = self.agent([pick, pick, pick, {"why": "done", "tool": "answer"}], [])
+        ag.turn("Run the failing tool")
+        results = [m["content"] for m in ag.messages if m.get("_result")]
+        self.assertEqual(sum("Error: notes.fail failed" in r for r in results), 1, "it ran once")
+        self.assertTrue(any("it failed then" in r for r in results))
+        self.assertEqual(len(self.asked), 1, "the user was asked once")
 
     def test_missing_and_unreadable_arguments_are_errors_for_the_model(self):
         pick = {"why": "save", "tool": "notes.add_note"}
@@ -290,6 +315,144 @@ class InTheAgent(Sandbox):
         self.assertIn("Connector tools that ran in this request: notes.add_note", facts[0])
         self.assertNotIn("you made none", facts[0], "not told that nothing was done")
         self.assertFalse(any("haven't changed anything yet" in m["content"] for m in ag.messages))
+
+
+class Browser(Sandbox):
+    """The headless browser: offered as one action, asked for once a session,
+    then its tools are connector tools (a stand-in server plays Playwright)."""
+
+    def agent(self, actions: list, answer: bool | str = True, state: str = "offer"):
+        self.write({})
+        hub = self.hub()
+        self.asked, self.bodies = [], []
+
+        def start():
+            self.asked.append("browser")
+            if answer is True:
+                c = hub.start(mcp.ServerDef("playwright", "user", self.notes()), hidden={"fail"},
+                              postprocess=lambda text: text.replace("Saved", "Opened"), stateful=True)
+                return c.state == "connected"
+            return answer
+
+        hooks = A.Hooks(start_browser=start, confirm_tool=lambda name, args, ro: True)
+        ag = A.Agent(ws=A.Workspace(str(self.repo)), hooks=hooks, connectors=hub, browser=state)
+
+        def post(body):
+            self.bodies.append(body)
+            kind = body["response_format"]["json_schema"]["name"]
+            if kind == "arguments":
+                return {"choices": [{"message": {"content": json.dumps({"title": "page", "body": "x"})}}]}
+            text = actions.pop(0) if actions else {"enough": True, "tool": "answer"}
+            return {"choices": [{"message": {"content": json.dumps(text)}}]}
+
+        ag._post = post
+        ag._text = lambda *a, **k: "Done."
+        return ag
+
+    @staticmethod
+    def offered(body) -> str:
+        return json.dumps(body["response_format"])
+
+    def test_started_on_request_then_its_tools_are_offered(self):
+        ag = self.agent([{"enough": False, "missing": "see the page", "tool": "browser"},
+                         {"enough": False, "missing": "open it", "tool": "playwright.add_note"},
+                         {"enough": True, "tool": "answer"}])
+        ag.turn("Open http://localhost:3000 and tell me what the console says")
+        self.assertEqual(self.asked, ["browser"], "asked once")
+        self.assertEqual(ag.browser, "running")
+        first, after = self.bodies[0], self.bodies[1]
+        self.assertIn('"browser"', self.offered(first))
+        self.assertIn('{"tool": "browser"}', first["messages"][0]["content"])
+        self.assertNotIn("playwright.", self.offered(first))
+        self.assertIn("playwright.add_note", self.offered(after))
+        self.assertNotIn('"enum": ["browser"]', self.offered(after), "not offered again once it runs")
+        self.assertNotIn("playwright.fail", self.offered(after), "hidden tools are never offered")
+        self.assertIn("playwright.add_note", after["messages"][0]["content"], "its tools join the system prompt")
+        results = [m["content"] for m in ag.messages if m.get("_result")]
+        self.assertTrue(any(r.startswith("Result of step 1 (browser):\nThe browser is running") for r in results))
+        self.assertTrue(any(A.CONNECTOR_HEAD + "Opened page" in r for r in results), "results go through postprocess")
+        # A URL in the message: the model is pointed at the browser.
+        self.assertTrue(any("mentions http://localhost:3000" in r for r in results))
+        ag.turn("And now?")
+        self.assertEqual(self.asked, ["browser"], "not asked again in the session")
+
+    def test_the_same_click_twice_runs_twice(self):
+        # Found live: the second click on a button was refused as a repeat.
+        start = {"enough": False, "missing": "the page", "tool": "browser"}
+        click = {"enough": False, "missing": "click", "tool": "playwright.add_note"}
+        look = {"enough": False, "missing": "look", "tool": "playwright.list_notes"}
+        ag = self.agent([start, click, click, look, look, click, look, {"enough": True, "tool": "answer"}])
+        ag.turn("Click Add twice on http://localhost:3000")
+        self.assertEqual((self.dir / "notes.txt").read_text(), "page\n" * 3, "every click ran")
+        results = [m["content"] for m in ag.messages if m.get("_result")]
+        self.assertEqual(sum(A.CONNECTOR_SAME in r for r in results), 1, "only looking again at an unchanged page")
+        ag2 = self.agent([start] + [click] * 7 + [{"enough": True, "tool": "answer"}])
+        ag2.turn("Click it a lot")
+        self.assertEqual((self.dir / "notes.txt").read_text().count("page"), 3 + A.STATEFUL_REPEATS, "a loop is still stopped")
+
+    def test_a_no_is_final_for_the_session(self):
+        ag = self.agent([{"enough": False, "missing": "see the page", "tool": "browser"},
+                         {"enough": True, "tool": "answer"}], answer="the user said no")
+        ag.turn("Does the login button on the dev server work?")
+        self.assertEqual(ag.browser, "declined")
+        results = [m["content"] for m in ag.messages if m.get("_result")]
+        self.assertTrue(any("isn't available in this session (the user said no). Don't ask for it again" in r for r in results))
+        self.assertNotIn('"enum": ["browser"]', self.offered(self.bodies[1]))
+        ag.turn("Try again")
+        self.assertEqual(self.asked, ["browser"])
+        self.assertNotIn('"enum": ["browser"]', self.offered(self.bodies[-1]))
+
+    def test_not_offered_when_the_session_cannot_have_one(self):
+        ag = self.agent([{"enough": True, "tool": "answer"}], state="none")
+        ag.turn("Open http://localhost:3000")
+        self.assertNotIn('"enum": ["browser"]', self.offered(self.bodies[0]))
+        self.assertNotIn('{"tool": "browser"}', self.bodies[0]["messages"][0]["content"])
+        self.assertFalse(any("mentions http" in m["content"] for m in ag.messages), "no hint either")
+
+    def test_a_reconnect_keeps_the_browser(self):
+        self.write({"notes": self.notes()})
+        hub = self.hub()
+        hub.start(mcp.ServerDef("playwright", "user", self.notes()), hidden={"fail"})
+        hub.connect()
+        self.assertEqual(hub.connectors["playwright"].state, "connected")
+        self.assertIn("playwright.add_note", hub.tools())
+        self.assertNotIn("playwright.fail", hub.tools())
+        self.assertIn("notes.fail", hub.tools(), "hiding is per connector")
+
+    def test_snapshots_and_console_files_are_put_inline(self):
+        snap, log = self.dir / "page.yml", self.dir / "console.log"
+        snap.write_text("- heading \"Hi\" [ref=e1]\n- button \"Go\" [ref=e2]\n")
+        log.write_text("[LOG] old\n[ERROR] boom @ app.js:3\n")
+        text = (f"### Page\n- Page URL: http://localhost:3000/\n### Snapshot\n- [Snapshot]({snap})\n"
+                f"### Events\n- New console entries: {log}#L2")
+        out = browser.inline_files(text)
+        self.assertIn('```yaml\n- heading "Hi" [ref=e1]\n- button "Go" [ref=e2]\n```', out)
+        self.assertIn("[ERROR] boom @ app.js:3", out)
+        self.assertNotIn("[LOG] old", out, "only the new entries")
+        ranged = browser.inline_files(f"- New console entries: {log}#L1-L1")
+        self.assertIn("[LOG] old", ranged)
+        self.assertNotIn("boom", ranged)
+        self.assertNotIn("-L1", ranged, "a range is read, not left behind")
+        self.assertEqual(browser.inline_files("- [Snapshot](/nope.yml)"), "- [Snapshot](/nope.yml)", "a missing file stays a link")
+
+    def test_the_hint(self):
+        self.assertIn("localhost:5173", browser.hint("the page at localhost:5173 is blank"))
+        self.assertIn("https://example.com/a", browser.hint("what does https://example.com/a show?"))
+        self.assertTrue(browser.hint("check the console errors on the dev server"))
+        self.assertTrue(browser.hint("is anything failing? it's running on port 5173"))
+        self.assertTrue(browser.hint("npm run dev is up. Does the home page actually show the list?"))
+        self.assertEqual(browser.hint("Add a footer to the home page component"), "")
+        self.assertEqual(browser.hint("rename parse_args to parse_cli"), "")
+        self.assertEqual(browser.hint("why does the gateway return 413?"), "")
+
+    def test_the_command_line(self):
+        d = browser.definition("abc123")
+        args = d.spec["args"]
+        for flag in ("--headless", "--isolated", "--image-responses", "--output-dir"):
+            self.assertIn(flag, args)
+        self.assertTrue(args[args.index("--output-dir") + 1].endswith("oppx/browser/abc123"), "outside the repository")
+        self.assertIn("browser_run_code_unsafe", browser.HIDDEN)
+        self.assertIn("playwright.browser_evaluate", browser.EVERY_TIME)
 
 
 if __name__ == "__main__":

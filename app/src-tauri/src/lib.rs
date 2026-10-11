@@ -157,7 +157,7 @@ struct ClusterSnapshot {
 
 async fn admin_client() -> Option<AdminClient> {
     let c = docker::inspect().await.ok().flatten()?;
-    (c.state.running && c.managed).then(|| c.admin_token.map(AdminClient::new)).flatten()
+    (c.state.running && c.managed).then(|| c.admin_token.map(|t| AdminClient::new(t, c.admin_port))).flatten()
 }
 
 async fn build_snapshot(app: &AppHandle) -> Snapshot {
@@ -171,8 +171,7 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
     let client = container
         .as_ref()
         .filter(|c| c.state.running && c.managed)
-        .and_then(|c| c.admin_token.clone())
-        .map(AdminClient::new);
+        .and_then(|c| c.admin_token.clone().map(|t| AdminClient::new(t, c.admin_port)));
     let mut admin_status = match &client {
         Some(c) => c.status().await.ok(),
         None => None,
@@ -1188,9 +1187,91 @@ async fn set_long_context(state: State<'_, AppState>, on: bool) -> CmdResult<Set
     })
 }
 
+/// A backend is starting, running or stopping: settings it was started with
+/// can't change until it stops.
+async fn backend_busy(state: &AppState) -> bool {
+    let starting = matches!(state.inner.lock().unwrap().phase, Phase::Starting { .. } | Phase::Stopping);
+    starting || docker::inspect().await.ok().flatten().is_some_and(|c| c.state.running)
+}
+
 #[tauri::command]
-fn set_gpu(state: State<'_, AppState>, index: u32) -> CmdResult<Settings> {
+async fn set_gpu(state: State<'_, AppState>, index: u32) -> CmdResult<Settings> {
+    if backend_busy(&state).await {
+        return Err("Stop the server to change the GPU; it applies at the next start.".into());
+    }
     state.update_settings(|s| s.gpu_index = index)
+}
+
+/// Moves one of the server's own ports: "agent_port" (the client API; clients
+/// then pair with the new address), "admin_port" (this app ↔ the backend) or
+/// "control_port" (oppxs). Applies at the next start. The cluster's ports
+/// can't move: every server must use the same ones.
+#[tauri::command]
+async fn set_port(state: State<'_, AppState>, which: String, port: u16) -> CmdResult<Settings> {
+    use openphalanx_core::ports::{port_problem, Movable};
+    let kind = match which.as_str() {
+        "agent_port" => Movable::Agent,
+        "admin_port" => Movable::Admin,
+        "control_port" => Movable::Control,
+        _ => return Err("That port is fixed: the cluster's ports must be the same on every server.".into()),
+    };
+    let settings = state.settings();
+    if kind != Movable::Control && backend_busy(&state).await {
+        return Err("Stop the server to change this port; it applies at the next start.".into());
+    }
+    if kind == Movable::Control && !net::port_is_free(settings.control_port) {
+        return Err(format!("oppxs is running on port {}; stop it first (oppxs and the app can't run at the same time anyway).", settings.control_port));
+    }
+    if let Some(problem) = port_problem(kind, port, &settings) {
+        return Err(problem);
+    }
+    state.update_settings(|s| match kind {
+        Movable::Agent => s.agent_port = port,
+        Movable::Admin => s.admin_port = port,
+        Movable::Control => s.control_port = port,
+    })
+}
+
+/// Privacy: hide the first digits of IP addresses wherever the app shows one.
+#[tauri::command]
+fn set_hide_ips(state: State<'_, AppState>, on: bool) -> CmdResult<Settings> {
+    state.update_settings(|s| s.hide_ips = on)
+}
+
+/// The app's theme ("light", "dark", or None to follow the system), kept in
+/// settings.json so it survives updates like every other setting.
+#[tauri::command]
+fn set_theme(state: State<'_, AppState>, theme: Option<String>) -> CmdResult<Settings> {
+    let theme = theme.filter(|t| t == "light" || t == "dark");
+    state.update_settings(|s| s.theme = theme)
+}
+
+/// The server's ports, what each is for, and who listens on it now.
+#[tauri::command]
+async fn port_overview(state: State<'_, AppState>) -> CmdResult<Vec<openphalanx_core::ports::PortInfo>> {
+    openphalanx_core::ports::overview(&state.settings()).await.map_err(err)
+}
+
+/// Where the server keeps its files, for the Settings page.
+#[derive(Serialize)]
+struct StoragePath {
+    label: &'static str,
+    detail: &'static str,
+    path: String,
+    exists: bool,
+}
+
+#[tauri::command]
+fn storage_paths() -> Vec<StoragePath> {
+    use openphalanx_core::paths;
+    let row = |label, detail, p: std::path::PathBuf| StoragePath { label, detail, exists: p.exists(), path: p.display().to_string() };
+    vec![
+        row("Settings", "selected model, context, port, GPU, these settings", paths::config_dir().join("settings.json")),
+        row("Downloaded models", "models the app downloaded (verified, pinned to a commit)", paths::models_dir()),
+        row("Hugging Face cache", "reused read-only when a model is already there", paths::hf_hub_dir()),
+        row("Backend state", "TLS certificate and paired devices; deleting it unpairs every client", paths::backend_state_dir()),
+        row("Cluster", "this server's cluster identity, certificate and members", paths::cluster_dir()),
+    ]
 }
 
 /// Takes effect on the next start (SearXNG starts alongside the backend).
@@ -1615,6 +1696,11 @@ pub fn run() {
             set_context_len,
             set_long_context,
             set_gpu,
+            set_port,
+            set_hide_ips,
+            set_theme,
+            port_overview,
+            storage_paths,
             set_web_search,
             download_model,
             cancel_download,

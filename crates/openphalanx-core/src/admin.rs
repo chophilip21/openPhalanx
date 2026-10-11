@@ -5,7 +5,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::docker::ADMIN_PORT;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Pairing {
@@ -100,13 +99,15 @@ pub struct AdminClient {
 }
 
 impl AdminClient {
-    pub fn new(token: String) -> Self {
+    /// The admin API of the backend listening on `port` (a container's
+    /// `admin_port`).
+    pub fn new(token: String, port: u16) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("reqwest client"),
-            base: format!("http://127.0.0.1:{ADMIN_PORT}"),
+            base: format!("http://127.0.0.1:{port}"),
             token,
         }
     }

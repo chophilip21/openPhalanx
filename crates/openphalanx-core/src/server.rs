@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use serde::Serialize;
 
-use crate::docker::{self, RunSpec, ADMIN_PORT};
+use crate::docker::{self, RunSpec};
 use crate::gpu::{self, GpuInfo};
 use crate::model;
 use crate::settings::Settings;
@@ -285,7 +285,7 @@ pub async fn preflight(settings: &Settings) -> Preflight {
     }
 
     if docker_ok && !running {
-        for (port, what) in [(settings.agent_port, "agent"), (ADMIN_PORT, "admin")] {
+        for (port, what) in [(settings.agent_port, "agent"), (settings.admin_port, "admin")] {
             if !net::port_is_free(port) {
                 checks.push(Check::new(
                     if what == "agent" { "agent_port" } else { "admin_port" },
@@ -402,6 +402,7 @@ pub async fn start_with(
         image: settings.image(),
         gpu_index: settings.gpu_index,
         agent_port: settings.agent_port,
+        admin_port: settings.admin_port,
         model: model::mount_for(&dir)?,
         model_key: model.key.clone(),
         mem_fraction_static: fraction,

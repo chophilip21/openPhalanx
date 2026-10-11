@@ -270,11 +270,17 @@
 </section>
 
 <style>
-  .dash { width: 100%; display: flex; flex-direction: column; gap: 14px; }
+  .dash { width: 100%; display: flex; flex-direction: column; gap: 14px; container-type: inline-size; }
   .dash-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; border-top: 1px solid var(--border); padding-top: 22px; }
   .dash-head h2 { margin: 2px 0 0; font-size: 18px; font-weight: 650; }
   .small { font-size: 12px; }
-  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  /* Six tiles split evenly: one row of 6, else 3 + 3, else 2 + 2 + 2 (auto-fit
+     left a lone tile on the second row at in-between widths). By the
+     dashboard's own width, so the sidebar collapsing doesn't matter. */
+  .tiles { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
+  @container (max-width: 860px) { .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @container (max-width: 420px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .tile .k { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 2px; box-shadow: var(--shadow); }
   .tile .k { font-size: 11.5px; color: var(--muted); }
   .tile .v { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }

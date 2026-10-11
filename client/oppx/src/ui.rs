@@ -132,6 +132,11 @@ impl Spinner {
         eprintln!("  {} {}", style("✓").green().bold().for_stderr(), message.as_ref());
     }
 
+    /// Changes what the spinner says.
+    pub fn set_message(&self, message: impl Into<String>) {
+        self.0.set_message(message.into());
+    }
+
     /// Removes the spinner without a message (e.g. before an error).
     pub fn clear(self) {
         self.0.finish_and_clear();

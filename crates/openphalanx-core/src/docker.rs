@@ -38,6 +38,7 @@ pub fn default_image() -> String {
     let hash = hex::encode(h.finalize());
     format!("{IMAGE_NAME}:{}-{}", env!("CARGO_PKG_VERSION"), &hash[..12])
 }
+/// The admin API's default port (`settings.admin_port` moves it).
 pub const ADMIN_PORT: u16 = 9091;
 /// A backend the app starts stops itself when no app has called its admin
 /// API for this long (the app polls every 2 s): an app that crashed or was
@@ -215,6 +216,9 @@ pub struct ContainerInfo {
     /// after a restart without storing the secret anywhere else.
     #[serde(skip)]
     pub admin_token: Option<String>,
+    /// The admin API's port it was started with (`ADMIN_PORT`; 9091 for one
+    /// started before it could move).
+    pub admin_port: u16,
 }
 
 pub async fn inspect() -> Result<Option<ContainerInfo>> {
@@ -241,6 +245,7 @@ pub async fn inspect() -> Result<Option<ContainerInfo>> {
         model_key: labels[MODEL_LABEL].as_str().map(str::to_string),
         context_len,
         admin_token,
+        admin_port: env_var("ADMIN_PORT").and_then(|v| v.parse().ok()).unwrap_or(ADMIN_PORT),
     }))
 }
 
@@ -249,6 +254,7 @@ pub struct RunSpec {
     pub image: String,
     pub gpu_index: u32,
     pub agent_port: u16,
+    pub admin_port: u16,
     pub model: ModelMount,
     pub model_key: String,
     pub mem_fraction_static: f64,
@@ -337,7 +343,7 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
             format!("{0}:{0}", spec.agent_port),
             // Admin API is reachable from this machine only.
             "-p".into(),
-            format!("127.0.0.1:{ADMIN_PORT}:{ADMIN_PORT}"),
+            format!("127.0.0.1:{0}:{0}", spec.admin_port),
         ]);
     }
     a.extend([
@@ -357,7 +363,7 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
         ("MEM_FRACTION_STATIC", format!("{}", spec.mem_fraction_static)),
         ("CONTEXT_LENGTH", spec.context_len.to_string()),
         ("AGENT_PORT", spec.agent_port.to_string()),
-        ("ADMIN_PORT", ADMIN_PORT.to_string()),
+        ("ADMIN_PORT", spec.admin_port.to_string()),
         ("ADMIN_TOKEN", spec.admin_token.clone()),
         ("APP_WATCHDOG_S", APP_WATCHDOG_SECS.to_string()),
         ("DEVICE_TTL_DAYS", spec.pairing_ttl_days.map_or_else(|| "never".to_string(), |d| d.to_string())),
@@ -664,6 +670,7 @@ mod tests {
             image: default_image(),
             gpu_index: 0,
             agent_port: 9090,
+            admin_port: ADMIN_PORT,
             model: ModelMount { dirs: vec!["/m".into(), "/blobs".into()], model_path: "/m".into() },
             model_key: "catalog:Qwen/X".into(),
             mem_fraction_static: 0.812,

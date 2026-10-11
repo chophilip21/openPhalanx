@@ -259,7 +259,7 @@ pub async fn collect_serving() -> Option<Serving> {
     if !(c.state.running && c.managed) {
         return None;
     }
-    let status = AdminClient::new(c.admin_token?).status().await.ok()?;
+    let status = AdminClient::new(c.admin_token?, c.admin_port).status().await.ok()?;
     Some(Serving { model: status.model, sglang: status.sglang, gateway: status.gateway, inference: status.inference })
 }
 

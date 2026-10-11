@@ -19,13 +19,15 @@ from .config import (ACCENT, CONTEXT, ENGINE, EXTRA_MEMORY, GREEN, MEMORY_FILE, 
 from .term import EscWatcher, SESSION, SPIN, Thinking, UI, out, step
 from .render import BulletStream, hide_reasoning, show_diff, show_edits, snapshot
 from .mcp import Hub
+from . import browser
 from .agent import Agent, Hooks, Workspace
 from .permissions import Permissions
 from .routing import wants_edit
 from .context import CONTEXT_MGR, PRI_EDITED, _check_tokens, _fitted_format_messages
 from .oppx_io import OppxIO
 from .cache import _ask_file_mentions, _ask_init, _coder_init, _dump_requests, _stable_ranked_map
-from .commands import ask_about_connector, connector_names, load_memory, show_connector_problems, translate
+from .commands import (ask_about_connector, connector_names, load_memory, show_connector_problems, start_browser,
+                       translate)
 
 
 def _interrupted(self):
@@ -206,31 +208,27 @@ def make_agent(coder) -> Agent:
         return result
 
     def on_confirm_tool(name: str, arguments: str, read_only: bool) -> bool | str:
-        """A connector tool reaches outside the repository, so each call is
-        the user's to allow: once, or always (saved for this project)."""
-        if perms.tool_denied(name):
-            step(f"Refused by your deny rule: {escape(name)}", MUTED)
-            return "The user's deny rule forbids this tool."
-        if perms.tool_allowed(name):
+        """A connector tool reaches outside the repository. Tools its connector
+        marks as only reading run without a question (like commands that only
+        read); the rest are asked once, with "always" for the tool or for the
+        whole connector, saved for this project."""
+        verdict, why = perms.judge_tool(name, read_only)
+        if verdict == "run":
             return True
+        if verdict == "refuse":
+            step(f"Not run: a deny rule forbids {escape(name)}", MUTED)
+            return why
+        connector = name.split(".", 1)[0]
         SPIN.stop()
-        note = f" [{MUTED}](its connector says it only reads)[/]" if read_only else ""
-        out(f"\n[{YELLOW}]⏺[/] [bold]Call this connector tool?[/]{note}")
+        out(f"\n[{YELLOW}]⏺[/] [bold]Call this connector tool?[/]")
         for line in f"{name} {arguments}".splitlines()[:30]:
             out(f"  [{MUTED}]│[/] {escape(line)}")
-        said = coder.io._ask_line(
-            f"  Allow? (y = yes, a = always allow {name} in this project, N = no, or type what to do instead) ").strip()
-        answer = said.lower()
+        said = coder.io._ask_line(f"  Allow? (y = yes, a = always allow {name}, c = always allow every {connector} tool, "
+                                  "N = no, or type what to do instead) ")
         SPIN.start()
-        if answer in ("a", "always"):
-            perms.allow_tool(name)
-            step("Allowed, and from now on without asking (/permissions to change)", GREEN)
-            return True
-        if answer in ("y", "yes"):
-            step("Allowed", GREEN)
-            return True
-        step("Declined" + ("" if answer in ("", "n", "no") else ", with your note"), MUTED)
-        return False if answer in ("", "n", "no") else f"The user said: {said}"
+        result, shown = perms.answered_tool(name, said)
+        step(shown, GREEN if result is True else MUTED)
+        return result
 
     def on_notice(text: str):
         SPIN.stop()
@@ -238,11 +236,13 @@ def make_agent(coder) -> Agent:
         SPIN.start()
 
     hooks = Hooks(step=on_step, stream=on_stream, edited=on_edited, confirm_run=on_confirm, notice=on_notice,
-                  confirm_tool=on_confirm_tool,
+                  confirm_tool=on_confirm_tool, start_browser=lambda: start_browser(SESSION.coder or coder, ask=True),
                   waiting=lambda label: SPIN.start(label), interrupted=lambda: UI.interrupted)
     agent = Agent(ws=Workspace(coder.root, getattr(coder, "repo_map", None), coder.io.encoding),
                   hooks=hooks, context=CONTEXT, reasoning=REASONING, trace=TRACE, web=WEB, memory=_memory(coder),
-                  connectors=UI.connectors)
+                  connectors=UI.connectors,
+                  # Offered whenever the user can be asked; print mode only has it when it starts by itself.
+                  browser="offer" if not PRINT_MODE else "none")
     # -c / -r: continue from the restored conversation (questions and answers).
     for m in coder.done_messages or []:
         if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str):
@@ -409,6 +409,12 @@ def run(argv) -> int:
     if ENGINE == "agent":
         UI.connectors = connect_connectors(coder)
         UI.agent = make_agent(coder)
+        if browser.AUTO:
+            # `oppx browser on`: started with the session, before the first
+            # request, so its tools are in the system prompt from the start.
+            UI.agent.browser = "offer"
+            start_browser(coder, ask=False)
+            SPIN.stop()
     initial = os.environ.get("OPPX_INITIAL", "").strip()
 
     if PRINT_MODE:

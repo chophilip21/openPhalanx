@@ -13,7 +13,8 @@ Environment from oppx: OPENAI_API_BASE / OPENAI_API_KEY (the loopback proxy),
 OPPX_SERVER, OPPX_CONTEXT, OPPX_MODEL_ID (what the server runs), OPPX_WEB
 ("1"/"0"), OPPX_VERSION, OPPX_BIN, OPPX_INITIAL (a first prompt) and
 OPPX_PRINT ("1": answer once and exit) and OPPX_ENGINE ("agent", the default, or
-"aider" for Aider's own loop), and OPPX_MCP_CONFIG (the user's connectors file).
+"aider" for Aider's own loop), OPPX_MCP_CONFIG (the user's connectors file), and
+OPPX_BROWSER_* (the headless browser: where it is, and whether it starts by itself).
 
 Modules, lowest layer first (each imports only from the ones above it):
 
@@ -23,6 +24,8 @@ Modules, lowest layer first (each imports only from the ones above it):
     context    ContextManager: fit every request into the context window
     mcp        connectors: MCP servers the user added, as extra tools (no UI
                code; also run alone by `oppx mcp add` to check a connector)
+    browser    the headless browser (Playwright's MCP server) as a connector oppx
+               starts itself, once the user agrees (no UI code)
     permissions  what may run without asking: commands that only read, and
                the user's saved "always" answers (no UI code)
     agent      the agent engine: the model reads the repository on demand with

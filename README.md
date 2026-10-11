@@ -79,12 +79,34 @@ oppx -c                           # continue the last conversation (-r to pick a
 oppx -p "explain src/main.rs"     # answer once and exit
 oppx --update                     # update oppx and its engine
 oppx mcp add <name> -- <command>  # add an MCP server's tools (/mcp in the chat)
+oppx browser on | off             # headless browser for web UIs: start with every chat, or ask once (default)
 ```
+
 Edits are never committed: review them with `git diff` and commit yourself. `oppx unpair` removes a laptop (or revoke it on the app's **Devices** page).
 
 ## Keys in the chat
 
 **Shift+Tab** plan mode (no edits) · **Esc** interrupt · **Ctrl-C** twice exits · **@file** add a file · **!cmd** run a command · **# note** save to project memory · **/help** all commands
+
+## Connect tools with MCP
+
+Connectors are [MCP](https://modelcontextprotocol.io) servers whose tools the agent can call, such as Linear, GitHub or a database. They run on your laptop with your own credentials; the server never sees them, and you approve each call (`y`, `N`, or `a` for always this session).
+
+```bash
+oppx mcp add <name> -- <command> [args]                  # a local server (stdio)
+oppx mcp add <name> --url <https://…> -H 'Name: value'   # a remote server (streamable HTTP)
+oppx mcp list                                            # what's added; /mcp in the chat
+oppx mcp remove <name>
+```
+
+Example, [Linear](https://linear.app), with a personal API key (Settings → Account → Security & access):
+```bash
+export LINEAR_API_KEY=lin_api_...
+oppx mcp add linear --url https://mcp.linear.app/mcp -H 'Authorization: Bearer ${LINEAR_API_KEY}'
+```
+Keep the single quotes: the key is read from your environment at start and never written to the config. For a browser login instead (needs Node): `oppx mcp add linear -- npx -y mcp-remote https://mcp.linear.app/mcp`. Then ask in the chat, e.g. "list my open Linear issues".
+
+Every connector's tool list is sent with each request, so add only what you use; `oppx mcp add` prints the cost and warns when the server's model has a small context window. `--project` saves a connector in the repo's `.mcp.json` (it asks before running one from a cloned repo).
 
 ## From source
 
@@ -97,22 +119,9 @@ cargo install --path client/oppx && cargo install --path crates/openphalanx-serv
 
 ## Contributing
 
-Contributions are welcome! Please follow these guidelines when submitting changes to this repository.
+Contributions are welcome. The pull request workflow, PR title prefixes and review rules are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-### Pull Request Workflow
-
-1. **Create a Branch or Fork**: Direct pushes to `main` are disabled. Create a separate feature/bugfix branch on your fork or repository.
-2. **Format Your PR Title**: All PR titles **must** begin with a version tag so our release automation can track changes:
-   - `[bug]` – for bug fixes (patch release)
-   - `[feature]` – for new features (minor release)
-   - `[major]` – for breaking changes (major release)
-   - `[docs]` or `[ci]` – for documentation or internal tooling (no release)
-3. **Review Process**: Every PR requires an explicit review and sign-off from `@chophilip21` before merging.
-4. **Automated Checks**: Ensure all CI status checks (linting, tests, and PR title validation) pass cleanly on your pull request.
-
-### License
-
-By contributing to this repository, you agree that your contributions will be licensed under the project's **GNU General Public License v3.0 (GPLv3)**.
+By contributing, you agree that your contributions will be licensed under the project's **GNU General Public License v3.0 (GPLv3)**.
 
 ## Learn more
 

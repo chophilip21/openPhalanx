@@ -73,13 +73,36 @@ export type Settings = {
   context_len: number;
   gpu_index: number;
   agent_port: number;
+  admin_port: number;
+  control_port: number;
   image: string | null;
   web_search: boolean;
   /** Days a client pairing lasts; null: never expires. */
   pairing_ttl_days: number | null;
   /** Models with a long-context mode (YaRN) may go past their native window. */
   long_context: boolean;
+  /** Privacy: IP addresses are shown with their first digits hidden. */
+  hide_ips: boolean;
+  /** "light" or "dark"; null follows the system. */
+  theme: "light" | "dark" | null;
 };
+
+/** A port the server uses and who listens on it now (Settings → Ports). */
+export type PortInfo = {
+  port: number;
+  last: number | null;
+  proto: string;
+  purpose: string;
+  reach: string;
+  when: string;
+  /** The setting that moves it; null: fixed (see `fixed_because`). */
+  setting: "agent_port" | "admin_port" | "control_port" | null;
+  fixed_because: string | null;
+  holders: string[];
+};
+
+/** A folder or file the server keeps (Settings → Storage). */
+export type StoragePath = { label: string; detail: string; path: string; exists: boolean };
 
 /** A server's hardware, as it reports it. */
 export type NodeInventory = {
@@ -431,6 +454,12 @@ export const api = {
   setLongContext: (on: boolean) => invoke<Settings>("set_long_context", { on }),
   setGpu: (index: number) => invoke<Settings>("set_gpu", { index }),
   setWebSearch: (enabled: boolean) => invoke<Settings>("set_web_search", { enabled }),
+  /** Moves one of the server's own ports (applies at the next start). */
+  setPort: (which: "agent_port" | "admin_port" | "control_port", port: number) => invoke<Settings>("set_port", { which, port }),
+  setHideIps: (on: boolean) => invoke<Settings>("set_hide_ips", { on }),
+  setTheme: (theme: "light" | "dark" | null) => invoke<Settings>("set_theme", { theme }),
+  portOverview: () => invoke<PortInfo[]>("port_overview"),
+  storagePaths: () => invoke<StoragePath[]>("storage_paths"),
   download: (key: string) => invoke<void>("download_model", { key }),
   cancelDownload: (key: string) => invoke<void>("cancel_download", { key }),
   clearDownload: (key: string) => invoke<void>("clear_download", { key }),

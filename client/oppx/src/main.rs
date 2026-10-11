@@ -186,6 +186,21 @@ enum Command {
         #[command(subcommand)]
         action: Option<McpCommand>,
     },
+    /// The chat's headless web browser (Playwright), run on this machine.
+    ///
+    /// The model uses it to open pages (your local dev server included),
+    /// click, type, and read the page and its console errors. By default the
+    /// chat asks once a session before starting it; `on` starts it with every
+    /// session without asking. Needs Node.js 18 or newer.
+    ///
+    ///   oppx browser            show the setting and what is installed
+    ///   oppx browser on | off   start it with every session, or ask first (the default)
+    ///   oppx browser install    install it now (otherwise on first use)
+    #[command(verbatim_doc_comment)]
+    Browser {
+        #[command(subcommand)]
+        action: Option<BrowserCommand>,
+    },
     /// List paired servers (tokens are never shown).
     Servers,
     /// Set the default server.
@@ -193,6 +208,18 @@ enum Command {
         /// Server name, as listed by `oppx servers`.
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum BrowserCommand {
+    /// Start the browser with every chat session, without asking.
+    On,
+    /// Ask once a session before starting it (the default).
+    Off,
+    /// Install or update it now.
+    Install,
+    /// Show the setting and what is installed (the default).
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -355,6 +382,23 @@ async fn run(cli: Cli) -> Result<()> {
             McpCommand::Remove { name, project } => mcp_remove(&path, &name, project)?,
             McpCommand::List => mcp_list(&path)?,
         },
+        Command::Browser { action } => match action.unwrap_or(BrowserCommand::Status) {
+            BrowserCommand::On => {
+                if !oppx::browser::ready() {
+                    oppx::browser::install()?;
+                }
+                cfg.browser_auto = true;
+                cfg.save(&path)?;
+                ui::line(ui::ok("browser", "starts with every chat session (oppx browser off to be asked first)"));
+            }
+            BrowserCommand::Off => {
+                cfg.browser_auto = false;
+                cfg.save(&path)?;
+                ui::line(ui::ok("browser", "the chat asks once a session before starting it"));
+            }
+            BrowserCommand::Install => oppx::browser::install()?,
+            BrowserCommand::Status => browser_status(&cfg),
+        },
         Command::Servers => {
             if cfg.servers.is_empty() {
                 println!("No servers paired yet. Pair with: {}", ui::accent("oppx pair <server> <code>"));
@@ -385,6 +429,22 @@ async fn run(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn browser_status(cfg: &Config) {
+    use oppx::browser;
+    let mode = if cfg.browser_auto { "on: starts with every chat session" } else { "off: the chat asks once a session" };
+    ui::line(ui::ok("setting", mode));
+    match browser::installed_version() {
+        Some(v) if v == browser::MCP_VERSION => ui::line(ui::ok("installed", format!("Playwright MCP {v}"))),
+        Some(v) => ui::line(ui::warn("installed", format!("Playwright MCP {v}; oppx browser install updates it"))),
+        None => ui::line(ui::warn("installed", "not yet (installed on first use, or: oppx browser install)")),
+    }
+    match browser::node() {
+        Ok(p) => ui::line(ui::ok("node", p.display().to_string())),
+        Err(e) => ui::line(ui::bad("node", e.to_string())),
+    }
+    ui::line(ui::ok("browser", browser::describe_browser()));
 }
 
 /// The context window of the default server's model, to judge what a
@@ -999,7 +1059,8 @@ async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args:
             .env("OPPX_VERSION", env!("CARGO_PKG_VERSION"))
             .env("OPPX_BIN", std::env::current_exe().unwrap_or_else(|_| "oppx".into()))
             .env("OPPX_PRINT", if launch.print { "1" } else { "0" })
-            .env("OPPX_INITIAL", launch.initial.clone().unwrap_or_default());
+            .env("OPPX_INITIAL", launch.initial.clone().unwrap_or_default())
+            .envs(oppx::browser::env(cfg.browser_auto));
         c
     };
     let mut child = command
