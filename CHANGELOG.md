@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.6.2 (2026-10-11)
+
+### Fixes
+
+- Working links, oppx --update, and a permissions audit (#10)
+
 ## v0.6.1 (2026-10-10)
 
 ### Fixes
