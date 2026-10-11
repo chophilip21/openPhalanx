@@ -209,6 +209,40 @@ class Rules(unittest.TestCase):
         self.assertEqual((fresh.run, fresh.tools, fresh.deny), ([], [], []))
         self.assertEqual(json.loads(self.file.read_text())["projects"], {})
 
+    def test_connector_tools_ask_less(self):
+        # A tool its connector marks as only reading runs without a question.
+        self.assertEqual(self.p.judge_tool("linear.get_issue", read_only=True), ("run", ""))
+        self.assertEqual(self.p.judge_tool("linear.save_issue", read_only=False), ("ask", ""))
+        # "c": every tool of that connector, now and in later sessions; other connectors still ask.
+        result, shown = self.p.answered_tool("linear.save_issue", "c")
+        self.assertIs(result, True)
+        self.assertIn("every linear tool", shown)
+        again = P.Permissions(str(self.root), self.file)
+        self.assertEqual(again.judge_tool("linear.save_comment", read_only=False), ("run", ""))
+        self.assertEqual(again.judge_tool("github.create_issue", read_only=False), ("ask", ""))
+        # "a": that tool only.
+        self.assertIs(again.answered_tool("github.create_issue", "a")[0], True)
+        self.assertEqual(again.judge_tool("github.create_issue", read_only=False), ("run", ""))
+        self.assertEqual(again.judge_tool("github.delete_repo", read_only=False), ("ask", ""))
+        # A note declines and is passed on; deny wins over read-only and over "every tool".
+        self.assertEqual(again.answered_tool("github.delete_repo", "no, open an issue instead")[0],
+                         "The user declined this call and said: no, open an issue instead")
+        again.add("deny", "linear.*")
+        self.assertEqual(again.judge_tool("linear.get_issue", read_only=True)[0], "refuse")
+        self.assertEqual(again.judge_tool("linear.save_comment", read_only=False)[0], "refuse")
+
+    def test_the_browser_is_allowed_for_the_session_only(self):
+        p = P.Permissions(str(self.root), self.file)
+        self.assertEqual(p.judge_tool("playwright.browser_click", read_only=False), ("ask", ""))
+        p.allow_for_session("playwright.*", unless={"playwright.browser_evaluate"})
+        self.assertEqual(p.judge_tool("playwright.browser_click", read_only=False), ("run", ""))
+        self.assertEqual(p.judge_tool("playwright.browser_evaluate", read_only=False), ("ask", ""), "still asked")
+        self.assertEqual(p.judge_tool("linear.save_issue", read_only=False), ("ask", ""), "other connectors aren't")
+        self.assertFalse(self.file.exists() and "playwright" in self.file.read_text(), "never saved")
+        self.assertEqual(P.Permissions(str(self.root), self.file).judge_tool("playwright.browser_click", False)[0], "ask")
+        p.add("deny", "playwright.browser_navigate")
+        self.assertEqual(p.judge_tool("playwright.browser_navigate", read_only=False)[0], "refuse", "deny wins")
+
     def test_rules_for_every_project_and_a_damaged_file(self):
         self.file.write_text(json.dumps({"global": {"run": ["cargo test"], "deny": ["npm publish"]}, "projects": []}))
         p = P.Permissions(str(self.root), self.file)

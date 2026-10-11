@@ -34,6 +34,10 @@ pub struct Config {
     pub default: Option<String>,
     #[serde(default)]
     pub servers: BTreeMap<String, Server>,
+    /// Start the chat's headless browser with every session, without asking
+    /// (`oppx browser on`). Off: the chat asks once a session, when needed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub browser_auto: bool,
 }
 
 /// `<config dir>/oppx/config.json`.

@@ -279,6 +279,10 @@ class Permissions:
         self.run: list[str] = []
         self.deny: list[str] = []
         self.tools: list[str] = []
+        # Allowed for this session only, never saved (the browser, once the
+        # user said yes to it), and the tools that stay asked regardless.
+        self.session_tools: set[str] = set()
+        self.session_except: set[str] = set()
         self._stamp = None
         self.load()
 
@@ -455,16 +459,58 @@ class Permissions:
         return True
 
     # ---- connector tools ----------------------------------------------------
+    @staticmethod
+    def _connector_of(name: str) -> str:
+        return name.split(".", 1)[0] if "." in name else name
+
     def tool_allowed(self, name: str) -> bool:
+        """Allowed by its own rule, or by its connector's ("linear.*")."""
         self._fresh()
-        return name in self.tools and name not in self.deny
+        if self.tool_denied(name):
+            return False
+        wild = f"{self._connector_of(name)}.*"
+        session = name not in self.session_except and (name in self.session_tools or wild in self.session_tools)
+        return name in self.tools or wild in self.tools or session
+
+    def allow_for_session(self, rule: str, unless=()):
+        """Allows a tool, or every tool of a connector ("playwright.*"), until
+        the chat ends; `unless` stay asked."""
+        self.session_tools.add(rule)
+        self.session_except.update(unless)
 
     def tool_denied(self, name: str) -> bool:
         self._fresh()
-        return name in self.deny
+        return name in self.deny or f"{self._connector_of(name)}.*" in self.deny
 
     def allow_tool(self, name: str):
         self._change("tools", add=[name])
+
+    def judge_tool(self, name: str, read_only: bool) -> tuple[str, str]:
+        """("run", ""), ("refuse", why) or ("ask", "") for a connector call.
+        A tool its connector marks as only reading runs without a question,
+        like a command that only reads; deny rules still win."""
+        if self.tool_denied(name):
+            return "refuse", "The user's deny rule forbids this tool; carry on without it, or tell the user."
+        if read_only or self.tool_allowed(name):
+            return "run", ""
+        return "ask", ""
+
+    def answered_tool(self, name: str, said: str) -> tuple[bool | str, str]:
+        """The answer to "Call this connector tool?": y once, a always for this
+        tool, c always for every tool of its connector, N, or what to do instead."""
+        answer = said.strip().lower()
+        connector = self._connector_of(name)
+        if answer in ("a", "always"):
+            self.allow_tool(name)
+            return True, f"Allowed, and from now on without asking: {name} (/permissions to change)"
+        if answer in ("c", "connector") and connector != name:
+            self.allow_tool(f"{connector}.*")
+            return True, f"Allowed, and from now on without asking: every {connector} tool (/permissions to change)"
+        if answer in ("y", "yes"):
+            return True, "Allowed"
+        if answer in ("", "n", "no"):
+            return False, "Declined"
+        return f"The user declined this call and said: {said.strip()}", "Declined, with your note"
 
     # ---- managing -----------------------------------------------------------
     def remove(self, rule: str, kind: str | None = None) -> bool:

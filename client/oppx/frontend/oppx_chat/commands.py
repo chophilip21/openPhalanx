@@ -12,6 +12,7 @@ from rich.markup import escape
 from .config import ACCENT, CONTEXT, ENGINE, EXTRA_MEMORY, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, OPPX_BIN, PRINT_MODE, RED, SERVER, VERSION, WEB, YELLOW
 from .term import SPIN, Thinking, UI, headline, out, step
 from .mcp import cost_warning
+from . import browser
 from .context import CONTEXT_MGR, MAP_MAX, PRI_EDITED, PRI_MODEL, PRI_USER, _orig_format_messages, _raw_tokens
 from .oppx_io import show_shortcuts
 from .routing import wants_edit
@@ -44,6 +45,7 @@ HELP = [
         ("!<command>", "run a shell command and share its output"),
         ("/test, /lint", "run your tests or linter and fix failures"),
         ("/mcp", "connectors (MCP servers): list, add, remove, tools, reconnect"),
+        ("/browser", "the headless web browser for this session: start, stop, on/off for every session"),
         ("/permissions", "what runs without asking in this project: list, remove <rule>, clear"),
     ]),
     ("Session", [
@@ -263,6 +265,112 @@ def reconnect_connectors(coder, adding: bool = False):
     warning = cost_warning(hub.tokens(), CONTEXT, adding)
     if warning:
         step(f"⚠ {escape(warning)}", YELLOW)
+
+
+# ---------------------------------------------------------------------------
+# The headless browser: /browser, and the question when the model asks for it
+# ---------------------------------------------------------------------------
+
+BROWSER_QUESTION = ("  Start it? (y = yes, a = always: start it with every session, N = no, "
+                    "or type what to do instead) ")
+
+
+def start_browser(coder, ask: bool) -> bool | str:
+    """Starts the browser for this session, after asking when `ask`. True once
+    it runs; otherwise a sentence for the model (the user said no, or why it
+    couldn't start)."""
+    agent, hub, perms = UI.agent, UI.connectors, UI.permissions
+    if hub is None or agent is None:
+        return "this session runs --engine aider"
+    if agent.browser == "running":
+        return True
+    if ask:
+        if PRINT_MODE:
+            return "the user can't be asked in print mode (oppx browser on starts it with every session)"
+        SPIN.stop()
+        out(f"\n[{YELLOW}]⏺[/] [bold]Start a headless browser (Playwright) for this session?[/]")
+        step("The model wants to open web pages (your local dev server, for example), click through them and read "
+             "their console errors. It runs on this machine and stops when the chat ends.")
+        said = coder.io._ask_line(BROWSER_QUESTION).strip()
+        answer = said.lower()
+        if answer in ("", "n", "no"):
+            step("Not started", MUTED)
+            SPIN.start()
+            return "the user said no"
+        if answer not in ("y", "yes", "a", "always"):
+            step("Not started, with your note", MUTED)
+            SPIN.start()
+            return f"the user said no, and: {said}"
+        if answer in ("a", "always"):
+            done = subprocess.run([OPPX_BIN, "browser", "on"], capture_output=True, text=True)
+            step("From now on it starts with every session (oppx browser off to be asked again)" if done.returncode == 0
+                 else "Couldn't save that; starting it for this session only", GREEN if done.returncode == 0 else YELLOW)
+    if not browser.available():
+        if not browser.NODE:
+            step(f"The browser can't start: {browser.why_unavailable()}", YELLOW)
+            return f"it can't start on this machine: {browser.why_unavailable()}"
+        SPIN.start("Installing the browser (one time)")
+        ok, tail = browser.install()
+        SPIN.stop()
+        if not ok:
+            step(f"Installing the browser failed: {escape(tail)}", YELLOW)
+            return f"installing it failed: {tail}"
+    SPIN.start("Starting the browser")
+    c = hub.start(browser.definition(agent.session), hidden=browser.HIDDEN, postprocess=browser.inline_files,
+                  timeout=browser.START_TIMEOUT, stateful=True)
+    SPIN.stop()
+    if c.state != "connected":
+        step(f"The browser didn't start: {escape(c.error)}", YELLOW)
+        return f"it didn't start: {c.error}"
+    perms.allow_for_session(f"{browser.NAME}.*", unless=browser.EVERY_TIME)
+    agent.browser = "running"
+    agent.reset_system()
+    step(f"Browser running (headless, {sum(n.startswith(browser.NAME + ".") for n in hub.names())} tools). Its tools "
+         "run without asking this session, except running JavaScript in the page.", GREEN)
+    SPIN.start()
+    return True
+
+
+def stop_browser():
+    hub, agent = UI.connectors, UI.agent
+    c = hub.connectors.pop(browser.NAME, None) if hub is not None else None
+    if c is not None:
+        c.close()
+    if hub is not None:
+        hub.builtin.pop(browser.NAME, None)
+    if agent is not None and agent.browser == "running":
+        agent.browser = "offer"
+        agent.reset_system()
+
+
+def browser_command(coder, arg: str):
+    sub = arg.strip().lower()
+    agent = UI.agent
+    if agent is None:
+        step("The browser is used by the default engine; this session runs --engine aider.", YELLOW)
+        return
+    if sub in ("on", "off"):
+        SPIN.stop()
+        subprocess.run([OPPX_BIN, "browser", sub])
+        if sub == "on" and agent.browser != "running":
+            start_browser(coder, ask=False)
+        SPIN.stop()
+    elif sub == "start":
+        start_browser(coder, ask=False)
+        SPIN.stop()
+    elif sub == "stop":
+        stop_browser()
+        step("Browser stopped. The model can ask for it again.")
+    elif sub in ("", "status"):
+        state = {"running": "running (headless) for this session", "offer": "not started; the model asks when it needs it",
+                 "declined": "not started; you said no this session (/browser start starts it)",
+                 "none": "not available in this session"}.get(agent.browser, agent.browser)
+        step(f"Browser: {state}")
+        step(f"[{MUTED}]At session start: {'starts without asking (oppx browser on)' if browser.AUTO else 'the chat asks when needed (oppx browser off)'}[/]")
+        if not browser.available():
+            step(f"[{MUTED}]{escape(browser.why_unavailable() or '')}; installed on first use[/]")
+    else:
+        step("Usage: /browser [start | stop | on | off]", YELLOW)
 
 
 def mcp_command(coder, arg: str):
@@ -516,6 +624,8 @@ def translate(coder, text: str):
         undo_edits()
     elif name == "/mcp":
         mcp_command(coder, arg)
+    elif name == "/browser":
+        browser_command(coder, arg)
     elif name in ("/permissions", "/allowed-tools"):
         permissions_command(arg)
     elif name in ("/commit", "/git"):
