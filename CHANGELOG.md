@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.7.0 (2026-10-11)
+
+### Features
+
+- Headless browser for the chat, and a Settings page for the server (#11)
+
 ## v0.6.2 (2026-10-11)
 
 ### Fixes
