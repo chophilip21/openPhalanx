@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.7.3 (2026-10-12)
+
+### Fixes
+
+- Follow-ups that made no edit, typing during a turn, and agent gaps (#14)
+
 ## v0.7.2 (2026-10-12)
 
 ### Fixes
