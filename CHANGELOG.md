@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.7.2 (2026-10-12)
+
+### Fixes
+
+- Permission gate audit: commands that ran unasked, questions that repeated, and connector recovery (#13)
+
 ## v0.7.1 (2026-10-12)
 
 ### Fixes
