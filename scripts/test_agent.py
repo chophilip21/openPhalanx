@@ -311,6 +311,25 @@ class AgentLoop(unittest.TestCase):
         finally:
             A.httpx.post = real
 
+    def test_an_action_typed_as_a_shell_command_is_not_run_and_a_declined_one_is_a_repeat(self):
+        s = self.s
+        asked = []
+        s.agent.hooks.confirm_run = lambda c: asked.append(c) or False
+        s.agent.web = False
+        s.actions = [{"tool": "run", "command": "web_search --query 'vite release'"}]
+        s.agent.turn("search the web for the newest vite release", can_edit=False)
+        self.assertEqual(asked, [])  # nobody is asked to run a program that doesn't exist
+        self.assertTrue(any("web search is not available in this session" in m["content"] for m in s.agent.messages))
+        self.assertNotIn('"tool": "web_search"', s.agent._system())
+        self.assertIn("Web search is switched off", s.agent._system())
+        # A command the user declined changed nothing: asking for it again is a repeat.
+        s2 = Scripted(str(self.root))
+        s2.agent.hooks.confirm_run = lambda c: asked.append(c) or False
+        s2.actions = [{"tool": "run", "command": "make deploy"}] * 6
+        s2.agent.turn("deploy it", can_edit=False)
+        self.assertEqual(asked, ["make deploy"])
+        self.assertTrue(any("already" in m["content"] for m in s2.agent.messages))
+
     def test_a_refused_command_tells_the_model_why(self):
         s = self.s
         seen = []

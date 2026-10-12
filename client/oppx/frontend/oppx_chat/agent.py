@@ -925,6 +925,7 @@ class Agent:
     _trail: list = field(default_factory=list)  # this turn's actions and results, one line each
     _before: dict = field(default_factory=dict)  # path -> its text before this request first changed it
     _search_off_until: float = 0.0  # the server paused or paced web search until then (monotonic)
+    _ran: bool = False  # the last run/start really ran (not declined, not refused)
     stuck: str = ""  # why the last turn stopped early ("" when it didn't)
     # Labels sent with every request (`oppx_trace`), for the server's Trace
     # page: which conversation, turn and step a request belongs to and what
@@ -978,6 +979,10 @@ class Agent:
         overview = "Top level of the repository: " + ", ".join(top[:80])
         memory = f"\n\nProject notes from the user (follow them):\n{self.memory.strip()[:8000]}" if self.memory.strip() else ""
         system = SYSTEM.replace("{BROWSER}", BROWSER_LINE if self.browser == "offer" else "")
+        if not self.web:
+            # Listed but never on offer, it was typed as a shell command instead.
+            system = "\n".join(line for line in system.split("\n") if not line.startswith('- {"tool": "web_search"'))
+            system += "\n\nWeb search is switched off in this session: if the user asks you to search the web, say that you can't here, and go on from what you know and the files."
         return f"{system}{self._connector_text()}\n\n{overview}{memory}"
 
     def _event(self, name: str, count: int = 1):
@@ -1297,6 +1302,7 @@ class Agent:
         nudged = edit_nudged = checked = reviewed = rethought = edit_checked = edit_planned = False
         changed_files: list[str] = []
         self._before = {}  # path -> its text before this request's first change to it
+        declined: set[str] = set()  # commands the user declined, or that were refused, in this request
         last_repeat = ""
         check: str | None = None  # the first line of the last command run after the latest edit ("exit code 0")
         queued: list[dict] = []  # lookups asked for in one step, still to run
@@ -1451,6 +1457,14 @@ class Agent:
                 last_repeat = title
                 result = (f"Those lines were already shown at step {seen_at}; they're above. "
                           "Use them, look somewhere else, or answer.")
+            elif tool in ("run", "start") and (act.get("command") or "").strip() in declined:
+                # Running a command again is fine (tests after a fix); asking
+                # again for one that was just declined or refused is not.
+                repeats += 1
+                self._event("repeat")
+                last_repeat = title
+                result = ("This command was already declined or refused in this request, and nothing has changed: "
+                          "don't ask for it again. Do the task another way, or answer and say what couldn't be run.")
             elif sig in done and visible(done[sig]) and tool not in ("edit", "create", "run", "start") and tool not in extra:
                 repeats += 1
                 self._event("repeat")
@@ -1460,7 +1474,10 @@ class Agent:
             else:
                 done[sig] = n
                 result = self._do(act)
-                if tool in ("run", "start") or (tool in EDIT_TOOLS and result.startswith(("Edited ", "Created ", "Replaced "))):
+                if tool in ("run", "start") and not self._ran:
+                    declined.add((act.get("command") or "").strip())
+                if (tool in ("run", "start") and self._ran) or (
+                        tool in EDIT_TOOLS and result.startswith(("Edited ", "Created ", "Replaced "))):
                     # The files may differ now, so what was looked up before
                     # can be looked up again. After an edit that half applied,
                     # every read of the file came back as "you already did
@@ -1769,13 +1786,15 @@ class Agent:
                 cmd = act.get("command", "").strip()
                 if not cmd:
                     raise ToolError(f"{tool} needs a command")
-                self._not_a_connector(cmd)
+                self._ran = False
+                self._not_a_program(cmd)
                 allowed = self.hooks.confirm_run(cmd)
                 if allowed is not True:
                     # A refusal can carry what the user said instead, or why
                     # it can't run (a deny rule, plan mode).
                     res = allowed if isinstance(allowed, str) and allowed else "The user declined to run this command."
                 else:
+                    self._ran = True  # the files may differ now; a declined command changed nothing
                     self.hooks.waiting("Running" if tool == "run" else "Starting")
                     res = self.ws.run(cmd) if tool == "run" else self.ws.start(cmd)
             elif tool == "web_search":
@@ -1985,16 +2004,25 @@ class Agent:
             return f"Replaced the whole of {rel} ({len(content.splitlines())} lines; it had {len(before.splitlines())})."
         return f"Created {rel} ({len(content.splitlines())} lines)."
 
-    def _not_a_connector(self, cmd: str):
-        """A connector's name typed as a shell command ("playwright browser
-        navigate http://…", with the browser's tools on offer): say what it is,
-        instead of asking the user to run a program that doesn't exist."""
-        if self.connectors is None:
+    def _not_a_program(self, cmd: str):
+        """One of the agent's own actions, or a connector's name, typed as a
+        shell command: say what it is, instead of asking the user to run a
+        program that doesn't exist. (`playwright browser navigate http://…`
+        with the browser's tools on offer; `web_search --query '…'` nine
+        times in a row in a session started with --no-web.)"""
+        words = cmd.split()
+        first = words[0].lower() if words else ""
+        if not first or shutil.which(words[0]):
             return
-        names = sorted(self.connectors.tools())
-        first = cmd.split()[0].lower()
+        if first in TOOLS:
+            if first == "web_search" and not (self.web and time.monotonic() >= self._search_off_until):
+                raise ToolError("web_search is not a program, and web search is not available in this session (switched off, "
+                                "or paused by the server). Carry on without it, from what you know and what the files "
+                                "say, and say in your reply that nothing was looked up on the web.")
+            raise ToolError(f'{first} is not a program: it is one of your actions. Choose it directly, as {{"tool": "{first}", …}}.')
+        names = sorted(self.connectors.tools()) if self.connectors is not None else []
         mine = [n for n in names if n.split(".", 1)[0].lower() == first or n in cmd]
-        if mine and not shutil.which(cmd.split()[0]):
+        if mine:
             raise ToolError(f"{first} is not a program here: it is a connector, and its tools are chosen directly as the "
                             f'action, e.g. {{"tool": "{mine[0]}"}}. Its tools: ' + ", ".join(mine[:12])
                             + (" …" if len(mine) > 12 else ""))

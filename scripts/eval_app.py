@@ -31,7 +31,9 @@ suspended). Without it the build task's first step can't be done; no check
 depends on it. Use `--web` for a single run, not for a batch.
 
 `oppx` must be paired. Needs Node, npm, and the browser oppx installed
-(`oppx browser install`). Results and logs go to target/eval_app/<time>/.
+(`oppx browser install`). A task stops early when two runs in a row fail the same checks (`--no-stop`
+runs them all): read the logs before spending more GPU time. Results and logs
+go to target/eval_app/<time>/.
 """
 
 import argparse
@@ -399,6 +401,8 @@ def main():
     ap.add_argument("--turns", type=int, default=3, help="messages per run at most (the prompt, then 'Continue…')")
     ap.add_argument("--timeout", type=int, default=2400, help="seconds per message")
     ap.add_argument("--web", action="store_true", help="let oppx search the web (off by default: see the note above)")
+    ap.add_argument("--no-stop", action="store_true",
+                    help="run every run even when two in a row fail the same checks (by default the task stops there)")
     ap.add_argument("--keep", action="store_true", help="keep each run's repository (under the results folder)")
     args = ap.parse_args()
     tasks = [t for t in args.task.split(",") if t]
@@ -417,6 +421,7 @@ def main():
     rows = []
     for task in tasks:
         prompt, keyword, required = TASKS[task]
+        last_failed: list | None = None
         for run in range(1, args.runs + 1):
             tag = f"{task}-{run}"
             out = results / tag
@@ -465,6 +470,13 @@ def main():
                       f"{took / 60:.1f} min  {agent.calls or '?'} model calls  "
                       f"{'left running: ' + str(len(orphans)) + '  ' if orphans else ''}"
                       f"{'failed: ' + ', '.join(failed) if failed else 'all passed'}", flush=True)
+            # The same checks failed twice in a row: more runs would only repeat it.
+            # Look at the logs before spending another hour of GPU time.
+            if failed and failed == last_failed and not args.no_stop and run < args.runs:
+                print(f"{task}: stopped after run {run}: the same checks failed twice in a row ({', '.join(failed)}). "
+                      f"Logs: {(results / tag).relative_to(ROOT)}. --no-stop runs them all.", flush=True)
+                break
+            last_failed = failed
 
     for task in tasks:
         mine = [r for r in rows if r["task"] == task]
