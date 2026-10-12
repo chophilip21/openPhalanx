@@ -21,11 +21,21 @@ pub struct GpuInfo {
 const QUERY: &str =
     "index,name,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu,compute_cap";
 
+/// How long `nvidia-smi` may take. It answers in about 50 ms; one that
+/// doesn't is stuck in the driver, and is killed instead of waited for.
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 pub async fn query() -> Result<Vec<GpuInfo>> {
-    let out = Command::new("nvidia-smi")
-        .args([&format!("--query-gpu={QUERY}"), "--format=csv,noheader,nounits"])
-        .output()
+    // The app asks every couple of seconds, from its monitor and from every
+    // page that shows VRAM. Without a limit, a driver that stops answering
+    // blocks the monitor (so nothing feeds the backend's watchdog, and a
+    // cluster member stops reporting) and leaves one more stuck process
+    // behind with each question from a page.
+    let mut cmd = Command::new("nvidia-smi");
+    cmd.args([&format!("--query-gpu={QUERY}"), "--format=csv,noheader,nounits"]).kill_on_drop(true);
+    let out = tokio::time::timeout(QUERY_TIMEOUT, cmd.output())
         .await
+        .map_err(|_| anyhow::anyhow!("nvidia-smi did not answer in {} s; the GPU driver may be stuck", QUERY_TIMEOUT.as_secs()))?
         .context("nvidia-smi not found; is the NVIDIA driver installed?")?;
     if !out.status.success() {
         bail!("nvidia-smi failed: {}", String::from_utf8_lossy(&out.stderr).trim());

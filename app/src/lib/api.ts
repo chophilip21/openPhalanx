@@ -221,7 +221,15 @@ export type Snapshot = {
   settings: Settings;
   warnings: string[];
   cluster: ClusterState | null;
+  /** The previous run did not end cleanly (killed, crashed, or the machine froze). */
+  unclean: RunMarker | null;
 };
+
+/** A run of the app: when it started, when it was last seen alive (Unix seconds), what the server was doing. */
+export type RunMarker = { pid: number; version: string; started: number; seen: number; state: string };
+
+/** A problem report: the whole text, where it was saved, and a link that opens a filled-in GitHub issue. */
+export type ProblemReport = { title: string; markdown: string; url: string; path: string | null };
 
 export type Requirement = {
   context_len: number;
@@ -437,6 +445,8 @@ export const api = {
   setTraceContent: (enabled: boolean) => invoke<void>("set_trace_content", { enabled }),
   contextLimit: () => invoke<ContextLimit>("get_context_limit"),
   snapshot: () => invoke<Snapshot>("get_snapshot"),
+  makeReport: (description: string) => invoke<ProblemReport>("make_report", { description }),
+  dismissUnclean: () => invoke<void>("dismiss_unclean"),
   checkUpdate: () => invoke<UpdateCheck>("check_update"),
   installUpdate: () => invoke<void>("install_update"),
   preflight: () => invoke<Preflight>("get_preflight"),

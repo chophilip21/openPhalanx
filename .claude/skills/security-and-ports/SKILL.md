@@ -18,6 +18,7 @@ Part of the developer notes; the index is in `CLAUDE.md`.
 | `9094/tcp` (`127.0.0.1` only) | `oppxs` control API (backend and cluster commands); needs `control.token` |
 | `9096`, `9098` (`127.0.0.1` only), `9100`–`9116/tcp` and NCCL's ephemeral ports | Split model only: SGLang and SearXNG on the host's network, and the rendezvous and traffic between the ranks |
 | `~/.local/share/openphalanx/cluster/` | This server's certificate (`head.crt`, `head.key`, 0600), identity, role and trusted hosts (`state.json`), members as host (`members.json`, hashed tokens), and the split run's worker orders (`workers.json`). Deleting it resets the server's cluster identity |
+| `~/.local/share/openphalanx/events.jsonl`, `running.json`, `reports/` | The app's journal of what happened (state changes, starts, errors; no addresses, tokens or prompts), the marker that tells a clean exit from a crash, and the problem reports the user asked for. Nothing is sent anywhere; a report leaves the machine only when the user posts it |
 | `~/.config/openphalanx/settings.json` | Selected model, context length, selected GPUs, custom models |
 | `~/.config/oppx/mcp.json` (client, 0600) and `<repo>/.mcp.json` | Connectors: the user's own MCP servers and a repository's (`oppx mcp add`). `~/.local/state/oppx/mcp-approved.json` records the repository connectors the user agreed to; `mcp-<name>.log` is a connector's stderr |
 | `~/.local/share/openphalanx/models/` | Models downloaded by the GUI (verified, pinned to a commit) |

@@ -2,8 +2,11 @@
   import { onMount } from "svelte";
   import Icon from "./components/Icon.svelte";
   import Notifications from "./components/Notifications.svelte";
+  import ReportDialog from "./components/ReportDialog.svelte";
   import UpdatePrompt from "./components/UpdatePrompt.svelte";
+  import { ask } from "@tauri-apps/plugin-dialog";
   import { api, errorText, openLink, type UpdateCheck } from "./lib/api";
+  import { condition, notify } from "./lib/notify.svelte";
   import logo from "./assets/logo.svg";
   import Devices from "./pages/Devices.svelte";
   import Home from "./pages/Home.svelte";
@@ -72,6 +75,89 @@
 
   const st = $derived(app.snapshot?.server.state ?? "stopped");
 
+  // ---- Report a problem -----------------------------------------------------
+  let reporting = $state(false);
+  let reportIntro = $state("");
+
+  function openReport(intro = "") {
+    reportIntro = intro;
+    reporting = true;
+  }
+
+  function closeReport() {
+    reporting = false;
+    // Reported or looked at: the note about the last run has done its job.
+    if (app.snapshot?.unclean) api.dismissUnclean().catch(() => {});
+  }
+
+  const clock = (t: number) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+  // The last run did not end cleanly: say so once, on every page, with a way to report it.
+  const unclean = $derived(app.snapshot?.unclean ?? null);
+  $effect(() => {
+    const u = unclean;
+    condition("unclean-exit", u ? {
+      kind: "warn",
+      text: `Openphalanx didn't shut down cleanly last time: it was last seen at ${clock(u.seen)} with the server ${u.state}. ` +
+        "The app was killed, it crashed, or this machine froze. What it recorded up to then is kept.",
+      action: {
+        label: "Report it…",
+        run: () => openReport(`The last run stopped without shutting down (last seen at ${clock(u.seen)}, server ${u.state}).`),
+      },
+      onclose: () => { api.dismissUnclean().catch(() => {}); },
+    } : null);
+  });
+
+  // ---- Ports held by another server process on this machine ---------------------
+  // The cluster service can't start while a leftover `oppxs` or a second copy
+  // of the app holds its ports, and this machine is then invisible to the
+  // others. That is an alert with a button, on every page: it used to be a
+  // small underlined "Free the ports…" at the bottom of the cluster panel.
+  const clusterError = $derived(app.snapshot?.cluster?.error ?? null);
+  let freeing = $state(false);
+
+  async function freePorts() {
+    freeing = true;
+    try {
+      const holders = await api.portHolders();
+      const ours = holders.filter((h) => h.ours && h.pid != null);
+      const others = holders.filter((h) => !h.ours);
+      const describe = (h: (typeof holders)[number]) =>
+        h.pid != null ? `${h.name} (pid ${h.pid}) on port ${h.port}` : `another user's process on port ${h.port}`;
+      if (!ours.length) {
+        if (others.length) {
+          notify("error", `The ports are held by something that isn't Openphalanx: ${others.map(describe).join("; ")}. Stop it yourself; this app won't.`);
+        } else {
+          notify("info", "Nothing is holding the ports now; the cluster service starts by itself within a few seconds.");
+        }
+        return;
+      }
+      const names = [...new Set(ours.map((h) => `${h.name} (pid ${h.pid})`))].join(", ");
+      const yes = await ask(
+        `Stop ${names}? It is another Openphalanx server on this machine holding the ports this app needs. If it is serving a model, that stops too.`,
+        { title: "Free the ports", kind: "warning" },
+      );
+      if (!yes) return;
+      const [stopped, left] = await api.freePorts();
+      notify("info", `Stopped ${stopped.join(", ")}. The cluster service starts within a few seconds.`);
+      if (left.length) notify("error", `Still held by something else: ${left.map(describe).join("; ")}.`);
+    } catch (e) {
+      notify("error", errorText(e), { label: "Report a problem…", run: () => openReport() });
+    } finally {
+      freeing = false;
+    }
+  }
+
+  $effect(() => {
+    const e = clusterError;
+    const busy = freeing;
+    condition("cluster-service", e ? {
+      kind: "error",
+      text: e,
+      action: { label: busy ? "Freeing the ports…" : "Free the ports", run: freePorts, busy },
+    } : null);
+  });
+
   // Settings that change the whole window: IP masking and the saved theme
   // (settings.json is the record; it survives updates).
   const hideIps = $derived(app.snapshot?.settings.hide_ips ?? false);
@@ -114,8 +200,10 @@
     </button>
     {#if updateNote && updateNote !== "Up to date"}<div class="update-error">{updateNote}</div>{/if}
     <button class="check-update" title={REPO} onclick={() => openLink(REPO).catch((e) => (updateNote = errorText(e)))}>GitHub <Icon name="external" size={11} /></button>
+    <button class="check-update" title="Gather what a bug report needs and open an issue on GitHub" onclick={() => openReport()}>Report a problem</button>
   </nav>
   {#if update}<UpdatePrompt check={update} onclose={() => (update = null)} />{/if}
+  {#if reporting}<ReportDialog intro={reportIntro} onclose={closeReport} />{/if}
   <Notifications />
 
   <main>
