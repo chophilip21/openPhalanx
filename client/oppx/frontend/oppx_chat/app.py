@@ -246,13 +246,19 @@ def make_agent(coder) -> Agent:
         if verdict == "refuse":
             step("Not run: " + ("a deny rule forbids it" if "deny rule" in why else "edits are off, and it doesn't only read"), MUTED)
             return why
-        rules = perms.offer(command)
-        SPIN.stop()
-        out(f"\n[{YELLOW}]⏺[/] [bold]Run this command?[/]")
-        for line in command.splitlines():
-            out(f"  [{MUTED}]│[/] {escape(line)}")
-        always = f"a = always allow {', '.join(f'`{r}`' for r in rules)} in this project, " if rules else ""
-        said = coder.io._ask_line(f"  Allow? (y = yes, {always}N = no, or type what to do instead) ").strip()
+        rules, session = perms.offer(command), perms.offer_session(command)
+        options = [("y", GREEN, "yes, this once")]
+        if rules:
+            options.append(("a", ACCENT, f"always in this project: {', '.join(rules)}"))
+        if session:
+            # Inline code (python -c) gets no saved rule; the rest of the line may.
+            keep = perms.savable(session)
+            if keep:
+                inline = ", ".join(r for r in session if r not in keep)
+                options.append(("a", ACCENT, f"always in this project: {', '.join(keep)}  ·  this session: {inline}"))
+            options.append(("s", ACCENT, f"this session only: {', '.join(session)}  (not saved)"))
+        options += [("n", RED, "no  (Enter)"), ("…", MUTED, "or type what to do instead")]
+        said = coder.io.ask_options("Run this command?", command.splitlines(), options).strip()
         SPIN.start()
         result, shown = perms.answered(command, said)
         step(shown, GREEN if result is True else MUTED)
@@ -270,12 +276,13 @@ def make_agent(coder) -> Agent:
             step(f"Not run: a deny rule forbids {escape(name)}", MUTED)
             return why
         connector = name.split(".", 1)[0]
-        SPIN.stop()
-        out(f"\n[{YELLOW}]⏺[/] [bold]Call this connector tool?[/]")
-        for line in f"{name} {arguments}".splitlines()[:30]:
-            out(f"  [{MUTED}]│[/] {escape(line)}")
-        said = coder.io._ask_line(f"  Allow? (y = yes, a = always allow {name}, c = always allow every {connector} tool, "
-                                  "N = no, or type what to do instead) ")
+        said = coder.io.ask_options("Call this connector tool?", f"{name} {arguments}".splitlines()[:30], [
+            ("y", GREEN, "yes, this once"),
+            ("a", ACCENT, f"always in this project: {name}"),
+            ("c", ACCENT, f"always in this project: every {connector} tool"),
+            ("n", RED, "no  (Enter)"),
+            ("…", MUTED, "or type what to do instead"),
+        ])
         SPIN.start()
         result, shown = perms.answered_tool(name, said)
         step(shown, GREEN if result is True else MUTED)

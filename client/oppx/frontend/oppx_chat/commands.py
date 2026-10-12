@@ -271,8 +271,6 @@ def reconnect_connectors(coder, adding: bool = False):
 # The headless browser: /browser, and the question when the model asks for it
 # ---------------------------------------------------------------------------
 
-BROWSER_QUESTION = ("  Start it? (y = yes, a = always: start it with every session, N = no, "
-                    "or type what to do instead) ")
 
 
 def start_browser(coder, ask: bool) -> bool | str:
@@ -287,11 +285,15 @@ def start_browser(coder, ask: bool) -> bool | str:
     if ask:
         if PRINT_MODE:
             return "the user can't be asked in print mode (oppx browser on starts it with every session)"
-        SPIN.stop()
-        out(f"\n[{YELLOW}]⏺[/] [bold]Start a headless browser (Playwright) for this session?[/]")
-        step("The model wants to open web pages (your local dev server, for example), click through them and read "
-             "their console errors. It runs on this machine and stops when the chat ends.")
-        said = coder.io._ask_line(BROWSER_QUESTION).strip()
+        said = coder.io.ask_options("Start a headless browser (Playwright) for this session?", [
+            "The model wants to open web pages (your local dev server, for example), click through them",
+            "and read their console errors. It runs on this machine and stops when the chat ends.",
+        ], [
+            ("y", GREEN, "yes, for this session"),
+            ("a", ACCENT, "always: start it with every session"),
+            ("n", RED, "no  (Enter)"),
+            ("…", MUTED, "or type what to do instead"),
+        ]).strip()
         answer = said.lower()
         if answer in ("", "n", "no"):
             step("Not started", MUTED)

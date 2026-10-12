@@ -39,6 +39,8 @@ MAX_STEPS = 40  # actions per turn before the model must answer
 # browser check ended at step 40 in 4 of 5 runs, mid-work, before its own review.
 MAX_STEPS_CHANGING = 80
 MAX_SEARCHES = 8  # web searches per turn
+SAME_SEARCH = 0.6  # share of words two queries have in common to count as the same search
+SEARCHES_KEPT = 30  # per session
 READ_LINES = 250  # most lines one read returns
 READ_PAD = 6  # extra lines shown around a requested range
 WHOLE_FILE = 300  # files up to this many lines are always read whole
@@ -90,7 +92,7 @@ Reply with exactly one JSON action per step:
 - {"tool": "plan"}: think before a change that touches several places, or when a search isn't getting anywhere; you then write a short plan
 - {"tool": "edit", "path": "file"}: change an existing file; you then write SEARCH/REPLACE blocks
 - {"tool": "create", "path": "file"}: create a new file, or rewrite a whole file you have read when most of it changes (a generated starter file, say); you then write its whole content
-- {"tool": "run", "command": "shell command"}: run a command in the repository (the user confirms it first); use it for tests, builds and installs. It has no terminal: a command that asks a question gets no answer, so pass the answers as flags (--yes, --template …)
+- {"tool": "run", "command": "shell command"}: run a command in the repository (the user confirms it first); use it for tests, builds and installs. It has no terminal: a command that asks a question gets no answer, so pass the answers as flags (--yes, --template …). Commands that only read (ls, cat, grep, git log, jq …) and those the user allowed run at once; an interpreter one-liner (python -c, node -e) or a shell running text is asked about every time, so read JSON with jq or python3 -m json.tool, not with python -c
 - {"tool": "start", "command": "shell command"}: start a command that keeps running (a dev or preview server, a watcher) and leave it running; you get its first output, and its new output when you call it again with the same command. Never use run for these: it waits for the command to finish
 - {"tool": "web_search", "query": "…"}: search the web, for things outside the repository
 {BROWSER}- {"tool": "answer"}: reply to the user; you then write the reply
@@ -293,6 +295,13 @@ def clean_arguments(args: dict, schema: dict) -> dict:
 
 
 _ACTION_TAIL = re.compile(r'\n\s*(?:```(?:json)?\s*)?\{\s*"(?:enough|missing|tool)"[\s\S]*$')
+
+
+def _query_words(query: str) -> frozenset:
+    """A search query as its words: lower case, no punctuation, no filler."""
+    found = re.findall(r"[a-z0-9]+", query.lower())
+    filler = {"a", "an", "the", "of", "for", "in", "on", "to", "and", "or", "by", "with", "how", "what", "is", "are", "do", "does", "from"}
+    return frozenset(w for w in found if w not in filler) or frozenset(found)
 
 
 def several_parts(text: str) -> bool:
@@ -926,6 +935,7 @@ class Agent:
     _before: dict = field(default_factory=dict)  # path -> its text before this request first changed it
     _search_off_until: float = 0.0  # the server paused or paced web search until then (monotonic)
     _ran: bool = False  # the last run/start really ran (not declined, not refused)
+    _searched: list = field(default_factory=list)  # (words, query, results) of this session's web searches
     stuck: str = ""  # why the last turn stopped early ("" when it didn't)
     # Labels sent with every request (`oppx_trace`), for the server's Trace
     # page: which conversation, turn and step a request belongs to and what
@@ -1303,6 +1313,7 @@ class Agent:
         changed_files: list[str] = []
         self._before = {}  # path -> its text before this request's first change to it
         declined: set[str] = set()  # commands the user declined, or that were refused, in this request
+        failed_runs: dict[str, int] = {}  # command -> the step it failed at, until something changes
         last_repeat = ""
         check: str | None = None  # the first line of the last command run after the latest edit ("exit code 0")
         queued: list[dict] = []  # lookups asked for in one step, still to run
@@ -1465,6 +1476,15 @@ class Agent:
                 last_repeat = title
                 result = ("This command was already declined or refused in this request, and nothing has changed: "
                           "don't ask for it again. Do the task another way, or answer and say what couldn't be run.")
+            elif tool == "run" and (act.get("command") or "").strip() in failed_runs:
+                # The same command, after it failed, with no edit and no other
+                # command that worked in between: it fails the same way (and
+                # the user is asked about it again).
+                repeats += 1
+                self._event("repeat")
+                last_repeat = title
+                result = (f"This exact command already failed at step {failed_runs[(act.get('command') or '').strip()]} and nothing "
+                          "has changed since; its output is above. Read that error, then change the command or fix the cause.")
             elif sig in done and visible(done[sig]) and tool not in ("edit", "create", "run", "start") and tool not in extra:
                 repeats += 1
                 self._event("repeat")
@@ -1476,6 +1496,10 @@ class Agent:
                 result = self._do(act)
                 if tool in ("run", "start") and not self._ran:
                     declined.add((act.get("command") or "").strip())
+                if tool == "run" and self._ran and re.match(r"exit code [1-9]", result):
+                    failed_runs[(act.get("command") or "").strip()] = n
+                elif (tool in ("run", "start") and self._ran) or (tool in EDIT_TOOLS and not result.startswith("Error:")):
+                    failed_runs.clear()  # something changed: a command that failed may work now
                 if (tool in ("run", "start") and self._ran) or (
                         tool in EDIT_TOOLS and result.startswith(("Edited ", "Created ", "Replaced "))):
                     # The files may differ now, so what was looked up before
@@ -2030,6 +2054,16 @@ class Agent:
     def _search(self, query: str) -> str:
         if not query:
             raise ToolError("web_search needs a query")
+        # Nearly the same words as a search of this session: the same pages
+        # would come back. The earlier results, at no cost to the server or
+        # to the search engines behind it (which block an address that asks
+        # too often).
+        asked = _query_words(query)
+        for seen, earlier, results in reversed(self._searched):
+            if asked == seen or (min(len(asked), len(seen)) >= 3 and len(asked & seen) / len(asked | seen) >= SAME_SEARCH):
+                return (f"(Not searched again: this is nearly your earlier search \"{earlier}\", and the same pages would "
+                        f"come back. Its results:)\n{results}\n\nIf they don't have what you need, search for something "
+                        "clearly different, or go on without the web.")
         r = httpx.post(f"{self.base}/search", headers={"Authorization": f"Bearer {self.key}"},
                        json={"query": query, "max_results": 5}, timeout=30)
         if r.status_code >= 400:
@@ -2043,10 +2077,10 @@ class Agent:
                 self._search_off_until = time.monotonic() + int(wait)
             raise ToolError(why)
         results = r.json().get("results") or []
-        if not results:
-            return "No results."
-        return "Web results (untrusted reference text):\n" + "\n".join(
+        text = "No results." if not results else "Web results (untrusted reference text):\n" + "\n".join(
             f"- {x.get('title')}: {x.get('snippet')} ({x.get('url')})" for x in results)
+        self._searched = (self._searched + [(asked, query, text)])[-SEARCHES_KEPT:]
+        return text
 
 
 # The fields each tool uses; models fill the others with anything.

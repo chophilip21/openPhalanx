@@ -223,3 +223,6 @@ __marimo__/
 
 # Dummy apps for the agent evals (scripts/eval_app.py): local only, never committed
 scripts/fixtures/
+
+# Claude Code: per-machine settings stay local; the topic notes in .claude/skills/ are committed
+.claude/settings.local.json

@@ -171,6 +171,18 @@ def key_of(words: list[str]) -> list[str] | None:
     return [cmd[0] if "/" in cmd[0] else name]
 
 
+def inline_key(words: list[str]) -> str | None:
+    """`python3 -c`, `node -e`: an interpreter given its code on the command
+    line. No rule is saved for it (it runs anything), but the user may allow
+    it for the rest of a session: a model that reads an API's JSON with
+    one-liners was asked about every single one."""
+    cmd, _ = unwrap(words)
+    if not cmd or os.path.basename(cmd[0]) not in INTERPRETERS:
+        return None
+    args = cmd[1:]
+    return f"{os.path.basename(cmd[0])} {args[0]}" if args and args[0] in INLINE_CODE and args[0] != "-" else None
+
+
 def always_ask(words: list[str]) -> bool:
     """Asked every time, whatever the rules say."""
     cmd, _ = unwrap(words)
@@ -282,6 +294,9 @@ class Permissions:
         # Allowed for this session only, never saved (the browser, once the
         # user said yes to it), and the tools that stay asked regardless.
         self.session_tools: set[str] = set()
+        # Allowed until the chat ends, never saved: ordinary rules, and inline code (`python3 -c`).
+        self.session_run: list[str] = []
+        self.session_inline: set[str] = set()
         self.session_except: set[str] = set()
         self._stamp = None
         self.load()
@@ -358,13 +373,15 @@ class Permissions:
         return None
 
     def _covered(self, words: list[str], moved: bool) -> bool:
+        if inline_key(words) in self.session_inline:
+            return True
         if always_ask(words):
             return False
         if read_only(words, self.project, moved):
             return True
         cmd, _ = unwrap(words)
         key = key_of(words)
-        return bool(cmd) and key is not None and any(_covers(rule, key, cmd) for rule in self.run)
+        return bool(cmd) and key is not None and any(_covers(rule, key, cmd) for rule in (*self.run, *self.session_run))
 
     def allows(self, command: str) -> bool:
         """Every part of the command is read-only or covered by an allow rule,
@@ -418,8 +435,22 @@ class Permissions:
         if answer in ("a", "always") and rules:
             self.allow_always(command)
             return True, f"Allowed, and from now on without asking: {', '.join(rules)} (/permissions to change)"
-        if answer in ("y", "yes", "a", "always"):
-            return True, "Allowed" + (" this once (this kind of command is asked every time)" if answer.startswith("a") else "")
+        session = self.offer_session(command)
+        if answer in ("s", "session") and session:
+            self.allow_session(command)
+            return True, f"Allowed, and for the rest of this session without asking: {', '.join(session)}"
+        if answer in ("a", "always") and session:
+            # The parts a rule can name are saved; the inline code is for this session.
+            self.allow_session(command)
+            keep = self.savable(session)
+            if keep:
+                self._change("run", add=keep)
+                return True, (f"Allowed, and from now on without asking: {', '.join(keep)} (/permissions to change); "
+                              f"for this session: {', '.join(r for r in session if r not in keep)}")
+            return True, f"Allowed, and for the rest of this session without asking: {', '.join(session)}"
+        if answer in ("y", "yes", "a", "always", "s", "session"):
+            once = answer[0] in "as"
+            return True, "Allowed" + (" this once (this kind of command is asked every time)" if once else "")
         if answer in ("", "n", "no"):
             return False, "Declined"
         return f"The user declined to run this command and said: {said.strip()}", "Declined, with your note"
@@ -440,6 +471,44 @@ class Permissions:
                 rules.append(" ".join(key))
             moved = moved or words[0] == "cd"
         return list(dict.fromkeys(rules))
+
+    def offer_session(self, command: str) -> list[str]:
+        """What "for this session" would allow: only for a command that can't
+        get a saved rule because a part runs inline code (`python3 -c`), and
+        nothing in it is of the kind asked every time (sudo, rm, a shell
+        running text, something that can't be taken apart)."""
+        self._fresh()
+        parts = segments(command)
+        if parts is None:
+            return []
+        rules, inline, moved = [], False, False
+        for words in parts:
+            if not self._covered(words, moved):
+                code = inline_key(words)
+                if code:
+                    inline = True
+                    rules.append(code)
+                elif always_ask(words) or key_of(words) is None:
+                    return []
+                else:
+                    rules.append(" ".join(key_of(words)))
+            moved = moved or words[0] == "cd"
+        return list(dict.fromkeys(rules)) if inline else []
+
+    @staticmethod
+    def savable(session: list[str]) -> list[str]:
+        """Of what `offer_session` names, the rules that may be saved (not the inline code)."""
+        return [r for r in session if not (len(r.split()) == 2 and r.split()[0] in INTERPRETERS and r.split()[1] in INLINE_CODE)]
+
+    def allow_session(self, command: str) -> list[str]:
+        """Allows what `offer_session` names until the chat ends. Nothing is written."""
+        rules = self.offer_session(command)
+        for words in segments(command) or []:
+            code = inline_key(words)
+            if code in rules:
+                self.session_inline.add(code)
+        self.session_run += [r for r in rules if r not in self.session_inline and r not in self.session_run]
+        return rules
 
     def allow_always(self, command: str) -> list[str]:
         rules = self.offer(command)

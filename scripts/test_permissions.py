@@ -61,6 +61,50 @@ class Rules(unittest.TestCase):
             self.assertFalse(self.p.allows(cmd), cmd)
             self.assertTrue(self.p.offer(cmd) != [] or cmd.startswith("git diff"), cmd)  # still askable and rememberable
 
+    # ---- "for this session" ---------------------------------------------------
+    def test_inline_code_can_be_allowed_for_the_session_never_saved(self):
+        curl = "curl -s 'https://hn.algolia.com/api/v1/search?tags=story' | python3 -c 'import json,sys; print(json.load(sys.stdin).keys())'"
+        self.assertEqual(self.p.offer(curl), [], "no saved rule for inline code")
+        self.assertEqual(self.p.offer_session(curl), ["curl", "python3 -c"])
+        result, shown = self.p.answered(curl, "s")
+        self.assertIs(result, True)
+        self.assertIn("rest of this session", shown)
+        # The next one-liner, with other code and another URL, isn't asked.
+        self.assertEqual(self.p.judge("curl -s https://example.com/x | python3 -c 'print(1)'")[0], "run")
+        self.assertEqual(self.p.judge("python3 -c 'print(2)' | head -3")[0], "run")
+        # Another interpreter, a shell running text, and the never-remembered kind still are.
+        for cmd in ("node -e 'console.log(1)'", "bash -c 'curl x'", "python3 -c 'x' && rm -rf build", "sudo python3 -c 'x'"):
+            self.assertEqual(self.p.judge(cmd)[0], "ask", cmd)
+        # Nothing was written, and a new session starts without it.
+        saved = json.loads(self.file.read_text()) if self.file.exists() else {}
+        self.assertNotIn("python3 -c", json.dumps(saved))
+        self.assertEqual(P.Permissions(str(self.root), self.file).judge("python3 -c 'print(2)'")[0], "ask")
+        # A deny rule still wins, and plan mode still refuses.
+        self.p.add("deny", "curl")
+        self.assertEqual(self.p.judge("curl -s https://example.com/x | python3 -c 'print(1)'")[0], "refuse")
+        self.assertEqual(self.p.judge("python3 -c 'print(2)'", read_only_turn=True)[0], "refuse")
+
+    def test_always_on_a_line_with_inline_code_saves_what_a_rule_can_name(self):
+        cmd = "curl -s https://example.com/x | python3 -c 'print(1)'"
+        result, shown = self.p.answered(cmd, "a")
+        self.assertIs(result, True)
+        self.assertIn("from now on without asking: curl", shown)
+        self.assertIn("for this session: python3 -c", shown)
+        fresh = P.Permissions(str(self.root), self.file)
+        self.assertEqual(fresh.judge("curl -s https://example.com/y")[0], "run", "curl was saved")
+        self.assertEqual(fresh.judge(cmd)[0], "ask", "the inline code was not")
+        self.assertEqual(self.p.judge("curl https://example.com/z | python3 -c 'print(2)'")[0], "run")
+
+    def test_session_is_only_offered_for_inline_code(self):
+        self.assertEqual(self.p.offer_session("cargo test"), [], "a saved rule fits: 'always' is the offer")
+        self.assertEqual(self.p.offer_session("rm -rf build"), [])
+        self.assertEqual(self.p.offer_session("python3 -c 'x' > out.txt"), [], "can't be taken apart")
+        self.assertEqual(self.p.offer_session("node -e 'x'"), ["node -e"])
+        # "s" where it isn't on offer is a yes for this once, like "a".
+        result, shown = self.p.answered("rm -rf build", "s")
+        self.assertIs(result, True)
+        self.assertIn("this once", shown)
+
     # ---- "always" -----------------------------------------------------------
     def test_always_saves_a_rule_that_covers_the_next_one(self):
         self.assertEqual(self.p.offer("cargo test -p oppx 2>&1 | tail -5"), ["cargo test"])

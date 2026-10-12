@@ -7,7 +7,10 @@ in one turn, once) keeps the engines blocked for everyone on the server.
 
 So every search asks this guard first, and tells it how the search went:
 
-* **Cache:** the same query again within `CACHE_S` is answered from memory.
+* **Cache:** the same query again within `CACHE_S` is answered from memory,
+  and so is nearly the same one: the same words in another order, or all but
+  one word in five shared (`NEAR`). Agents reword a search far more often
+  than they ask something new.
 * **Pace:** searches leave at a bounded rate (a burst of `BURST`, then one
   every `REFILL_S` seconds, for the whole server). Over it, the search is
   refused with the wait, not queued.
@@ -22,6 +25,7 @@ without the gateway (scripts/test_searchguard.py).
 """
 
 import os
+import re
 import time
 from collections import OrderedDict
 
@@ -32,6 +36,10 @@ REFILL_S = float(os.environ.get("SEARCH_REFILL_S", "20"))
 TRIP_AFTER = int(os.environ.get("SEARCH_TRIP_AFTER", "2"))
 PAUSE_S = float(os.environ.get("SEARCH_PAUSE_S", "300"))
 PAUSE_MAX_S = float(os.environ.get("SEARCH_PAUSE_MAX_S", "3600"))
+# Two queries count as the same when this share of their words (both ways) is shared.
+NEAR = float(os.environ.get("SEARCH_NEAR", "0.8"))
+NEAR_MIN_WORDS = 4  # shorter queries must match word for word: one word changes what they ask
+FILLER = frozenset("a an the of for in on to and or by with how what is are do does from".split())
 
 
 class Refused(Exception):
@@ -42,8 +50,21 @@ class Refused(Exception):
         self.retry_after = max(1, round(retry_after))
 
 
+def words(query: str) -> frozenset[str]:
+    """The words that make a query what it is: lower case, no punctuation, no filler."""
+    found = re.findall(r"[a-z0-9]+", query.lower())
+    return frozenset(w for w in found if w not in FILLER) or frozenset(found)
+
+
 def _key(query: str) -> str:
-    return " ".join(query.lower().split())
+    return " ".join(sorted(words(query))) or " ".join(query.lower().split())
+
+
+def near(a: frozenset[str], b: frozenset[str], share: float = NEAR) -> bool:
+    """Nearly the same words: at least `share` of all the words either has."""
+    if min(len(a), len(b)) < NEAR_MIN_WORDS:
+        return a == b
+    return len(a & b) / len(a | b) >= share
 
 
 def _wait(seconds: float) -> str:
@@ -82,13 +103,18 @@ class Guard:
     # ---- before a search ----------------------------------------------------
     def cached_results(self, query: str) -> list | None:
         """The results of the same query a short while ago, if any."""
-        hit = self._cache.get(_key(query))
+        key = _key(query)
+        if key not in self._cache:
+            # Not the same words: nearly the same ones, then (the freshest such query).
+            asked = words(query)
+            key = next((k for k in reversed(self._cache) if near(asked, frozenset(k.split()))), key)
+        hit = self._cache.get(key)
         if hit is None:
             return None
         if self._now() - hit[0] > CACHE_S:
-            del self._cache[_key(query)]
+            del self._cache[key]
             return None
-        self._cache.move_to_end(_key(query))
+        self._cache.move_to_end(key)
         self.cached += 1
         return hit[1]
 

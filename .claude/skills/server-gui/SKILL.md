@@ -1,0 +1,74 @@
+---
+name: server-gui
+description: "The desktop server app (app/): getting and building it, the Models page, starting a model, Fits/Tight/Won't fit and the memory fraction, notifications, Force load, what closing the app does, the watchdog, and in-app updates. Read before changing app/src, app/src-tauri, vram.rs or app_update.rs."
+---
+
+# Server GUI: models, start, VRAM fit, notifications, updates
+
+Part of the developer notes; the index is in `CLAUDE.md`.
+
+## Using the server GUI
+
+### 1. Get the app
+
+From source, in development mode with hot reload:
+
+```bash
+cd app
+npm install
+npx tauri dev # start whole gui server
+
+# you can also start in headless way, especially for none-host nodes.
+cargo run -p openphalanx-server -- run --name dev
+```
+
+Or build an installable package and install it:
+
+```bash
+cd app && npm install && npx tauri build --bundles deb    # or: --bundles appimage
+sudo apt install ../target/release/bundle/deb/Openphalanx_0.3.0_amd64.deb
+```
+
+### 2. Choose a model
+
+Open **Models**:
+
+* **Context window** (slider at the top) is a server setting: the most tokens one request can use, passed to SGLang when the server starts. It doesn't filter models; it changes each model's KV-cache need, so the VRAM column and badges follow it. The panel shows how far the selected model can go on this GPU. The same slider (`ContextSlider.svelte`) sits in the Server page's model card; both write `settings.context_len`. It saves when the thumb is let go (pointer, key or blur, not only `change`: WebKit doesn't fire `change` after a drag whose value the code moved, so the slider showed 64k, nothing was saved and Start used 32k). It's locked while a backend is starting, running or stopping (and `set_context_len` refuses then), since the running model keeps the context it started with. It also can't go past the selected model's **maximum for the VRAM free now** (`get_context_limit`: the same `vram_budget` as the Fits badges, this GPU or the split pool, re-read every 5 s): dragging stops at that exact value, the track beyond it is hatched red, and `set_context_len` refuses anything longer. A saved context above the limit (after switching models, or when another program took VRAM) shows a warning and **Use <max>**.
+* The table lists Qwen, Gemma 4, gpt-oss, Devstral and Mistral, Granite, DeepSeek, GLM, Llama, Phi, Kimi and MiniMax, each from its smallest to its largest size, plus code-specialized models (StarCoder2, Code Llama, Codestral, Seed-Coder, Yi-Coder, OpenCoder, Mellum, IQuest-Coder, KAT-Coder, OpenHands LM), filterable by family, by "only models that fit", by "only downloaded models", and by a search box (`lib/search.ts`: every word must match the name, family, repo, size, quantization, quantizer or license, ignoring case and punctuation; typos are forgiven only when nothing matches as typed), sorted by release date or download size (either direction; newest first by default), 15 per page. Official repos, plus widely used 4-bit **Community** quantizations (labelled with who made them) where the publisher ships none.
+* The table shows each model's VRAM need at the chosen context window, with a **Fits / Tight / Won't fit** badge measured against your GPU's free memory, and the longest context that would fit. The need is deliberately conservative and much larger than the download size. It covers weights as loaded, KV cache for the full context plus 25%, and runtime memory. **Best fit for this GPU** marks the largest model that fits with headroom.
+* Every downloaded model has a delete button (except the one the server is running). A copy the app downloaded is removed from its models folder; one found in the Hugging Face cache is removed from that cache (its whole `models--org--name` folder, every revision), after a warning that other tools may share it. Anything outside those two places is refused.
+* A downloaded model whose files are damaged shows **Broken** with the reason (`model::broken`): a file the download recorded is missing or has another size, `config.json` or the shard index doesn't parse, a shard is missing, or a `.safetensors` file doesn't end where its header says the last tensor does (cut short or overwritten). Only sizes and headers are read (5–16 ms for the 14B and 27B models here), cached until a file's size or date changes. The pre-flight **Model** check then fails with "…files are broken (…). Delete it on the Models page and download it again", which blocks Start. A cluster member counts a damaged copy as missing, and a split worker refuses to start with one. Content damage that keeps the size isn't caught (that would need re-hashing ~10 GB on every check).
+* Click **Download** on a model that fits. Progress shows at once (a progress bar; it pulses until the size is known), then each phase: listing files, checking files already on disk (a resumed `.part` file is re-hashed first, which takes a while for big shards), and the transfer with its speed; the size is reported as soon as the file list is in, and until then the empty bar pulses (no moving fill, which read as progress resetting). A second click while it runs is harmless. Every message banner in the app has an (X) to close it (`Notice.svelte`). The default, Qwen2.5-Coder-14B-Instruct-AWQ, is already selected, and it is reused if it is in `~/.cache/huggingface`.
+* To use your own model, enter a local folder (with `config.json` and `.safetensors`) or a Hugging Face URL under **Add your own model**. Its VRAM need is checked before anything downloads.
+
+### 3. Start
+
+On **Server**, check that the pre-flight list is green, then press the power button:
+
+* The first start builds the backend image: Docker downloads the official SGLang image (about 16 GB, once) and the app adds its gateway on top (about a minute). Loading the model then takes about 3–4 minutes.
+* The running model (name, quantization, context) shows under the headline with a lock, and as **Running** on Models; it's fixed until the server stops (the tooltip says so). The context comes from the container's `CONTEXT_LENGTH`.
+* The button turns green when SGLang is ready, and a **pairing code** appears. Use it to pair a client. Codes are single-use and expire after 10 minutes, but paired devices stay paired.
+* **Logs** shows live SGLang output (before the first start it says so, instead of Docker's "No such container"). **Devices** lists paired clients and lets you revoke them.
+
+Start is disabled whenever free VRAM is below the least the selected model starts with. Close other GPU programs, or choose a smaller model or context length.
+
+**Fits, tight, won't fit** (`vram::check`): the comfortable need (`total_bytes`: weights, KV cache for the context plus 25%, runtime at 2 GiB + 15% of the weights) plus 1.5 GiB is **Fits**. Down to the least the model starts with (`Requirement::min_bytes`: weights, KV for exactly one window, runtime at 2 GiB + 8% of the weights) is **Tight**: it starts, with a warning. Below that is **Won't fit**. The context slider's maximum uses the same floor. In the tight range `mem_fraction_static` shrinks the runtime reserve first, down to the lean one.
+* **The fraction is taken of free memory, not of the card.** SGLang keeps `free at start × (1 − fraction)` as its runtime reserve. We used to divide by the card's total, so memory other programs held was subtracted twice: with 3 GiB taken by another process, a 2.8 GiB reserve became 6.2 GiB and the 14B model got a 14.9k-token KV cache for a 32k context, with 4 GB idle (the same effect left the split 27B run short). Fixed: 34.2k tokens in the same test.
+* **Verified at the bottom of the tight range** (3090, a filler process holding 3 GiB, Qwen2.5-Coder-14B-AWQ at 32k: 18.7 GiB free against 20.7 comfortable and 18.5 least): it loaded, served a 31.4k-token prompt, a 700-token generation and two 23k-token prompts at once, with no out-of-memory error; about 0.5 GB stayed free.
+* **Notifications** (`lib/notify.svelte.ts`, `Notifications.svelte`, mounted in `App.svelte`): what the Server page has to say sits in a stack at the top right of the window, over the page instead of inside it. Before, up to seven banners sat around the power button; each moved the page as it came and went, and a closed one came back when its text changed (free VRAM, a download's percentage) or the page was opened again. A **condition** (a member lacks the model, with its Download button; a member is downloading; GPU memory almost full) has one id, updates in place, has no close button and leaves when the state does. A hint or an error (model selected, "follow it in Logs", a failed action, the context note) can be closed. Leaving the page takes its notes along. Why a start is blocked stays where it was, under the headline. The context slider's "would run out of VRAM, so the slider stops there" is plain text now: its close button did nothing while the slider sat at the limit. Rendered in a harness page in both themes (a condition, one with an action, an error, a hint, text changing every 300 ms without the note moving); not yet seen in the running app, and the other pages' own error banners (`Notice.svelte`) are unchanged.
+* **Force load:** when not enough VRAM is the only failing check, the Server page shows a checkbox ("Force load. I understand it may fail to load, or crash when it runs out of GPU memory…"); ticking it enables the power button (`start_server` with `force`, `server::start_with`; `oppxs start --force`). It starts with the lean reserve and gives SGLang the rest (`vram::mem_fraction_forced`); the gateway then reports whatever context the KV cache holds. Every other check still blocks. The tick lives in `nav.svelte.ts` (`forceLoad`), so it survives a visit to another page; it is dropped once the checks no longer ask for it. While ticked, the VRAM messages (the line under the headline, the pre-flight row, the bar and the slider's "doesn't fit" note) are amber instead of red. Ticking it also sets the context window to the longest the model fits right now (`get_context_limit`), or the 2k minimum when none does, with a notice; if the model then fits, the checkbox goes away and Start is simply enabled. Unticking puts the earlier window back.
+
+**Closing the app stops the server** (`shutdown` in the app, on `RunEvent::Exit`): the backend and SearXNG it manages are stopped and the split orders withdrawn, so nothing keeps the GPU's memory without a window to stop it from. Ctrl-C, `kill` and logging out (SIGINT, SIGTERM, SIGHUP) are turned into a normal exit first. A member's app also stops its split worker (`Cluster::goodbye`, which `oppxs` runs on Ctrl-C and SIGTERM too). Two exceptions: a backend started by hand ("running outside the app") is left alone, and an update's relaunch keeps the backend for the new copy to adopt. An app that crashes or gets `kill -9` can't run any of this, so the gateway has a **watchdog**: the app sets `APP_WATCHDOG_S=60` on every backend it starts, the gateway notes each authenticated admin call (the app polls every 2 s), and after 60 s without one it stops the container ("No OpenPhalanx app has checked in for 61 s…" in the log). Verified with the gateway alone: stopped 16 s after start with nobody polling at a 15 s limit; stayed up through 40 s of polling, then stopped 17 s after the last call.
+
+### 4. Updates
+
+At launch the app asks GitHub for the latest release (`app_update.rs` in core; quiet when offline). If it's newer, a dialog offers to download it; **Check for updates** under the version in the sidebar asks again.
+
+* **How it installs** depends on how the app was installed (`Install::detect`):
+  * AppImage (`$APPIMAGE`): the new AppImage is downloaded next to it and renamed over it.
+  * .deb (the binary belongs to a package, `dpkg-query -S`): `pkexec apt-get install` on the downloaded file, so the system asks for the password. The file is downloaded as `/tmp/openphalanx-update/<asset name>` (`download_path`): apt accepts a file on its command line only when the name ends in `.deb`, and the first version passed `.Openphalanx_0.6.1_amd64.deb.download`, so every package update failed with "E: Unsupported file … given on commandline". Reproduced and checked with `apt-get -s install` on the real 0.6.1 package (old name refused; new name "Inst openphalanx [0.6.0] (0.6.1 local-deb)"); the password prompt and relaunch after it still haven't been run.
+  * Built from source or `tauri dev`: the dialog says to `git pull` and rebuild, with no install button.
+* **Links** (GitHub in the sidebar, What's new, View on Hugging Face) go through `openLink` (`lib/api.ts`). The opener permission needs a URL scope: `capabilities/default.json` allows `https://github.com/*` and `https://huggingface.co/*`. With `opener:allow-open-url` alone every link was refused without a message, so none of them ever worked; a refusal now shows as an error. Not yet clicked in a running app.
+* **Checked before anything changes:** the download must match its line in the release's `SHA256SUMS` (the same trust model as `oppx --update`: GitHub over TLS). Tauri's updater plugin would add signatures, but needs a signing key in CI and a `latest.json` per release.
+* **Relaunch:** a detached `sh -c 'sleep 2; exec <app>'` starts the new copy after this one exits (Tauri's `restart()` starts it first, and both would bind the cluster port). The backend container keeps running and the new app adopts it, a split run included (`workers.json`).
+* **To test:** build an AppImage from a copy with the version lowered (`Cargo.toml`, `tauri.conf.json`, `package.json`), run it, and update to the latest release.

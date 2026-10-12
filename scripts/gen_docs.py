@@ -13,7 +13,8 @@ Pages:
   binary itself, so it can't drift from the code.
 * Gateway API reference: every route in docker/server/gateway.py with its
   method, authentication and docstring (read with `ast`; no imports needed).
-* Operations and development: CLAUDE.md.
+* Operations and development: CLAUDE.md (the index), with one page per topic
+  file under .claude/skills/.
 * Changelog: CHANGELOG.md (written by scripts/bump_version.py).
 """
 
@@ -101,12 +102,26 @@ def main():
     copy("README.md", "introduction.md", "Openphalanx")
     (src / "cli.md").write_text(cli_reference(args.oppx))
     (src / "api.md").write_text(api_reference(ROOT / "docker/server/gateway.py"))
-    copy("CLAUDE.md", "development.md", "Operations and development")
+    # CLAUDE.md is the index; each topic's notes are a page of their own under it.
+    topics = []
+    for skill in sorted((ROOT / ".claude/skills").glob("*/SKILL.md")):
+        text = skill.read_text()
+        if text.startswith("---"):
+            text = text.split("---", 2)[2].lstrip()  # the frontmatter is for the agent, not the reader
+        title = next((line[2:].strip() for line in text.splitlines() if line.startswith("# ")), skill.parent.name)
+        (src / f"topic-{skill.parent.name}.md").write_text(text)
+        topics.append((skill.parent.name, title))
+    index = (ROOT / "CLAUDE.md").read_text() if (ROOT / "CLAUDE.md").exists() else "# Operations and development\n\nNothing yet.\n"
+    for name, _ in topics:
+        index = index.replace(f"(.claude/skills/{name}/SKILL.md)", f"(topic-{name}.md)")
+    (src / "development.md").write_text(index)
     copy("CHANGELOG.md", "changelog.md", "Changelog")
     (src / "SUMMARY.md").write_text(
         "# Summary\n\n[Introduction](introduction.md)\n\n"
         "- [Client CLI reference](cli.md)\n- [Gateway API reference](api.md)\n"
-        "- [Operations and development](development.md)\n- [Changelog](changelog.md)\n"
+        "- [Operations and development](development.md)\n"
+        + "".join(f"  - [{title}](topic-{name}.md)\n" for name, title in topics)
+        + "- [Changelog](changelog.md)\n"
     )
     (out / "book.toml").write_text(
         '[book]\ntitle = "Openphalanx"\nauthors = ["Openphalanx contributors"]\nlanguage = "en"\nsrc = "src"\n\n'
