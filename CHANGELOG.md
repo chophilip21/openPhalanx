@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.7.4 (2026-10-12)
+
+### Fixes
+
+- Problem reports after a crash, the port conflict as an alert, and a time limit on nvidia-smi (#15)
+
 ## v0.7.3 (2026-10-12)
 
 ### Fixes
