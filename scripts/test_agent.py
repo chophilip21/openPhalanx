@@ -25,6 +25,11 @@ try:  # edits are applied with Aider's matcher; CI runs without it
 except ImportError:
     HAVE_AIDER = False
 needs_aider = unittest.skipUnless(HAVE_AIDER, "needs aider-chat (run with the oppx engine's Python)")
+try:  # the terminal module draws with rich, which CI doesn't install either
+    import rich  # noqa: F401
+    HAVE_RICH = True
+except ImportError:
+    HAVE_RICH = False
 
 
 class Scripted:
@@ -554,6 +559,7 @@ class FollowUps(Repo):
 
     BLOCK = "src/calc.py\n<<<<<<< SEARCH\nLIMIT = 3\n=======\nLIMIT = 4\n>>>>>>> REPLACE"
 
+    @needs_aider
     def test_a_change_not_made_stays_owed_until_it_is_made(self):
         s = self.s
         s.actions = [{"tool": "read", "path": "src/calc.py"}, {"tool": "answer"}, {"tool": "answer"}, {"tool": "answer"}]
@@ -878,6 +884,7 @@ class EditText(Repo):
         self.assertIsNone(A.misplaced_lookup('{"x": 1}'))
 
 
+@unittest.skipUnless(HAVE_RICH, "needs rich (run with the oppx engine's Python)")
 class TypeAhead(unittest.TestCase):
     """What is typed while a turn runs: kept, queued on Enter, and shown on the spinner's line."""
 
