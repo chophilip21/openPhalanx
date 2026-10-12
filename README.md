@@ -88,6 +88,12 @@ Edits are never committed: review them with `git diff` and commit yourself. `opp
 
 **Shift+Tab** plan mode (no edits) · **Esc** interrupt · **Ctrl-C** twice exits · **@file** add a file · **!cmd** run a command · **# note** save to project memory · **/help** all commands
 
+## Project notes
+
+`oppx` reads `OPENPHALANX.md` from the root of your repository at the start of every chat and follows it, like `CLAUDE.md` in Claude Code. Put there what it should always know: how to build and test, the layout, your conventions. `OPPX.md` and `AGENTS.md` are read too if they exist.
+
+**/init** writes the file for you from the repository · **/memory** opens it in your editor · **# note** adds a line to it
+
 ## Connect tools with MCP
 
 Connectors are [MCP](https://modelcontextprotocol.io) servers whose tools the agent can call, such as Linear, GitHub or a database. They run on your laptop with your own credentials; the server never sees them, and you approve each call (`y`, `N`, or `a` for always this session).

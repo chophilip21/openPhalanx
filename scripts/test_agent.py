@@ -25,6 +25,11 @@ try:  # edits are applied with Aider's matcher; CI runs without it
 except ImportError:
     HAVE_AIDER = False
 needs_aider = unittest.skipUnless(HAVE_AIDER, "needs aider-chat (run with the oppx engine's Python)")
+try:  # the terminal module draws with rich, which CI doesn't install either
+    import rich  # noqa: F401
+    HAVE_RICH = True
+except ImportError:
+    HAVE_RICH = False
 
 
 class Scripted:
@@ -58,7 +63,9 @@ class Scripted:
         ag._action, ag._text_once = action, text_once
 
 
-class AgentLoop(unittest.TestCase):
+class Repo(unittest.TestCase):
+    """A small repository and an agent with a scripted model on it."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
@@ -74,6 +81,8 @@ class AgentLoop(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+
+class AgentLoop(Repo):
     def test_a_json_reply_is_never_shown(self):
         s = self.s
         s.actions = [{"tool": "read", "path": "src/calc.py"}, {"tool": "answer"}]
@@ -542,6 +551,379 @@ class AgentLoop(unittest.TestCase):
         self.assertEqual(bodies[0]["stop"], ["\n\n"])
         self.assertEqual(bodies[0]["temperature"], 0)
         self.assertEqual(bodies[1]["temperature"], 0.7)
+
+
+class FollowUps(Repo):
+    """A message is read with what came before it: a confirmation, a reply that
+    announced a change, a command that keeps failing the same way."""
+
+    BLOCK = "src/calc.py\n<<<<<<< SEARCH\nLIMIT = 3\n=======\nLIMIT = 4\n>>>>>>> REPLACE"
+
+    @needs_aider
+    def test_a_change_not_made_stays_owed_until_it_is_made(self):
+        s = self.s
+        s.actions = [{"tool": "read", "path": "src/calc.py"}, {"tool": "answer"}, {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = ["Nothing was changed: I got stuck."]
+        s.agent.turn("make the limit bigger", can_edit=True, wants_change=True)
+        self.assertEqual(s.agent.pending, "make the limit bigger")
+        self.assertEqual(s.agent.last_reply(), "Nothing was changed: I got stuck.")
+        # A question in between doesn't forget it...
+        s.texts = ["It is 3."]
+        s.agent.turn("what is the limit now?", can_edit=True, wants_change=False)
+        self.assertEqual(s.agent.pending, "make the limit bigger")
+        # ...and the turn that makes the change settles it. The follow-up's own words don't replace the request.
+        edit = {"tool": "edit", "path": "src/calc.py"}
+        s.actions = [edit, edit, {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = ["Plan: change LIMIT in src/calc.py.", self.BLOCK, "LIMIT is now 4 (not verified)."]
+        s.agent.turn("yes, go ahead.", can_edit=True, wants_change=True)
+        self.assertIn("LIMIT = 4", (self.root / "src/calc.py").read_text())
+        self.assertEqual(s.agent.pending, "")
+
+    def test_a_change_owed_is_forgotten_after_a_few_other_turns_and_on_clear(self):
+        s = self.s
+        s.agent.turn("make the limit bigger", can_edit=True, wants_change=True)
+        self.assertTrue(s.agent.pending)
+        for _ in range(A.PENDING_TURNS):
+            s.agent.turn("what does add do?", can_edit=True, wants_change=False)
+        self.assertEqual(s.agent.pending, "")
+        s.agent.turn("make the limit bigger", can_edit=True, wants_change=True)
+        s.agent.reset()
+        self.assertEqual(s.agent.pending, "")
+        # Plan mode asks for nothing to be changed, so nothing is owed.
+        s.agent.turn("make the limit bigger", can_edit=False, wants_change=True)
+        self.assertEqual(s.agent.pending, "")
+
+    @needs_aider
+    def test_a_reply_that_announces_a_change_is_held_to_it(self):
+        s = self.s
+        offered, heard = [], []
+        action = s.agent._action
+        s.agent._action = lambda tools: offered.append(tools) or action(tools)
+        s.agent.hooks.announces = lambda reply: heard.append(reply) or "Now I'll" in reply
+        edit = {"tool": "edit", "path": "src/calc.py"}
+        # The message read as a question, the model answered "Now I'll change it" and stopped.
+        s.actions = [{"tool": "read", "path": "src/calc.py"}, {"tool": "answer"}, edit, edit, {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = ["The limit is 3. Now I'll change it to 4.", "Plan: change LIMIT in src/calc.py.", self.BLOCK,
+                   "LIMIT is now 4 (not verified)."]
+        reply = s.agent.turn("are you having trouble?", can_edit=True, wants_change=False)
+        self.assertEqual(heard, ["The limit is 3. Now I'll change it to 4."])
+        self.assertEqual(set(offered[2]), {"edit", "create", "run", "start"}, "the step after the announcement only acts")
+        self.assertIn("LIMIT = 4", (self.root / "src/calc.py").read_text())
+        self.assertEqual(reply, "LIMIT is now 4 (not verified).")
+        self.assertEqual(s.shown, ["The limit is 3. Now I'll change it to 4.", reply], "both were shown, in order")
+        self.assertFalse(any(m["content"] == A.ASK_EDIT_CHECK for m in s.agent.messages), "it said so itself: no second check")
+
+    def test_an_offer_or_an_answer_ends_the_turn(self):
+        s = self.s
+        s.agent.hooks.announces = lambda reply: False  # "Want me to change it?" is not an announcement
+        s.actions = [{"tool": "read", "path": "src/calc.py"}, {"tool": "answer"}]
+        s.texts = ["The limit is 3. Want me to change it to 4?"]
+        reply = s.agent.turn("what is the limit?", can_edit=True, wants_change=False)
+        self.assertEqual(s.shown, [reply])
+        self.assertEqual(s.agent.pending, "", "nothing was asked for, so nothing is owed")
+
+    def test_an_announcement_is_followed_up_once_and_never_without_edit_tools(self):
+        s = self.s
+        asked = []
+        s.agent.hooks.announces = lambda reply: asked.append(reply) or True
+        # It announces, is given a step to act, and answers again: that reply stands.
+        s.actions = [{"tool": "answer"}, {"tool": "answer"}]
+        s.texts = ["Let me make the changes now.", "Nothing was changed: I don't know which file."]
+        reply = s.agent.turn("hm?", can_edit=True, wants_change=False)
+        self.assertEqual(reply, "Nothing was changed: I don't know which file.")
+        self.assertEqual(len(asked), 1)
+        self.assertIn("you made none", s.prompts[-1][0], "the second reply is written with the facts")
+        self.assertEqual(s.agent.pending, "hm?", "and the change it announced is owed")
+        # Plan mode: no edit tools, so nothing to hold it to.
+        s2 = Scripted(str(self.root))
+        s2.agent.hooks.announces = lambda reply: asked.append("plan") or True
+        s2.texts = ["Let me make the changes now."]
+        s2.agent.turn("hm?", can_edit=False)
+        self.assertNotIn("plan", asked)
+
+    @needs_aider
+    def test_a_command_that_failed_twice_is_not_run_again_because_another_one_worked(self):
+        s = self.s
+        ran = []
+        s.agent.hooks.confirm_run = lambda c: ran.append(c) or True
+        bad = {"tool": "run", "command": "python3 -c 'import sys; sys.exit(1)'"}
+        ok = {"tool": "run", "command": "true"}
+        s.actions = [dict(bad), dict(ok), dict(bad), dict(ok), dict(bad)]
+        s.agent.turn("check the api", can_edit=False)
+        # Failed, another command worked, failed again the same way: the third time it is refused
+        # (a `print(keys)` in between had let a broken one-liner run again and again).
+        self.assertEqual(ran, [bad["command"], "true", bad["command"], "true"])
+        refused = [m["content"] for m in s.agent.messages if "character for character" in m["content"]]
+        self.assertEqual(len(refused), 1)
+
+    @needs_aider
+    def test_the_action_after_a_refused_repeat_is_sampled(self):
+        s = self.s
+        sampled = []
+        action = s.agent._action
+        s.agent._action = lambda tools: sampled.append(getattr(s.agent, "_sample", False)) or action(tools)
+        s.agent.hooks.confirm_run = lambda c: True
+        bad = {"tool": "run", "command": "python3 -c 'import sys; sys.exit(1)'"}
+        s.actions = [dict(bad), dict(bad), {"tool": "run", "command": "true"}, {"tool": "answer"}]
+        s.agent.turn("check the api", can_edit=False)
+        self.assertEqual(sampled, [False, False, True, False], "only the call right after the refusal")
+
+    @needs_aider
+    def test_stuck_on_one_failing_command_says_no_fix_was_ever_sent(self):
+        s = self.s
+        s.agent.hooks.confirm_run = lambda c: True
+        bad = {"tool": "run", "command": "python3 -c 'import sys; sys.exit(1)'"}
+        s.actions = [dict(bad)] * 6
+        s.texts = ["I need data['hits'][0].", "I got stuck."]
+        s.agent.turn("check the api", can_edit=False)
+        self.assertIn("same failing command without changing it", s.agent.stuck)
+        self.assertIn("No corrected command was ever sent", s.prompts[-1][0])
+
+    @needs_aider
+    def test_a_page_nobody_looked_at_is_said_and_the_browser_is_offered(self):
+        (self.root / "src/App.jsx").write_text("export const LIMIT = 3\n")
+        block = "src/App.jsx\n<<<<<<< SEARCH\nexport const LIMIT = 3\n=======\nexport const LIMIT = 4\n>>>>>>> REPLACE"
+        edit = {"tool": "edit", "path": "src/App.jsx"}
+
+        def run(browser):
+            (self.root / "src/App.jsx").write_text("export const LIMIT = 3\n")
+            s = Scripted(str(self.root))
+            s.agent.browser = browser
+            s.agent.hooks.confirm_run = lambda c: True
+            s.actions = [dict(edit), {"tool": "run", "command": "true"}, {"tool": "answer"}, {"tool": "answer"}]
+            s.texts = [block, "Done; lint passes."]
+            s.agent.turn("make the limit 4 in src/App.jsx", can_edit=True)
+            nudges = [m["content"] for m in s.agent.messages if "shows in a web page" in m["content"]]
+            return nudges, s.prompts[-1][0]
+
+        nudges, facts = run("offer")
+        self.assertEqual(len(nudges), 1)
+        self.assertIn("choose the browser action", nudges[0])
+        self.assertIn("not checked in a browser", facts)
+        self.assertIn("headless browser", facts, "the user may not know it is there")
+        nudges, facts = run("declined")  # they said no: say it wasn't seen, don't offer again
+        self.assertEqual(nudges, [])
+        self.assertIn("not checked in a browser", facts)
+        self.assertNotIn("headless browser", facts)
+        # A change that no page shows: nothing about browsers.
+        s = self.s
+        s.agent.browser = "offer"
+        s.actions = [{"tool": "edit", "path": "src/calc.py"}, {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = [self.BLOCK, "Done."]
+        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
+        self.assertNotIn("browser", s.prompts[-1][0])
+
+    def test_the_intent_check_reads_a_follow_up_with_what_came_before(self):
+        from oppx_chat import routing as R
+        self.assertEqual(R.intent_input("add a test"), "add a test", "a first message goes as it is")
+        text = R.intent_input("yes, go ahead.", "…the field is created_at.\n\nWant me to add   the dropdown?", "add a sort dropdown")
+        self.assertEqual(text.split("\n"), ["Change asked for earlier, not made yet: add a sort dropdown",
+                                           "Assistant's last reply: …the field is created_at. Want me to add the dropdown?",
+                                           "Message: yes, go ahead."])
+        long = R.intent_input("ok", "x" * 5000 + " Shall I?")
+        self.assertLess(len(long), R.CONTEXT_CHARS + 60)
+        self.assertIn("Shall I?", long, "the end of the reply is what is kept")
+        seen = []
+        R.ask_choice = lambda system, text, choices, trace=None: seen.append((system, text, choices)) or None
+        self.assertTrue(R.wants_edit("yes", None, "Want me to?", ""), "no answer from the model: assume a change")
+        self.assertIn("Assistant's last reply: Want me to?", seen[0][1])
+        self.assertFalse(R.announces_change("Let me fix that."), "no answer from the model: nothing is forced")
+        self.assertEqual(seen[1][2], ("yes", "no"))
+
+
+class ConfirmedGaps(Repo):
+    """CHO-10: gaps that were checked against the code and closed."""
+
+    BLOCK = FollowUps.BLOCK
+
+    @needs_aider
+    def test_an_edit_to_a_file_that_changed_on_disk_is_refused_until_it_is_read_again(self):
+        s = self.s
+        calc = self.root / "src/calc.py"
+        read, edit = {"tool": "read", "path": "src/calc.py"}, {"tool": "edit", "path": "src/calc.py"}
+        texts = []
+
+        def someone_else_saves(tools):  # the user's editor, between the read and the edit
+            act = dict(actions.pop(0)) if actions else {"tool": "answer"}
+            if act["tool"] == "edit" and not texts:
+                calc.write_text(calc.read_text() + "\n# added by the user\n")
+                texts.append("saved")
+            return act if act["tool"] in tools else {"tool": "answer"}
+
+        actions = [dict(read), dict(edit), dict(read), dict(edit), {"tool": "answer"}, {"tool": "answer"}]
+        s.agent._action = someone_else_saves
+        s.texts = [self.BLOCK, "LIMIT is now 4 (not verified)."]
+        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
+        refused = [m["content"] for m in s.agent.messages if "has changed on disk since you read it" in m["content"]]
+        self.assertEqual(len(refused), 1)
+        self.assertIn("Nothing was changed", refused[0])
+        text = calc.read_text()
+        self.assertIn("LIMIT = 4", text, "after the read it asked for, the edit went in")
+        self.assertIn("# added by the user", text, "and the user's line is still there")
+        # Its own edit doesn't count as a change by someone else: a second edit needs no new read.
+        s.agent._action = Scripted(str(self.root)).agent._action  # (unused; the next turn scripts its own)
+        s2 = Scripted(str(self.root))
+        s2.actions = [dict(read), dict(edit), dict(edit), {"tool": "answer"}, {"tool": "answer"}]
+        s2.texts = [self.BLOCK.replace("LIMIT = 3", "LIMIT = 4").replace("=======\nLIMIT = 4", "=======\nLIMIT = 5"),
+                    self.BLOCK.replace("LIMIT = 3", "LIMIT = 5").replace("=======\nLIMIT = 4", "=======\nLIMIT = 6"), "Done."]
+        s2.agent.turn("make the limit 6 in src/calc.py", can_edit=True)
+        self.assertIn("LIMIT = 6", calc.read_text())
+        self.assertFalse(any("changed on disk" in m["content"] for m in s2.agent.messages))
+
+    def test_replacing_a_whole_file_that_changed_on_disk_is_refused_too(self):
+        s = self.s
+        calc = self.root / "src/calc.py"
+        s.agent.ws.read("src/calc.py", None, None)
+        calc.write_text("LIMIT = 99\n")
+        with self.assertRaises(A.ToolError) as e:
+            s.agent.ws.check_current(calc)
+        self.assertIn("Read it again", str(e.exception))
+        s.agent.ws.read("src/calc.py", None, None)
+        s.agent.ws.check_current(calc)  # read again: fine
+        s.agent.ws.check_current(self.root / "src/other.py")  # never read: nothing to compare with
+
+    def test_the_question_knows_a_command_will_be_left_running(self):
+        s = self.s
+        asked = []
+        s.agent.hooks.confirm_run = lambda c: asked.append((s.agent.asking, c)) or False
+        s.actions = [{"tool": "start", "command": "npm run dev"}, {"tool": "run", "command": "npm test"}]
+        s.agent.turn("start the dev server and run the tests", can_edit=False)
+        self.assertEqual(asked, [("start", "npm run dev"), ("run", "npm test")])
+
+    def test_a_plan_right_after_a_plan_is_refused(self):
+        s = self.s
+        s.actions = [{"tool": "plan"}, {"tool": "plan"}, {"tool": "read", "path": "src/calc.py"}, {"tool": "plan"}]
+        s.texts = ["Plan A.", "Plan B.", "It is 3."]
+        s.agent.turn("what is the limit, and why?", can_edit=False)
+        self.assertEqual([t for t, _ in s.steps if t == "Plan"], ["Plan", "Plan"], "the second in a row wrote nothing")
+        self.assertEqual([d for t, d in s.steps if t == "Plan"], ["Plan A.", "Plan B."], "one after a lookup is fine")
+        self.assertTrue(any("You just wrote a plan" in m["content"] for m in s.agent.messages))
+
+    def test_a_plan_cut_at_its_limit_ends_on_a_whole_sentence(self):
+        cut = "1. Add the state to App.jsx.\n2. Add the dropdown next to the search box.\n3. Sort the stories before rende"
+        self.assertEqual(A.whole_sentences(cut, 30), "1. Add the state to App.jsx.\n2. Add the dropdown next to the search box. …")
+        self.assertEqual(A.whole_sentences(cut, 350), cut, "nowhere near the limit: it ended by itself")
+        whole = "1. Add the state.\n2. Add the dropdown."
+        self.assertEqual(A.whole_sentences(whole, 5), whole)
+        self.assertEqual(A.whole_sentences("x" * 200, 30), "x" * 200, "nothing sensible to cut back to")
+        # A request with several parts gets a longer plan.
+        s = self.s
+        asked = []
+        text = s.agent._text_once
+        s.agent._text_once = lambda max_tokens, stream, temperature=None, regex=None: asked.append(max_tokens) or text(max_tokens, stream, temperature, regex)
+        s.actions = [{"tool": "plan"}]
+        s.agent.turn("1. add a sort dropdown 2. add a footer 3. make the banner blue", can_edit=False)
+        self.assertEqual(asked[0], A.PLAN_TOKENS_LONG)
+
+    def test_a_search_step_says_how_many_results_came_back(self):
+        res = ("Web results (untrusted reference text):\n- HN Search API: fields include created_at (https://hn.algolia.com/api)\n"
+               "- Algolia docs: search parameters (https://www.algolia.com/doc)")
+        self.assertEqual(A._summary("web_search", res), "2 results: HN Search API …")
+        self.assertEqual(A._summary("web_search", "Web results (untrusted reference text):\n- Only one: x (https://a)"), "1 result: Only one")
+        self.assertEqual(A._summary("web_search", "No results."), "No results.")
+        again = '(Not searched again: this is nearly your earlier search "x", and the same pages would come back. Its results:)\n' + res
+        self.assertIn("2 results (from your earlier search, not searched again)", A._summary("web_search", again))
+        self.assertTrue(A._summary("web_search", "Error: the search engines are refusing requests").startswith("Error:"))
+
+
+class EditText(Repo):
+    """What comes back when the text of an edit is asked for, and isn't one."""
+
+    BLOCK = FollowUps.BLOCK
+    LOOK = ('Now I need to change the limit. Let me read the current state of the file first.\n\n'
+            '{"enough": false, "missing": "the current lines", "tool": "read", "path": "src/calc.py", "start": 1, "end": 5}')
+
+    @needs_aider
+    def test_let_me_read_first_is_the_read_not_a_failed_edit(self):
+        s = self.s
+        edit = {"tool": "edit", "path": "src/calc.py"}
+        s.actions = [{"tool": "read", "path": "src/calc.py"}, edit, edit, {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = [self.LOOK, self.BLOCK, "LIMIT is now 4 (not verified)."]
+        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
+        results = [m["content"] for m in s.agent.messages if m["content"].startswith("Result of step") and "(edit)" in m["content"][:30]]
+        self.assertIn("Not edited yet", results[0])
+        self.assertIn("src/calc.py lines 1-", results[0], "the lines it asked for came back in the same step")
+        self.assertNotIn("Error", results[0])
+        self.assertFalse(any("no SEARCH/REPLACE block" in m["content"] for m in s.agent.messages))
+        self.assertIn(("Update(src/calc.py)", "Not edited yet: it looked at that first"), s.steps)
+        self.assertIn("LIMIT = 4", (self.root / "src/calc.py").read_text(), "and the next edit went in")
+        self.assertNotIn("An edit you tried was refused", s.prompts[-1][0])
+        self.assertEqual(s.agent.changed_session, ["src/calc.py"])
+
+    @needs_aider
+    def test_looking_first_is_not_a_change(self):
+        s = self.s
+        s.actions = [{"tool": "read", "path": "src/calc.py"}, {"tool": "edit", "path": "src/calc.py"}, {"tool": "answer"},
+                     {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = [self.LOOK, "Nothing was changed."]
+        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
+        self.assertEqual(s.agent.changed_session, [])
+        self.assertIn("Files you changed in this request: none", s.prompts[-1][0])
+        self.assertTrue(s.agent.pending, "the change is still owed")
+
+    @needs_aider
+    def test_other_text_without_a_block_is_still_an_error(self):
+        s = self.s
+        s.actions = [{"tool": "read", "path": "src/calc.py"}, {"tool": "edit", "path": "src/calc.py"}]
+        s.texts = ['I will change it.\n{"enough": true, "tool": "answer"}']  # not a lookup: nothing to run instead
+        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
+        self.assertTrue(any("no SEARCH/REPLACE block" in m["content"] for m in s.agent.messages))
+
+    def test_a_new_file_is_never_a_sentence_and_an_action(self):
+        s = self.s
+        look = 'Let me check the folder first.\n{"enough": false, "missing": "what is there", "tool": "list", "path": "src"}'
+        s.actions = [{"tool": "create", "path": "src/new.py"}] * 4  # the first one is answered with a plan
+        s.texts = ["Plan: create src/new.py.", look, 'I am done.\n{"enough": true, "tool": "answer"}', "```python\nX = 1\n```"]
+        s.agent.turn("create src/new.py with X = 1", can_edit=True)
+        results = [m["content"] for m in s.agent.messages if m["content"].startswith("Result of step") and "(create)" in m["content"][:32]]
+        self.assertIn("Not edited yet", results[0])
+        self.assertIn("calc.py", results[0], "the listing it asked for")
+        self.assertIn("not the file's content", results[1])
+        self.assertEqual((self.root / "src/new.py").read_text(), "X = 1\n", "only the real content was written")
+        self.assertIsNone(A.misplaced_lookup("src/calc.py\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE"))
+        self.assertIsNone(A.misplaced_lookup('{"x": 1}'))
+
+
+@unittest.skipUnless(HAVE_RICH, "needs rich (run with the oppx engine's Python)")
+class TypeAhead(unittest.TestCase):
+    """What is typed while a turn runs: kept, queued on Enter, and shown on the spinner's line."""
+
+    def setUp(self):
+        from oppx_chat import term
+        self.T = term
+        term.UI.queued, term.UI.prefill, term.UI.unannounced = [], "", []
+
+    tearDown = setUp
+
+    def test_typing_is_kept_and_enter_queues_it(self):
+        T = self.T
+        w = T.EscWatcher()
+        w._typed("fix the tpyo")
+        self.assertEqual(T.UI.prefill, "fix the tpyo")
+        w._typed("\x17typo\x7f\x7fpo too\r")  # Ctrl-W, two backspaces, Enter
+        self.assertEqual((T.UI.queued, T.UI.prefill), (["fix the typo too"], ""))
+        self.assertEqual(T.UI.unannounced, ["fix the typo too"], "to be shown as queued")
+        w._typed("\r  \r")  # an empty line queues nothing
+        self.assertEqual(len(T.UI.queued), 1)
+        w._typed("half a tho\x15and then")  # Ctrl-U
+        self.assertEqual(T.UI.prefill, "and then", "left for the next prompt")
+        # A character cut in two by the read is not lost.
+        euro = "€".encode()
+        self.assertEqual(w._decode(euro[:1]) + w._decode(euro[1:]), "€")
+
+    def test_the_spinner_line_shows_it_and_never_wraps(self):
+        T = self.T
+        base = "(12s · esc to interrupt"
+        self.assertEqual(T.ahead(base, "", 0, 100), (base + " · type to queue a message)", ""))
+        self.assertEqual(T.ahead(base, "also add a footer", 0, 100), (base + ")", "also add a footer"))
+        self.assertEqual(T.ahead(base, "", 2, 100), (base + " · 2 queued)", ""))
+        for width in (120, 80, 60, 40, 20, 8):
+            for typed in ("", "x" * 300, "宽字符" * 40):
+                status, shown = T.ahead(base, typed, 3, width)
+                used = T.cell_len(status) + (T.cell_len(shown) + 5 if shown else 0)
+                self.assertLessEqual(used, max(width - 2, 1), (width, typed[:5]))
+        status, shown = T.ahead(base, "the end is what matters", 0, 50)
+        self.assertTrue(shown.startswith("…") and shown.endswith("matters"), "the end of the line is what is being typed")
 
 
 class Tools(unittest.TestCase):

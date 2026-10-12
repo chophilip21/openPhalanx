@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import atexit
 import difflib
+import hashlib
 import os
 import re
 import shutil
@@ -184,7 +185,14 @@ RETHINK_PROMPT = ("You are going in circles. Your actions this turn:\n{trail}\n\
 CHECKPOINT_PROMPT = ("You have taken {n} steps. Stop and take stock, in plain text (no JSON), at most 3 short lines: what "
                      "have you established so far (path:line)? Does that answer the user's request? If yes, say "
                      "\"enough\". If not, name the one thing still missing and the single action that gets it.")
+# An edit was chosen, and its text said "let me read first": the lookup ran instead.
+LOOKED_FIRST = "Not edited yet: you said you need to look at something first, so that was done. Now make the edit. "
+WROTE = ("Edited ", "Created ", "Replaced ")  # how the result of a change that was really written begins
 CHECK_EVERY = 10
+PENDING_TURNS = 3  # a change still owed is forgotten after this many turns about something else
+RETRY_TEMPERATURE = 0.7  # after a refused repeat: at 0 the same prompt gives the same action again
+# Files that show in a page: a lint or a build doesn't say whether the change works there.
+PAGE_FILES = (".jsx", ".tsx", ".vue", ".svelte", ".html", ".htm", ".css", ".scss", ".sass", ".less", ".astro")
 SWEEP = 3  # the same pattern grepped in this many places in a row is a sweep
 EDIT_PLAN_PROMPT = ("Before the first edit, write the plan for this change in plain text (no JSON), one short line per "
                     "edit: the file and function, and what changes there, in the order you will make them. Include "
@@ -195,6 +203,7 @@ ASK_EDIT_CHECK = ("The user's latest message reads as a question, and you are ab
                   "again; otherwise choose answer.")
 MAX_PLANS = 2
 THINK_TOKENS = 350  # a plan or a stock-take; the model writes ~36 tokens a second
+PLAN_TOKENS_LONG = 600  # a plan for a request with several parts: 350 cut it in the middle of a sentence
 # Before the reply to a request with several parts: each part against what
 # really changed. Asked for five changes, Qwen3.6 reported "front page by
 # default" as done in 4 of 5 runs with the request to the API untouched, though
@@ -310,11 +319,38 @@ def mcp_kind(kind: str) -> str:
     return KINDS.get(kind, KINDS["other"])
 
 
+def whole_sentences(text: str, tokens: int) -> str:
+    """A text that ran into its token limit, cut back to where its last
+    complete line or sentence ends, so a plan doesn't stop in the middle of a
+    word. Left as it is when it ended by itself, or when little would remain."""
+    body = text.rstrip()
+    if len(body) < tokens * 2.5 or body.endswith((".", "!", "?", ":", ")", "`", "]", '"')):
+        return text  # well under the limit (a token is 3 to 4 characters), or it ends cleanly
+    # The end of a line, or of a sentence (a full stop after a word, not the "3." of a list).
+    ends = [m.end() for m in re.finditer(r"(?<=[^\W\d])[.!?](?=\s)|\n", body)]
+    cut = ends[-1] if ends else 0
+    return body[:cut].rstrip() + " …" if cut >= len(body) // 2 else text
+
+
 def several_parts(text: str) -> bool:
     """A request that asks for several things: numbered or bulleted items, or
     simply a long one. Those get a review of each part before the reply."""
     items = re.findall(r"(?:^|[\s:;])(?:\d{1,2}[.)]|[-*•])\s+\S", text)
     return len(items) >= 2 or len(text) >= 400
+
+
+def misplaced_lookup(text: str) -> dict | None:
+    """Asked for the text of an edit, a model sometimes writes that it has to
+    look at something first, and the action for that ("Let me read the current
+    state of the file first." then a read as JSON). That action, when it is a
+    lookup; None for anything else."""
+    lines = text.rstrip().splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].lstrip().startswith(("{", "```")):
+            act = as_action("\n".join(lines[i:]))
+            if act is not None:
+                return act if act.get("tool") in LOOKUPS else None
+    return None
 
 
 def strip_action(text: str) -> str:
@@ -377,6 +413,9 @@ class Hooks:
     # The model asked for the browser: True once it runs, or a sentence for
     # the model (the user said no, or it couldn't start).
     start_browser: Callable[[], bool | str] = lambda: "the user's setup has no browser"
+    # Does this reply say the assistant is about to make a change now? (A
+    # one-word model decision the app supplies; the engine has no UI imports.)
+    announces: Callable[[str], bool] = lambda reply: False
 
 
 class ToolError(Exception):
@@ -411,6 +450,27 @@ class Workspace:
         self.repo_map = repo_map  # Aider's RepoMap, for outlines
         self.encoding = encoding
         self.jobs: dict[str, dict] = {}  # commands left running by `start`, by command line
+        self.seen: dict[str, str] = {}  # file -> a digest of what it held when the model last read or wrote it
+
+    def mark(self, p: Path):
+        """The model now knows this file as it is on disk (it read it, or wrote it)."""
+        try:
+            self.seen[self.rel(p)] = hashlib.sha1(p.read_bytes()).hexdigest()
+        except OSError:
+            self.seen.pop(self.rel(p), None)
+
+    def check_current(self, p: Path):
+        """Refuses a change to a file that isn't what the model read any more
+        (the user's editor, a formatter, a dev server's code generator): the
+        edit would be written against lines that are gone. As in Claude Code."""
+        rel = self.rel(p)
+        try:
+            now = hashlib.sha1(p.read_bytes()).hexdigest()
+        except OSError:
+            return
+        if rel in self.seen and self.seen[rel] != now:
+            raise ToolError(f"{rel} has changed on disk since you read it (the user, a formatter or a command changed it). "
+                            "Read it again, then make the change against what it holds now")
 
     def path(self, rel: str, must_exist: bool = True) -> Path:
         rel = (rel or "").strip()
@@ -669,6 +729,7 @@ class Workspace:
         if p.is_dir():
             raise ToolError(f"{path} is a folder; use list")
         lines = self.read_text(p).splitlines()
+        self.mark(p)
         n = len(lines)
         start = max(1, start or 1)
         end = min(n, end or start + READ_LINES - 1, start + READ_LINES - 1)
@@ -919,7 +980,7 @@ class Agent:
     context: int = 32768
     reasoning: bool = False
     web: bool = True
-    memory: str = ""  # OPENPHALANX.md / AGENTS.md
+    memory: str = ""  # OPENPHALANX.md / OPPX.md / AGENTS.md
     connectors: object = None  # mcp.Hub: the user's MCP connectors, as extra tools (None: none)
     # The headless browser: "none" (this session can't have one), "offer" (the
     # browser action is offered; the user is asked), "running", "declined".
@@ -937,6 +998,12 @@ class Agent:
     # facts each reply is given; and the last reply, to catch a repeat.
     changed_session: list = field(default_factory=list)
     _replies: list = field(default_factory=list)  # (user message, reply), the latest few
+    # A change the user asked for that no turn has made yet (the turn got
+    # stuck, was interrupted, or ended on a promise). The next message is
+    # read in its light: "continue" and "where is the edit?" then mean it.
+    pending: str = ""
+    _pending_age: int = 0
+    asking: str = ""  # the tool a command is being confirmed for ("run", "start"): the question differs
     _trail: list = field(default_factory=list)  # this turn's actions and results, one line each
     _before: dict = field(default_factory=dict)  # path -> its text before this request first changed it
     _search_off_until: float = 0.0  # the server paused or paced web search until then (monotonic)
@@ -974,6 +1041,7 @@ class Agent:
         self._system_text = None
         self.changed_session.clear()
         self._replies.clear()
+        self.pending, self._pending_age = "", 0
         self.session, self.turns = uuid.uuid4().hex[:12], 0
 
     def undone(self, names: list[str]):
@@ -1084,15 +1152,19 @@ class Agent:
                 return None
             return act if isinstance(act, dict) and act.get("tool") else None
 
+        # After a refused repeat the next action is sampled: at temperature 0
+        # the same conversation gave the very same command again, four times,
+        # each time after the model had written out the fix in plain text.
+        warm, self._sample = ({"temperature": RETRY_TEMPERATURE} if getattr(self, "_sample", False) else {}), False
         try:
-            data = ask(getattr(self, "_flat_schema", False))
+            data = ask(getattr(self, "_flat_schema", False), **warm)
         except ContextOverflow:
             raise
         except RuntimeError as e:
             if getattr(self, "_flat_schema", False) or "400" not in str(e):
                 raise
             self._flat_schema = True  # this server's grammar can't do anyOf
-            data = ask(True)
+            data = ask(True, **warm)
         act = parse(data)
         if act is None:
             # Cut off before it named a tool. That used to count as "answer",
@@ -1249,12 +1321,33 @@ class Agent:
         self._trail, self.stuck, self._called = [], "", {}
         self.turns += 1
         self._step, self._prev = 0, {}
+        wanted = can_edit if wants_change is None else (wants_change and can_edit)
+        # Until the turn says otherwise: a change request that fails or is interrupted is still owed.
+        self._wanted, self._did = wanted, False
         try:
-            return self._turn(text, can_edit, can_edit if wants_change is None else (wants_change and can_edit))
+            return self._turn(text, can_edit, wanted)
         except Exception as e:
             # Leave a trace, so a later turn doesn't assume this one worked.
             self.messages.append({"role": "assistant", "content": f"(This request failed: {str(e)[:200]}. Nothing more was done.)"})
             raise
+        finally:
+            if self._did:
+                self.pending, self._pending_age = "", 0
+            elif self._wanted:
+                # Still owed. A follow-up ("yes, go ahead") keeps the request it was about.
+                self.pending, self._pending_age = self.pending or text.split("\n\n(Files the user added", 1)[0][:400], 0
+            elif self.pending:
+                self._pending_age += 1
+                if self._pending_age >= PENDING_TURNS:
+                    self.pending = ""  # they moved on
+
+    def last_reply(self) -> str:
+        """The assistant's latest reply, for reading the next message in its light."""
+        if self._replies:
+            return self._replies[-1][1]
+        # A resumed session has the messages only: the last thing said that isn't an action.
+        return next((m["content"] for m in reversed(self.messages)
+                     if m["role"] == "assistant" and not m["content"].lstrip().startswith("{")), "")
 
     def _named_files(self, text: str) -> list[str]:
         """Repository files the message names by path (at most 3)."""
@@ -1316,13 +1409,21 @@ class Agent:
         repeats = search_errors = searches = search_empty = failed_edits = plans = 0
         searched = opened = changed = 0  # find/grep/list, read/outline, edit/create steps this turn
         act_forced = must_act = False  # a change request that keeps choosing answer gets one step without it
+        announced = False  # a reply that said "I'll make the change now" was held to it, once
+        planned_at = -1  # the model call that last chose `plan`
+        sampled_at = 0  # the repeat count the last sampled action answered
         nudged = edit_nudged = checked = reviewed = rethought = edit_checked = edit_planned = False
         changed_files: list[str] = []
         self._before = {}  # path -> its text before this request's first change to it
         declined: set[str] = set()  # commands the user declined, or that were refused, in this request
         self.down = {}
         failed_runs: dict[str, int] = {}  # command -> the step it failed at, until something changes
+        failed_times: dict[str, int] = {}  # command -> how often it failed in this request
         last_repeat = ""
+        failed_title = None  # the title of a failing command that was sent again unchanged
+
+        def close():
+            self._wanted, self._did = wants_change, bool(changed or called)
         check: str | None = None  # the first line of the last command run after the latest edit ("exit code 0")
         queued: list[dict] = []  # lookups asked for in one step, still to run
         calls = 0  # actions the model chose (a queued lookup costs no call)
@@ -1350,7 +1451,9 @@ class Agent:
             if repeats >= 2:
                 if rethought:
                     # Twice in circles: stop, and say so.
-                    self.stuck = f"it kept repeating actions it had already taken (last: {last_repeat})"
+                    self.stuck = (f"it kept sending the same failing command without changing it (last: {last_repeat}). "
+                                  "No corrected command was ever sent, so none was rejected" if last_repeat == failed_title else
+                                  f"it kept repeating actions it had already taken (last: {last_repeat})")
                     break
                 # Going in circles (small models, and any model whose search
                 # words don't match the code): one forced look at what is
@@ -1375,6 +1478,7 @@ class Agent:
                 first = wants_change and calls == 1 and not changed
                 doing = tuple(t for t in tools if t in (*EDIT_TOOLS, "run", "start")) if must_act else ()
                 must_act = False
+                self._sample, sampled_at = bool(repeats) and repeats != sampled_at, repeats
                 act = self._action(doing or (tuple(t for t in tools if t != "answer") if first else tools))
                 then = act.pop("then", None) if act.get("tool") in LOOKUPS else None
                 queued = [{"enough": False, "missing": "(asked for with the step before)", **x}
@@ -1419,6 +1523,15 @@ class Agent:
                         " You haven't run anything to check the change: if the project has a quick check for what "
                         "you touched (its type check, its tests, a build), run it now; if nothing can check it, "
                         "say in your reply that it is unverified.")
+                    if self._unseen_page(changed_files, called) and self.browser in ("offer", "running"):
+                        # A lint passed, and "did you check it in the browser?"
+                        # was the user's next message: they didn't know it was
+                        # on offer, and the model never asked for it.
+                        verify += (" What you changed shows in a web page, and a lint or a build doesn't show whether it "
+                                   "works there. If the page can be opened (a dev server that runs, or one you can start), "
+                                   "look at it now: " + ("use the playwright.* tools" if self.browser == "running" else
+                                                         "choose the browser action (the user is asked once)")
+                                   + ", open the page, try the change, read the console.")
                     note("Files you changed in this request: " + ", ".join(dict.fromkeys(changed_files))
                          + ". If the task needs more (other files, callers of something renamed, "
                          "a test you meant to add), do it now with edit; grep for an old name to check. "
@@ -1433,16 +1546,36 @@ class Agent:
                          "choose answer. Otherwise choose answer. Either way the reply must not call a part done "
                          "that your review couldn't show.")
                     continue
-                return self._answer(text, self._facts(changed_files, failed_edits, wants_change, called, check))
+                close()
+                reply = self._answer(text, self._facts(changed_files, failed_edits, wants_change, called, check, self._unseen_page(changed_files, called)))
+                if (can_edit and not changed and not called and not announced and not act_forced and not self.stuck
+                        and reply and self.hooks.announces(reply)):
+                    # "Now I'll implement the sort feature." and the turn ended:
+                    # the message read as a question, so nothing held the model
+                    # to it. A reply that announces a change is followed by the
+                    # change, as it is in Claude Code; an offer ("want me to?")
+                    # is not, and waits for the user.
+                    announced = act_forced = must_act = wants_change = True
+                    self._event("announced")
+                    note("You just told the user you would make the change now, and nothing has been changed. Do it: "
+                         "make the first change (edit or create, with the file's path).")
+                    continue
+                return reply
             if tool == "plan":
-                plans += 1
-                if plans > MAX_PLANS:
+                again = planned_at == calls - 1
+                plans += not again  # one refused for coming right after a plan isn't a plan
+                if plans > MAX_PLANS or again:
+                    # More than enough plans, or a plan right after a plan:
+                    # nothing was learnt in between that a new one could use.
                     repeats += 1
                     self._event("repeat")
                     last_repeat = "plan"
-                    note("You have planned enough; act on the plan above, or answer.")
+                    planned_at = calls
+                    note("You just wrote a plan and nothing has happened since: act on the plan above (its first step), or answer."
+                         if again else "You have planned enough; act on the plan above, or answer.")
                     continue
-                self._think(PLAN_PROMPT, "Plan")
+                planned_at = calls
+                self._think(PLAN_PROMPT, "Plan", PLAN_TOKENS_LONG if several_parts(text) else THINK_TOKENS)
                 note("Carry out the plan, one action at a time.")
                 continue
             if tool in ("edit", "create"):
@@ -1490,9 +1623,11 @@ class Agent:
                 # the user is asked about it again).
                 repeats += 1
                 self._event("repeat")
-                last_repeat = title
+                last_repeat = failed_title = title
                 result = (f"This exact command already failed at step {failed_runs[(act.get('command') or '').strip()]} and nothing "
-                          "has changed since; its output is above. Read that error, then change the command or fix the cause.")
+                          "has changed since; its output is above. The command you just sent is, character for character, "
+                          "the one that failed: if you worked out a fix, it is not in it. Write the corrected command "
+                          "out in full, or fix the cause.")
             elif sig in done and visible(done[sig]) and tool not in ("edit", "create", "run", "start") and tool not in extra:
                 repeats += 1
                 self._event("repeat")
@@ -1505,9 +1640,18 @@ class Agent:
                 if tool in ("run", "start") and not self._ran:
                     declined.add((act.get("command") or "").strip())
                 if tool == "run" and self._ran and re.match(r"exit code [1-9]", result):
-                    failed_runs[(act.get("command") or "").strip()] = n
-                elif (tool in ("run", "start") and self._ran) or (tool in EDIT_TOOLS and not result.startswith("Error:")):
-                    failed_runs.clear()  # something changed: a command that failed may work now
+                    command = (act.get("command") or "").strip()
+                    failed_runs[command] = n
+                    failed_times[command] = failed_times.get(command, 0) + 1
+                elif tool in EDIT_TOOLS and result.startswith(WROTE):
+                    failed_runs.clear()  # the files changed: a command that failed may work now
+                    failed_times.clear()
+                elif tool in ("run", "start") and self._ran:
+                    # Another command worked (an install, say), so one that
+                    # failed once may work now. One that failed twice the same
+                    # way won't: a `print(keys)` in between let a broken
+                    # one-liner run, and fail, again and again.
+                    failed_runs = {c: at for c, at in failed_runs.items() if failed_times.get(c, 0) >= 2}
                 if (tool in ("run", "start") and self._ran) or (
                         tool in EDIT_TOOLS and result.startswith(("Edited ", "Created ", "Replaced "))):
                     # The files may differ now, so what was looked up before
@@ -1582,7 +1726,7 @@ class Agent:
                         done.clear()
                         reads.clear()
                         outputs.clear()
-                    else:
+                    elif result.startswith(WROTE):
                         changed += 1
                         check = None  # a new edit: whatever ran before says nothing about it
                         path = act.get("path") or ""
@@ -1601,7 +1745,9 @@ class Agent:
             results[n] = self.messages[-1]
         else:
             self.stuck = f"it used all {limit} steps without finishing"
-        return self._answer(text, self._facts(changed_files, failed_edits, wants_change, called, check), self.stuck)
+        close()
+        return self._answer(text, self._facts(changed_files, failed_edits, wants_change, called, check,
+                                              self._unseen_page(changed_files, called)), self.stuck)
 
     def _unseen(self) -> str:
         """Top-level folders no action of this turn has touched: where to look
@@ -1655,6 +1801,7 @@ class Agent:
             self.messages.pop()
         if not plan or as_action(plan) is not None:
             plan = "(no plan written)"
+        plan = whole_sentences(plan, tokens)
         last = self.messages[-1] if self.messages else None
         if last and last["role"] == "assistant" and last["content"].startswith("{"):
             last["content"] = plan  # in place of the action that asked for it
@@ -1664,8 +1811,13 @@ class Agent:
         self.hooks.step(title, plan)
         return plan
 
+    def _unseen_page(self, changed_files: list[str], called: list[str]) -> bool:
+        """Files that show in a web page were changed, and no browser tool looked at the result."""
+        return (any(f.lower().endswith(PAGE_FILES) for f in changed_files)
+                and not any(t.startswith("playwright.") for t in called))
+
     def _facts(self, changed_files: list[str], failed_edits: int, can_edit: bool, called: list[str] | None = None,
-               check: str | None = None) -> str:
+               check: str | None = None, unseen_page: bool = False) -> str:
         """What really changed, given with every reply: small models claim edits
         they never made, and repeat the claim when asked about it."""
         now = list(dict.fromkeys(changed_files))
@@ -1683,6 +1835,14 @@ class Agent:
             parts.append(f"The last command you ran after editing ended with {check}: say that the check failed; don't call the work done.")
         elif now:
             parts.append("The last command you ran after editing succeeded (exit code 0): you may say what you ran and that it passed.")
+        if now and unseen_page:
+            # The user may not know the browser exists: say what wasn't seen, and that it can be.
+            parts.append("You changed what a web page shows and did not look at the page: say in one sentence that it was "
+                         "not checked in a browser" + (
+                             ", and that you can open it in a headless browser and try it if they want (they will be asked "
+                             "to allow it)." if self.browser == "offer" else
+                             ", and that you can do so with the browser that is running if they want." if self.browser == "running"
+                             else "."))
         parts.append("Files you changed earlier in this conversation: " + (", ".join(before) if before else "none") + ".")
         if called:
             # What a request like "open an issue" was about; not a file change.
@@ -1828,6 +1988,7 @@ class Agent:
                     raise ToolError(f"{tool} needs a command")
                 self._ran = False
                 self._not_a_program(cmd)
+                self.asking = tool
                 allowed = self.hooks.confirm_run(cmd)
                 if allowed is not True:
                     # A refusal can carry what the user said instead, or why
@@ -2021,11 +2182,21 @@ class Agent:
         if not self._has_read(rel):
             raise ToolError(f"read the lines you're changing in {rel} first (read with start and end); "
                             "an edit must copy the file's current text exactly")
+        self.ws.check_current(self.ws.path(path))
         self.hooks.waiting("Editing")
         reply = self._written(EDIT_PROMPT.format(path=path), 4096, path)
         # Keep the blocks in the conversation as the action's text.
         self.messages[-1] = {"role": "assistant", "content": self.messages[-1]["content"] + "\n" + reply}
+        if "<<<<<<< SEARCH" not in reply:
+            look = misplaced_lookup(reply)
+            if look:
+                # It needs to see something before it can write the edit (the
+                # file as its own last edit left it, say). That is not a
+                # failed edit: do the lookup now, in this step.
+                self._event("looked_first")
+                return LOOKED_FIRST + self._do(look)
         rel, before, after = apply_edit(self.ws, path, reply)
+        self.ws.mark(self.ws.path(path))
         self._before.setdefault(rel, before)
         self.hooks.edited(rel, before, after)
         return f"Edited {rel}. The changed lines now read:\n{changed_region(before, after)}{balance_warning(before, after)}"
@@ -2041,14 +2212,26 @@ class Agent:
                 raise ToolError(f"{path} is a folder")
             if not self._has_read(self.ws.rel(p)):
                 raise ToolError(f"{path} already exists. Read it first; then edit it, or create it again to replace all of it")
+            self.ws.check_current(p)
             before = p.read_text(encoding=self.ws.encoding, errors="replace")
         self.hooks.waiting("Writing")
         reply = self._written((CREATE_PROMPT if before is None else REWRITE_PROMPT).format(path=path), 8192, path)
         self.messages[-1] = {"role": "assistant", "content": self.messages[-1]["content"] + "\n" + reply}
         m = re.search(r"```[^\n]*\n(.*?)```", reply, re.S)
+        if m is None or as_action(m.group(1)) is not None:
+            # Not the file: a sentence and an action ("Let me check the folder
+            # first." and a list as JSON) would have been written into it.
+            look = misplaced_lookup(reply)
+            if look:
+                self._event("looked_first")
+                return LOOKED_FIRST.replace("make the edit", "write the file") + self._do(look)
+            if strip_action(reply) != reply.strip():
+                raise ToolError("your reply was not the file's content: it ended in a JSON action. Write the whole "
+                                "file, in one code block")
         content = m.group(1) if m else reply
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding=self.ws.encoding)
+        self.ws.mark(p)
         rel = self.ws.rel(p)
         self._before.setdefault(rel, before)
         self.hooks.edited(rel, before, content)
@@ -2153,6 +2336,8 @@ def _signature(act: dict) -> str:
 def _summary(tool: str, res: str) -> str:
     if res.startswith("Error:"):
         return res
+    if res.startswith("Not edited yet:"):
+        return "Not edited yet: it looked at that first"
     if res.startswith(CONNECTOR_HEAD):
         body = res[len(CONNECTOR_HEAD):].rsplit("\n(Called ", 1)[0].strip()  # the arguments are in the title
         # The first line that says something (Playwright opens with "### Page").
@@ -2174,6 +2359,14 @@ def _summary(tool: str, res: str) -> str:
         return f"{n} definitions"
     if tool in ("run", "start"):
         return first[:120]
+    if tool == "web_search":
+        # Not the heading ("Web results (untrusted reference text):"): how many, and the first.
+        hits = re.findall(r"(?m)^- (.*)$", res)
+        if not hits:
+            return first[:120]
+        count = f"{len(hits)} result{'s' if len(hits) != 1 else ''}"
+        again = " (from your earlier search, not searched again)" if res.startswith("(Not searched again") else ""
+        return f"{count}{again}: {hits[0].split(': ', 1)[0][:80]}" + (" …" if len(hits) > 1 else "")
     if tool == "browser":
         return "Running (headless)" if res.startswith("The browser is running") else first[:120]
     return first[:120]

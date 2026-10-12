@@ -177,8 +177,17 @@ class Rules(Base):
     def test_what_happens_before_and_after_the_question(self):
         self.assertEqual(self.p.judge("git status"), ("run", ""))
         self.assertEqual(self.p.judge("cargo test")[0], "ask")
-        # yes, once: nothing saved
-        self.assertEqual(self.p.answered("cargo test", " Y "), (True, "Allowed"))
+        # only this once: asked again next time
+        self.assertEqual(self.p.answered("cargo test", " O "), (True, "Allowed this once"))
+        self.assertEqual(self.p.judge("cargo test")[0], "ask")
+        # yes: enough for this session (another session open on the project is not this one), nothing saved
+        other = P.Permissions(str(self.root), self.file)
+        result, shown = other.answered("cargo test", " Y ")
+        self.assertIs(result, True)
+        self.assertIn("for the rest of this session without asking: cargo test", shown)
+        self.assertEqual(other.judge("cargo test -p x")[0], "run")
+        self.assertEqual(other.judge("cargo build")[0], "ask", "that rule, not every command")
+        self.assertFalse(self.file.exists(), "nothing was saved")
         self.assertEqual(self.p.judge("cargo test")[0], "ask")
         # no, and no with a note for the model
         self.assertEqual(self.p.answered("cargo test", ""), (False, "Declined"))
@@ -606,29 +615,68 @@ class Audit(Base):
 
     def test_d18_a_plain_ok_is_a_yes(self):
         for said in ("ok", "OK", "sure", "yep", "yes please", "go ahead", "yes!", "Yes.", " okay "):
-            self.assertEqual(self.p.answered("cargo test", said), (True, "Allowed"), said)
-            self.assertEqual(self.p.answered_tool("linear.save_issue", said), (True, "Allowed"), said)
+            p = P.Permissions(str(self.root), self.file)
+            self.assertIs(p.answered("cargo test", said)[0], True, said)
+            self.assertIs(p.answered_tool("linear.save_issue", said)[0], True, said)
+            self.assertEqual(p.judge("cargo test")[0], "run", f"{said}: a yes, so not asked again in this session")
         self.assertEqual(self.p.run, [], "nothing was saved")
         for said in ("no, use cargo check", "ok but only the unit tests", "not now"):
             self.assertIn("declined", self.p.answered("cargo test", said)[0], said)
             self.assertIn("declined", self.p.answered_tool("linear.save_issue", said)[0], said)
 
-    def test_d19_a_tool_asked_every_time_is_never_remembered(self):
+    def test_d19_a_tool_asked_every_time_is_never_saved_and_one_yes_lasts_the_session(self):
         tool = "playwright.browser_evaluate"
         self.p.allow_for_session("playwright.*", unless={tool})
         self.assertTrue(self.p.every_time(tool))
         self.assertFalse(self.p.every_time("playwright.browser_click"))
-        for said in ("a", "c", "s", "always"):
-            result, shown = self.p.answered_tool(tool, said)
-            self.assertIs(result, True)
-            self.assertIn("this once", shown)
-            self.assertEqual(self.p.judge_tool(tool, read_only=False)[0], "ask")
-        self.assertEqual(self.p.tools, [])
         self.assertEqual(self.p.judge_tool(tool, read_only=True)[0], "ask", "whatever the connector says about it")
-        # Even with a rule written by hand.
-        self.file.write_text(json.dumps({"projects": {str(self.root): {"tools": [tool, "playwright.*"]}}}))
+        # Only this once: asked again.
+        self.assertEqual(self.p.answered_tool(tool, "o"), (True, "Allowed this once"))
         self.assertEqual(self.p.judge_tool(tool, read_only=False)[0], "ask")
-        self.assertEqual(self.p.judge_tool("playwright.browser_click", read_only=False)[0], "run")
+        # A no is not a yes.
+        self.assertEqual(self.p.answered_tool(tool, "n")[0], False)
+        self.assertEqual(self.p.judge_tool(tool, read_only=False)[0], "ask")
+        # One yes, in whatever form, is enough until the chat ends (it was asked three times running).
+        for said in ("y", "a", "c", "s", "ok"):
+            p = P.Permissions(str(self.root), self.file)
+            p.allow_for_session("playwright.*", unless={tool})
+            result, shown = p.answered_tool(tool, said)
+            self.assertIs(result, True)
+            self.assertIn("rest of this session", shown)
+            self.assertEqual(p.judge_tool(tool, read_only=False)[0], "run", said)
+            self.assertEqual(p.tools, [], f"{said}: never saved")
+        self.assertFalse(self.file.exists())
+        # A new session asks again, even with a rule written by hand.
+        self.file.write_text(json.dumps({"projects": {str(self.root): {"tools": [tool, "playwright.*"]}}}))
+        fresh = P.Permissions(str(self.root), self.file)
+        fresh.allow_for_session("playwright.*", unless={tool})
+        self.assertEqual(fresh.judge_tool(tool, read_only=False)[0], "ask")
+        self.assertEqual(fresh.judge_tool("playwright.browser_click", read_only=False)[0], "run")
+        # A deny rule wins over the yes.
+        fresh.answered_tool(tool, "y")
+        fresh.add("deny", tool)
+        self.assertEqual(fresh.judge_tool(tool, read_only=False)[0], "refuse")
+
+    def test_one_yes_is_enough_for_a_session_for_any_tool_of_any_connector(self):
+        for tool in ("linear.save_issue", "github.create_issue", "notes.add_note", "db.run_query", "some-new-connector.do_it",
+                     "toolwithoutconnector"):
+            self.assertEqual(self.p.judge_tool(tool, read_only=False)[0], "ask", tool)
+            result, shown = self.p.answered_tool(tool, "y")
+            self.assertIs(result, True)
+            self.assertIn(f"rest of this session without asking: {tool}", shown)
+            for _ in range(3):
+                self.assertEqual(self.p.judge_tool(tool, read_only=False)[0], "run", f"{tool}: not asked again")
+        self.assertEqual(self.p.judge_tool("linear.delete_issue", read_only=False)[0], "ask", "that tool, not its whole connector")
+        self.assertFalse(self.file.exists(), "a yes saves nothing")
+        self.assertEqual(P.Permissions(str(self.root), self.file).judge_tool("linear.save_issue", False)[0], "ask", "a new session asks")
+        # The same for commands: one yes covers that kind of command until the chat ends...
+        self.assertIs(self.p.answered("npm run build", "y")[0], True)
+        self.assertEqual(self.p.judge("npm run lint")[0], "run")
+        self.assertIs(self.p.answered("cat /etc/hostname", "yes")[0], True)
+        # ...except what is asked every time, because one wrong unattended call loses work.
+        for cmd in ("rm -rf build", "git push", "sudo ls", "git checkout -- ."):
+            self.assertIn("this once", self.p.answered(cmd, "y")[1], cmd)
+            self.assertEqual(self.p.judge(cmd)[0], "ask", cmd)
 
     def test_d20_a_repository_connector_is_not_believed_about_itself(self):
         self.assertEqual(self.p.judge_tool("repo.wipe", read_only=True, trusted=False)[0], "ask")

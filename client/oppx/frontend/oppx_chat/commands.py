@@ -478,11 +478,18 @@ def memory_path(coder) -> Path:
     return Path(coder.root) / MEMORY_FILE
 
 
+def memory_files(root) -> list[Path]:
+    """The memory files in the repository root, in reading order."""
+    try:
+        found = {p.name.lower(): p for p in sorted(Path(root).iterdir()) if p.is_file()}
+    except OSError:
+        return []
+    return [found[n.lower()] for n in (MEMORY_FILE, *EXTRA_MEMORY) if n.lower() in found]
+
+
 def load_memory(coder):
-    for name in (MEMORY_FILE, *EXTRA_MEMORY):
-        p = Path(coder.root) / name
-        if p.is_file():
-            coder.abs_read_only_fnames.add(str(p.resolve()))
+    for p in memory_files(coder.root):
+        coder.abs_read_only_fnames.add(str(p.resolve()))
 
 
 def remember(coder, note: str):

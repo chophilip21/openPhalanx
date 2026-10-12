@@ -15,7 +15,7 @@ from rich.markdown import Markdown
 from rich.markup import escape
 from rich.text import Text
 
-from .config import (ACCENT, CONTEXT, ENGINE, EXTRA_MEMORY, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, PRINT_MODE,
+from .config import (ACCENT, CONTEXT, ENGINE, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, PRINT_MODE,
                      REASONING, RED, SERVER, TESTED_AIDER, TRACE, WEB, YELLOW)
 from .term import EscWatcher, SESSION, SPIN, Thinking, UI, console, out, step
 from .render import BulletStream, _bullet, hide_reasoning, show_diff, show_edits, snapshot
@@ -23,11 +23,11 @@ from .mcp import Hub
 from . import browser
 from .agent import Agent, Hooks, Workspace
 from .permissions import Permissions
-from .routing import wants_edit
+from .routing import announces_change, wants_edit
 from .context import CONTEXT_MGR, PRI_EDITED, _check_tokens, _fitted_format_messages
 from .oppx_io import OppxIO
 from .cache import ASK_NOTE, _ask_file_mentions, _ask_init, _coder_init, _dump_requests, _stable_ranked_map
-from .commands import (ask_about_connector, connector_names, load_memory, show_connector_problems, start_browser,
+from .commands import (ask_about_connector, connector_names, load_memory, memory_files, show_connector_problems, start_browser,
                        translate)
 
 
@@ -247,18 +247,24 @@ def make_agent(coder) -> Agent:
             step("Not run: " + ("a deny rule forbids it" if "deny rule" in why else "edits are off, and it doesn't only read"), MUTED)
             return why
         rules, session = perms.offer(command), perms.offer_session(command)
-        options = [("y", GREEN, "yes, this once")]
+        covered = session or rules  # what one yes allows until the chat ends
+        # One yes is enough for a session. What is asked every time (rm, sudo, git push) has no such yes.
+        options = [("y", GREEN, f"yes, and don't ask again this session: {', '.join(covered)}" if covered else "yes, this once")]
         if rules:
             options.append(("a", ACCENT, f"always in this project: {', '.join(rules)}"))
-        if session:
+        elif session:
             # Inline code (python -c) gets no saved rule; the rest of the line may.
             keep = perms.savable(session)
             if keep:
                 inline = ", ".join(r for r in session if r not in keep)
                 options.append(("a", ACCENT, f"always in this project: {', '.join(keep)}  ·  this session: {inline}"))
-            options.append(("s", ACCENT, f"this session only: {', '.join(session)}  (not saved)"))
+        if covered:
+            options.append(("o", ACCENT, "only this once"))
         options += [("n", RED, "no  (Enter)"), ("…", MUTED, "or type what to do instead")]
-        said = coder.io.ask_options("Run this command?", command.splitlines(), options).strip()
+        # `start` leaves it running (a dev server): say so, it is not the same yes.
+        starting = getattr(UI.agent, "asking", "") == "start"
+        question = "Start this command and leave it running? (it is stopped when the chat ends)" if starting else "Run this command?"
+        said = coder.io.ask_options(question, command.splitlines(), options).strip()
         SPIN.start()
         result, shown = perms.answered(command, said)
         step(shown, GREEN if result is True else MUTED)
@@ -273,21 +279,21 @@ def make_agent(coder) -> Agent:
         connector = name.split(".", 1)[0]
         known = getattr(UI.connectors, "connectors", {}).get(connector)
         trusted = known is None or known.definition.scope != "project"
-        verdict, why = perms.judge_tool(name, read_only, trusted)
+        verdict, why = perms.judge_tool(name, read_only, trusted, arguments)
         if verdict == "run":
             return True
         if verdict == "refuse":
             step(f"Not run: a deny rule forbids {escape(name)}", MUTED)
             return why
-        options = [("y", GREEN, "yes, this once")]
-        if not perms.every_time(name):  # running JavaScript in the browser: asked every time, nothing lasting on offer
+        # One yes is enough for a session, for any tool of any connector.
+        options = [("y", GREEN, f"yes, and don't ask again this session: {name}")]
+        if not perms.every_time(name):  # running JavaScript in the browser is never saved between sessions
             options += [("a", ACCENT, f"always in this project: {name}"),
-                        ("c", ACCENT, f"always in this project: every {connector} tool"),
-                        ("s", ACCENT, f"this session only: {name}  (not saved)")]
-        options += [("n", RED, "no  (Enter)"), ("…", MUTED, "or type what to do instead")]
+                        ("c", ACCENT, f"always in this project: every {connector} tool")]
+        options += [("o", ACCENT, "only this once"), ("n", RED, "no  (Enter)"), ("…", MUTED, "or type what to do instead")]
         said = coder.io.ask_options("Call this connector tool?", f"{name} {arguments}".splitlines()[:30], options)
         SPIN.start()
-        result, shown = perms.answered_tool(name, said)
+        result, shown = perms.answered_tool(name, said, arguments)
         step(shown, GREEN if result is True else MUTED)
         return result
 
@@ -298,7 +304,9 @@ def make_agent(coder) -> Agent:
 
     hooks = Hooks(step=on_step, stream=on_stream, edited=on_edited, confirm_run=on_confirm, notice=on_notice,
                   confirm_tool=on_confirm_tool, start_browser=lambda: start_browser(SESSION.coder or coder, ask=True),
-                  waiting=lambda label: SPIN.start(label), interrupted=lambda: UI.interrupted)
+                  waiting=lambda label: SPIN.start(label), interrupted=lambda: UI.interrupted,
+                  announces=lambda reply: announces_change(reply, {"session": UI.agent.session, "turn": UI.agent.turns,
+                                                                   "step": 0, "kind": "route"} if UI.agent else None))
     agent = Agent(ws=Workspace(coder.root, getattr(coder, "repo_map", None), coder.io.encoding),
                   hooks=hooks, context=CONTEXT, reasoning=REASONING, trace=TRACE, web=WEB, memory=_memory(coder),
                   connectors=UI.connectors,
@@ -326,13 +334,11 @@ def connect_connectors(coder) -> Hub:
 
 def _memory(coder) -> str:
     parts = []
-    for name in (MEMORY_FILE, *EXTRA_MEMORY):
-        p = Path(coder.root) / name
-        if p.is_file():
-            try:
-                parts.append(p.read_text(encoding="utf-8"))
-            except OSError:
-                pass
+    for p in memory_files(coder.root):
+        try:
+            parts.append(p.read_text(encoding="utf-8"))
+        except OSError:
+            pass
     return "\n\n".join(parts)
 
 
@@ -348,7 +354,8 @@ def agent_turn(coder, text: str):
     agent = UI.agent
     # The ask/edit check belongs to the turn that is about to start (for the server's Trace page).
     route = {"session": agent.session, "turn": agent.turns + 1, "step": 0, "kind": "route"}
-    wants_change = can_edit and wants_edit(text, route)
+    # Read with what it may be an answer to: alone, "yes, go ahead" is a question.
+    wants_change = can_edit and wants_edit(text, route, agent.last_reply(), agent.pending)
     agent = UI.agent
     if agent.memory != _memory(coder):  # # notes and /init change it
         agent.memory = _memory(coder)
@@ -388,6 +395,7 @@ def agent_turn(coder, text: str):
     finally:
         SESSION.watcher = None
         SPIN.stop()
+        UI.unannounced.clear()  # each is shown as "> …" when its turn starts, right after this one
     if UI.interrupted:
         step("Interrupted by user", YELLOW)
     if reply:
