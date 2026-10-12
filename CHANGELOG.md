@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.7.1 (2026-10-12)
+
+### Fixes
+
+- Agent fixes from the end-to-end app audit, a search guard, and server notifications (#12)
+
 ## v0.7.0 (2026-10-11)
 
 ### Features
