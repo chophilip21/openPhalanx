@@ -19,6 +19,16 @@
     if (app.snapshot) app.snapshot.settings = s;
   }
 
+  // The ticked GPUs among those in the machine (settings.gpus null: all of them).
+  const gpusOn = $derived((snap?.gpus ?? []).map((g) => g.index).filter((i) => !settings?.gpus || settings.gpus.includes(i)));
+  const gpuOn = (index: number) => gpusOn.includes(index);
+  function toggleGpu(index: number, on: boolean) {
+    const next = (snap?.gpus ?? []).map((g) => g.index).filter((i) => (i === index ? on : gpuOn(i)));
+    // Every card ticked is "all": a card added later is then used too.
+    const all = next.length === (snap?.gpus ?? []).length;
+    return save("GPUs", () => api.setGpus(all ? null : next));
+  }
+
   async function save(what: string, call: () => Promise<Settings>) {
     error = "";
     saved = "";
@@ -135,19 +145,32 @@
         <p class="note"><Icon name="lock" size={13} /> The server is running. The GPU and the client and admin ports apply at the next start; stop it to change them.</p>
       {/if}
 
-      {#if snap && snap.gpus.length > 0}
+      {#if snap && snap.gpus.length === 1}
         <div class="row">
           <div class="label">
             <span>GPU</span>
-            <span class="muted small">The card the model runs on. A split model uses each server's own.</span>
+            <span class="muted small">The card the model runs on.</span>
           </div>
-          <div class="control">
-            <select value={String(settings.gpu_index)} disabled={locked || snap.gpus.length < 2} aria-label="GPU"
-              onchange={(e) => save("GPU", () => api.setGpu(Number(e.currentTarget.value)))}>
-              {#each snap.gpus as g}
-                <option value={String(g.index)}>{g.index}: {g.name} ({(g.total_bytes / 2 ** 30).toFixed(0)} GB)</option>
-              {/each}
-            </select>
+          <div class="control">{snap.gpus[0].index}: {snap.gpus[0].name} ({(snap.gpus[0].total_bytes / 2 ** 30).toFixed(0)} GB)</div>
+        </div>
+      {:else if snap && snap.gpus.length > 1}
+        <div class="row">
+          <div class="label">
+            <span>GPUs</span>
+            <span class="muted small">
+              The cards the server may use; all of them unless you untick some. A model that fits one card runs on the
+              one with the most free memory. A model that doesn't is spread over the ticked cards.
+              <strong>Experimental:</strong> that has not been tried on a machine with several GPUs yet.
+            </span>
+          </div>
+          <div class="control gpus">
+            {#each snap.gpus as g}
+              <label title={locked ? "Stop the server to change the GPUs" : gpuOn(g.index) && gpusOn.length === 1 ? "At least one GPU has to stay selected" : ""}>
+                <input type="checkbox" checked={gpuOn(g.index)} disabled={locked || (gpuOn(g.index) && gpusOn.length === 1)}
+                  onchange={(e) => toggleGpu(g.index, e.currentTarget.checked)} />
+                {g.index}: {g.name} ({(g.total_bytes / 2 ** 30).toFixed(0)} GB, {(g.free_bytes / 2 ** 30).toFixed(1)} free)
+              </label>
+            {/each}
           </div>
         </div>
       {/if}
@@ -274,11 +297,13 @@
   .eyebrow + .row, .eyebrow + .note + .row { border-top: none; }
   .label { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 240px; }
   .control { display: flex; gap: 8px; align-items: center; }
+  .gpus { flex-direction: column; align-items: flex-start; gap: 6px; }
+  .gpus label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .gpus input { width: 16px; height: 16px; flex: none; }
   .toggle { cursor: pointer; }
   .toggle input { width: 18px; height: 18px; flex: none; }
   .small { font-size: 12.5px; }
   .port { width: 92px; text-align: right; }
-  select { min-width: 220px; }
   .note { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--warn-text); margin: 6px 0 2px; }
   .saved { display: inline-flex; align-items: center; gap: 4px; color: var(--on); margin-left: 8px; font-size: 12.5px; }
   .bad { color: var(--bad-text); }

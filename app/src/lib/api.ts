@@ -72,6 +72,8 @@ export type Settings = {
   selected_model: string | null;
   context_len: number;
   gpu_index: number;
+  /** The GPUs the server may use, by index; null: every GPU (the default). */
+  gpus: number[] | null;
   agent_port: number;
   admin_port: number;
   control_port: number;
@@ -453,6 +455,8 @@ export const api = {
   setContextLen: (contextLen: number) => invoke<Settings>("set_context_len", { contextLen }),
   setLongContext: (on: boolean) => invoke<Settings>("set_long_context", { on }),
   setGpu: (index: number) => invoke<Settings>("set_gpu", { index }),
+  /** Which GPUs the server may use, by index; null: every GPU. */
+  setGpus: (indices: number[] | null) => invoke<Settings>("set_gpus", { indices }),
   setWebSearch: (enabled: boolean) => invoke<Settings>("set_web_search", { enabled }),
   /** Moves one of the server's own ports (applies at the next start). */
   setPort: (which: "agent_port" | "admin_port" | "control_port", port: number) => invoke<Settings>("set_port", { which, port }),

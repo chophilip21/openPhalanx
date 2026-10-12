@@ -57,6 +57,7 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 import reqtrace
+import searchguard
 
 SGLANG_ROOT = f"http://127.0.0.1:{os.environ.get('SGLANG_PORT', '8080')}"
 MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", "openphalanx-coder")
@@ -601,13 +602,29 @@ async def classify(ask, system: str, choices: tuple[str, ...]) -> str | None:
 
 
 class SearchUnavailable(Exception):
-    pass
+    def __init__(self, message: str, retry_after: int = 0):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+# Public engines block an address that asks too often, and SearXNG then
+# returns nothing. The guard answers repeats from memory, paces what goes
+# out, and stops searching for a while once the engines refuse.
+search_guard = searchguard.Guard()
+SEARCH_KEPT = 20  # results kept per query (the most one request may ask for)
 
 
 async def web_search(query: str, limit: int) -> list[dict]:
     """Top results from the private SearXNG instance as {title, url, snippet}."""
     if not SEARXNG_URL:
         raise SearchUnavailable("web search is not enabled on this server")
+    cached = search_guard.cached_results(query)
+    if cached is not None:
+        return cached[:limit]
+    try:
+        search_guard.admit()
+    except searchguard.Refused as e:
+        raise SearchUnavailable(str(e), e.retry_after) from None
     try:
         r = await upstream().get(
             f"{SEARXNG_URL}/search",
@@ -615,8 +632,10 @@ async def web_search(query: str, limit: int) -> list[dict]:
             timeout=SEARCH_TIMEOUT_S,
         )
         r.raise_for_status()
-        results = r.json().get("results", [])
+        data = r.json()
+        results = data.get("results", [])
     except (httpx.HTTPError, ValueError) as e:
+        search_guard.failed()
         raise SearchUnavailable(f"search failed: {type(e).__name__}") from None
     metrics.web_searches += 1
     out, seen = [], set()
@@ -630,9 +649,14 @@ async def web_search(query: str, limit: int) -> list[dict]:
             "url": url,
             "snippet": " ".join((item.get("content") or "").split())[:400],
         })
-        if len(out) >= limit:
+        if len(out) >= SEARCH_KEPT:
             break
-    return out
+    try:
+        # Engines that refused and no results is not "nothing found".
+        search_guard.record(query, out, data.get("unresponsive_engines"))
+    except searchguard.Refused as e:
+        raise SearchUnavailable(str(e), e.retry_after) from None
+    return out[:limit]
 
 
 def format_results(query: str, results: list[dict]) -> str:
@@ -740,7 +764,10 @@ async def search(req: SearchRequest, device: dict = Depends(require_device)) -> 
     try:
         results = await web_search(req.query, req.max_results)
     except SearchUnavailable as e:
-        return openai_error(503, str(e), "service_unavailable")
+        refused = openai_error(503, str(e), "service_unavailable")
+        if e.retry_after:
+            refused.headers["retry-after"] = str(e.retry_after)
+        return refused
     devices.add_search(device)
     return JSONResponse({"query": req.query, "results": results})
 
@@ -974,6 +1001,8 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
     auto_search = (
         request.headers.get("x-oppx-web-search", "").lower() == "auto"
         and bool(SEARXNG_URL)
+        # While search is paused the router isn't asked either: two model calls for nothing.
+        and not search_guard.paused
         and isinstance(body.get("messages"), list)
         # Structured utility calls (e.g. the client's ask/edit classifier) never search.
         and not body.get("regex")
@@ -1153,6 +1182,7 @@ async def admin_status() -> dict:
         "model": MODEL_NAME,
         "gateway": metrics.snapshot(),
         "web_search": bool(SEARXNG_URL),
+        "search": search_guard.status(),
         "inference": await sglang_metrics() if ready else {},
         "pairing": pairing.describe(),
         "devices": len(devices.devices),

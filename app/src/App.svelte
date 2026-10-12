@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import Icon from "./components/Icon.svelte";
+  import Notifications from "./components/Notifications.svelte";
   import UpdatePrompt from "./components/UpdatePrompt.svelte";
   import { api, errorText, openLink, type UpdateCheck } from "./lib/api";
   import logo from "./assets/logo.svg";
@@ -115,6 +116,7 @@
     <button class="check-update" title={REPO} onclick={() => openLink(REPO).catch((e) => (updateNote = errorText(e)))}>GitHub <Icon name="external" size={11} /></button>
   </nav>
   {#if update}<UpdatePrompt check={update} onclose={() => (update = null)} />{/if}
+  <Notifications />
 
   <main>
     {#if failed}

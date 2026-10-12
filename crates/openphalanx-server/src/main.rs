@@ -77,6 +77,10 @@ enum Command {
     Ports,
     /// Run a private SearXNG so clients' models can search the web: on or off. Applies at the next start.
     WebSearch { mode: String },
+    /// Show this machine's GPUs, or choose which the server may use: `gpus all` (the
+    /// default) or `gpus 0,2`. A model that fits one card runs on one; one that doesn't
+    /// is spread over the selected cards (experimental). Applies at the next start.
+    Gpus { which: Option<String> },
     /// Start serving the selected model.
     Start {
         /// Start although the model doesn't fit the free VRAM. It may fail
@@ -712,7 +716,8 @@ async fn control(cmd: Command) -> Result<()> {
         | Command::LongContext { .. }
         | Command::Port { .. }
         | Command::Ports
-        | Command::WebSearch { .. } => unreachable!("handled in main"),
+        | Command::WebSearch { .. }
+        | Command::Gpus { .. } => unreachable!("handled in main"),
     }
     Ok(())
 }
@@ -741,10 +746,16 @@ fn find_model(wanted: &str) -> Result<catalog::CatalogEntry> {
 
 async fn models(all: bool) -> Result<()> {
     let settings = Settings::load();
-    let gpu = gpu::query().await.unwrap_or_default().into_iter().find(|g| g.index == settings.gpu_index);
-    match &gpu {
-        Some(g) => println!("{} · {} free · context {}k", g.name, vram::fmt_gib(g.free_bytes), settings.context_len / 1024),
-        None => println!("No NVIDIA GPU found; fits can't be checked."),
+    let selected = settings.selected_gpus(&gpu::query().await.unwrap_or_default());
+    let gpu = server::best_gpu(&selected);
+    match (&gpu, selected.len()) {
+        (Some(g), 1) => println!("{} · {} free · context {}k", g.name, vram::fmt_gib(g.free_bytes), settings.context_len / 1024),
+        (Some(_), n) => println!(
+            "{n} GPUs · {} free together (a model that doesn't fit one is spread over them: experimental) · context {}k",
+            vram::fmt_gib(selected.iter().map(|g| g.free_bytes).sum()),
+            settings.context_len / 1024
+        ),
+        (None, _) => println!("No NVIDIA GPU found; fits can't be checked."),
     }
     println!("{:<52} {:>9} {:>9}  {:<10} state", "model", "download", "VRAM", "fit");
     let mut hidden = 0;
@@ -752,7 +763,7 @@ async fn models(all: bool) -> Result<()> {
         let key = server::catalog_key(&e.id);
         let Some(m) = server::resolve(&settings, &key) else { continue };
         let req = m.requirement(settings.context_len, gpu.as_ref().and_then(|g| g.compute_capability));
-        let fit = gpu.as_ref().map(|g| vram::check(&req, g.free_bytes).fit);
+        let fit = server::check_over(&req, &selected).map(|f| f.fit);
         if !all && fit == Some(vram::Fit::Insufficient) && m.installed_dir.is_none() {
             hidden += 1;
             continue;
@@ -823,8 +834,9 @@ async fn refuse_while_running(what: &str) -> Result<()> {
 /// this GPU now (`None`: not even the minimum, or no GPU to measure).
 async fn context_fit(settings: &Settings) -> Option<(server::ResolvedModel, Option<u32>)> {
     let m = server::resolve(settings, settings.selected_model.as_deref()?)?;
-    let gpu = gpu::query().await.unwrap_or_default().into_iter().find(|g| g.index == settings.gpu_index);
-    let fit = gpu.and_then(|g| vram::max_fitting_context(m.max_context, g.free_bytes, |c| m.requirement(c, g.compute_capability)));
+    let selected = settings.selected_gpus(&gpu::query().await.unwrap_or_default());
+    let cc = server::best_gpu(&selected).and_then(|g| g.compute_capability);
+    let fit = server::max_context_over(m.max_context, &selected, |c| m.requirement(c, cc));
     Some((m, fit))
 }
 
@@ -963,6 +975,54 @@ fn set_web_search(mode: &str) -> Result<()> {
     Ok(())
 }
 
+/// `oppxs gpus`: the cards and which are selected; `gpus all` or `gpus 0,2`
+/// changes that (refused while a backend runs, like the app's checkboxes).
+async fn gpus(which: Option<&str>) -> Result<()> {
+    let mut settings = Settings::load();
+    let present = gpu::query().await.unwrap_or_default();
+    if let Some(which) = which {
+        if openphalanx_core::docker::inspect().await.ok().flatten().is_some_and(|c| c.state.running) {
+            bail!("Stop the server to change the GPUs; it applies at the next start.");
+        }
+        let chosen = match which.trim() {
+            "all" => None,
+            list => {
+                let indices = list
+                    .split(',')
+                    .map(|i| i.trim().parse::<u32>().map_err(|_| anyhow::anyhow!("use `oppxs gpus all` or indices like `oppxs gpus 0,2`")))
+                    .collect::<Result<Vec<u32>>>()?;
+                if let Some(missing) = indices.iter().find(|i| !present.iter().any(|g| g.index == **i)) {
+                    bail!("There is no GPU {missing} in this machine (`oppxs gpus` lists them).");
+                }
+                Some(indices)
+            }
+        };
+        settings.set_gpus(chosen).map_err(|e| anyhow::anyhow!(e))?;
+        settings.save()?;
+    }
+    if present.is_empty() {
+        println!("No NVIDIA GPU found (nvidia-smi failed).");
+        return Ok(());
+    }
+    let selected = settings.selected_gpus(&present);
+    for g in &present {
+        let mark = if selected.iter().any(|s| s.index == g.index) { "x" } else { " " };
+        println!("[{mark}] {}: {} · {} of {} free", g.index, g.name, vram::fmt_gib(g.free_bytes), vram::fmt_gib(g.total_bytes));
+    }
+    match (&settings.gpus, selected.len()) {
+        (None, n) if n > 1 => println!("Every GPU is used (the default)."),
+        (Some(_), 0) => println!("None of the selected GPUs is in this machine: choose with `oppxs gpus all` or `oppxs gpus 0,2`."),
+        _ => {}
+    }
+    if selected.len() > 1 {
+        println!(
+            "A model that fits one card runs on the one with the most free memory. One that doesn't is spread over the \
+             selected cards: experimental, not yet tried on real hardware."
+        );
+    }
+    Ok(())
+}
+
 /// `start --force`, as ticking "Force load" in the app: the context window
 /// comes down to the longest the model fits now, or to the minimum when none
 /// does, so the server isn't asked for a window the GPU can't hold.
@@ -1008,6 +1068,7 @@ async fn main() {
         Command::Port { args } => set_port(&args).await,
         Command::Ports => show_ports().await,
         Command::WebSearch { mode } => set_web_search(&mode),
+        Command::Gpus { which } => gpus(which.as_deref()).await,
         Command::Logs { member: None, lines } => backend_logs(lines).await,
         other => control(other).await,
     };

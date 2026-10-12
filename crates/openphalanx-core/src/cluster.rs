@@ -245,7 +245,8 @@ pub async fn collect_inventory() -> Inventory {
         arch: std::env::consts::ARCH.to_string(),
         cpus: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1),
         memory_bytes: memory_bytes().unwrap_or(0),
-        gpus: gpu::query().await.unwrap_or_default(),
+        // Only the cards this machine's owner selected: the host pools what it is told about.
+        gpus: crate::settings::Settings::load().selected_gpus(&gpu::query().await.unwrap_or_default()),
         docker_version,
         docker_error,
         nvidia_runtime,
@@ -1942,11 +1943,9 @@ async fn start_worker(order: &WorkerOrder) -> Result<()> {
     // Built here like on the host (the first time this downloads the SGLang
     // base image, ~16 GB); the host shows the worker as starting meanwhile.
     crate::docker::ensure_image(&order.image, |_| {}).await?;
-    let gpu = crate::gpu::query()
-        .await?
-        .into_iter()
-        .max_by_key(|g| g.free_bytes)
-        .context("no NVIDIA GPU found")?;
+    // Of the GPUs selected on this machine (Settings), the one with the most free memory.
+    let selected = crate::settings::Settings::load().selected_gpus(&crate::gpu::query().await?);
+    let gpu = crate::server::best_gpu(&selected).context("no NVIDIA GPU found among the selected ones")?;
     let req = order.stage.requirement;
     let fraction = crate::vram::mem_fraction_static(&req, gpu.free_bytes, gpu.total_bytes).with_context(|| {
         format!(

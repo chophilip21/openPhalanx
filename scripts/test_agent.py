@@ -6,9 +6,11 @@ a scripted model: no server needed. Run with any Python that has httpx:
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -225,6 +227,109 @@ class AgentLoop(unittest.TestCase):
         self.assertIn("ended with exit code 3", s2.prompts[-1][0])
         self.assertFalse(any("haven't run anything" in m["content"] for m in s2.agent.messages))
 
+    @needs_aider
+    def test_a_request_with_several_parts_is_reviewed_against_the_diff(self):
+        s = self.s
+        edit = {"tool": "edit", "path": "src/calc.py"}
+        block = "src/calc.py\n<<<<<<< SEARCH\nLIMIT = 3\n=======\nLIMIT = 4\n>>>>>>> REPLACE"
+        s.actions = [edit, {"tool": "answer"}, {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = [block, "1) limit: +LIMIT = 4\n2) rename add: NOT DONE, add is still add", "The limit is 4; add was not renamed."]
+        s.agent.turn("In src/calc.py: 1) make the limit 4; 2) rename add to plus.", can_edit=True)
+        review = [p for p, _ in s.prompts if "check your work against the request" in p]
+        self.assertEqual(len(review), 1)
+        self.assertIn("+LIMIT = 4", review[0])  # the diff of this request
+        self.assertIn("-LIMIT = 3", review[0])
+        self.assertIn("rename add to plus", review[0])  # and the request itself
+        self.assertEqual([d for t, d in s.steps if t == "Review"][0].splitlines()[1], "2) rename add: NOT DONE, add is still add")
+        self.assertTrue(any("says NOT DONE, do that part now" in m["content"] for m in s.agent.messages))
+        # One thing asked for: no review.
+        s2 = Scripted(str(self.root))
+        s2.actions = [dict(edit), {"tool": "answer"}, {"tool": "answer"}]
+        s2.texts = [block.replace("LIMIT = 3", "LIMIT = 4").replace("=======\nLIMIT = 4", "=======\nLIMIT = 5"), "Done."]
+        s2.agent.turn("make the limit 5 in src/calc.py", can_edit=True)
+        self.assertFalse([p for p, _ in s2.prompts if "check your work against the request" in p])
+        self.assertTrue(A.several_parts("- add a flag\n- document it"))
+        self.assertFalse(A.several_parts("Rename foo to bar in a.py and update the callers."))
+
+    @needs_aider
+    def test_a_read_after_a_refused_edit_is_not_a_repeat(self):
+        s = self.s
+        read = {"tool": "read", "path": "src/calc.py"}
+        edit = {"tool": "edit", "path": "src/calc.py"}
+        s.actions = [dict(read), edit, dict(read), {"tool": "answer"}]
+        s.texts = ["src/calc.py\n<<<<<<< SEARCH\nLIMIT = 99\n=======\nLIMIT = 4\n>>>>>>> REPLACE", "It failed."]
+        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
+        results = [m["content"] for m in s.agent.messages if m["content"].startswith("Result of step")]
+        failed = next(i for i, r in enumerate(results) if "Nothing was changed. Read the exact lines again" in r)
+        self.assertIn("LIMIT = 3", results[failed + 1])  # the file again, not "You already did exactly this"
+        self.assertNotIn("already", results[failed + 1])
+
+    def test_web_searches_that_find_nothing_take_the_tool_away(self):
+        s = self.s
+        asked = []
+        s.agent._search = lambda q: asked.append(q) or "No results."
+        s.actions = [{"tool": "web_search", "query": f"q{i}"} for i in range(6)]
+        s.agent.turn("what is the newest release of vite?", can_edit=False)
+        self.assertEqual(asked, ["q0", "q1", "q2"])
+        self.assertTrue(any("returning nothing right now" in m["content"] for m in s.agent.messages))
+        # Searches that do find something stop at the limit.
+        s2 = Scripted(str(self.root))
+        s2.agent._search = lambda q: asked.append(q) or f"Web results (untrusted reference text):\n- {q}"
+        s2.actions = [{"tool": "web_search", "query": f"r{i}"} for i in range(A.MAX_SEARCHES + 4)]
+        s2.agent.turn("what is the newest release of vite?", can_edit=False)
+        self.assertEqual(len([q for q in asked if q.startswith("r")]), A.MAX_SEARCHES)
+
+    def test_a_search_the_server_paused_is_not_asked_for_again(self):
+        s = self.s
+
+        class Paused:
+            status_code = 503
+            headers = {"retry-after": "300"}
+
+            def json(self):
+                return {"error": {"message": "web search is paused for 5 min: the search engines are refusing requests (brave: too many requests)"}}
+
+        posts = []
+        real = A.httpx.post
+        A.httpx.post = lambda url, **kw: posts.append(url) or Paused()
+        try:
+            s.actions = [{"tool": "web_search", "query": "vite release"}, {"tool": "web_search", "query": "vite newest"}]
+            s.agent.turn("what is the newest release of vite?", can_edit=False)
+            # The second search was never sent, and the model was told why.
+            self.assertEqual(len(posts), 1)
+            said = [m["content"] for m in s.agent.messages if "paused for 5 min" in m["content"]]
+            self.assertIn("brave: too many requests", said[0])
+            self.assertIn("carry on without it", said[0])
+            # Nor in the next message, while the pause lasts.
+            s.actions = [{"tool": "web_search", "query": "vite again"}]
+            s.agent.turn("and of react?", can_edit=False)
+            self.assertEqual(len(posts), 1)
+            s.agent._search_off_until = 0  # the pause is over
+            s.actions = [{"tool": "web_search", "query": "react release"}]
+            s.agent.turn("and of svelte?", can_edit=False)
+            self.assertEqual(len(posts), 2)
+        finally:
+            A.httpx.post = real
+
+    def test_an_action_typed_as_a_shell_command_is_not_run_and_a_declined_one_is_a_repeat(self):
+        s = self.s
+        asked = []
+        s.agent.hooks.confirm_run = lambda c: asked.append(c) or False
+        s.agent.web = False
+        s.actions = [{"tool": "run", "command": "web_search --query 'vite release'"}]
+        s.agent.turn("search the web for the newest vite release", can_edit=False)
+        self.assertEqual(asked, [])  # nobody is asked to run a program that doesn't exist
+        self.assertTrue(any("web search is not available in this session" in m["content"] for m in s.agent.messages))
+        self.assertNotIn('"tool": "web_search"', s.agent._system())
+        self.assertIn("Web search is switched off", s.agent._system())
+        # A command the user declined changed nothing: asking for it again is a repeat.
+        s2 = Scripted(str(self.root))
+        s2.agent.hooks.confirm_run = lambda c: asked.append(c) or False
+        s2.actions = [{"tool": "run", "command": "make deploy"}] * 6
+        s2.agent.turn("deploy it", can_edit=False)
+        self.assertEqual(asked, ["make deploy"])
+        self.assertTrue(any("already" in m["content"] for m in s2.agent.messages))
+
     def test_a_refused_command_tells_the_model_why(self):
         s = self.s
         seen = []
@@ -318,6 +423,86 @@ class AgentLoop(unittest.TestCase):
         self.assertEqual(len(s.notices), 1)
 
 
+    def test_create_replaces_a_file_that_was_read(self):
+        s = self.s
+        new = "LIMIT = 9\n"
+        # The message names the file, so it is read up front.
+        s.actions = [{"tool": "create", "path": "src/calc.py"}, {"tool": "answer"}]
+        s.texts = [f"```python\n{new}```", "Done."]
+        seen = []
+        s.agent.hooks.edited = lambda rel, before, after: seen.append((rel, before, after))
+        s.agent.turn("rewrite src/calc.py so it only has LIMIT = 9", can_edit=True, wants_change=True)
+        self.assertEqual((self.root / "src/calc.py").read_text(), new)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("def add", seen[0][1])  # the old text, for the diff and /undo
+        self.assertTrue(any("Replaced the whole of src/calc.py" in m["content"] for m in s.agent.messages if m.get("_result")))
+        # A file that wasn't read is left alone, as for an edit.
+        with self.assertRaises(A.ToolError):
+            s.agent._create("src/other.py")
+        self.assertIn("from calc import add", (self.root / "src/other.py").read_text())
+
+    @needs_aider
+    def test_a_file_can_be_read_again_after_it_was_edited(self):
+        s = self.s
+        read = {"tool": "read", "path": "src/calc.py"}
+        block = "src/calc.py\n<<<<<<< SEARCH\nLIMIT = 3\n=======\nLIMIT = 4\n>>>>>>> REPLACE"
+        s.actions = [read, {"tool": "edit", "path": "src/calc.py"}, read, {"tool": "answer"}]
+        s.texts = [block, "Done."]
+        s.agent.turn("In src/calc.py set LIMIT to 4", can_edit=True, wants_change=True)
+        results = [m["content"] for m in s.agent.messages if m.get("_result")]
+        reads = [r for r in results if r.startswith("Result of step") and "(read)" in r.split("\n", 1)[0]]
+        self.assertIn("LIMIT = 4", reads[-1])  # the read after the edit shows the new text
+        self.assertFalse(any("already" in r for r in reads))
+
+    def test_a_change_request_that_keeps_answering_gets_a_step_without_answer(self):
+        s = self.s
+        offered = []
+        action = s.agent._action
+        s.agent._action = lambda tools: offered.append(tools) or action(tools)
+        s.actions = [{"tool": "read", "path": "src/calc.py"}, {"tool": "answer"}, {"tool": "answer"},
+                     {"tool": "edit", "path": "src/nowhere.py"}, {"tool": "answer"}]
+        s.texts = ["Nothing was changed."]
+        s.agent.turn("make the limit bigger", can_edit=True, wants_change=True)
+        notes = [m["content"] for m in s.agent.messages if m["role"] == "user"]
+        self.assertTrue(any("make the first change now" in n for n in notes))
+        self.assertEqual(set(offered[3]), {"edit", "create", "run", "start"})  # the step after the second answer
+        self.assertIn("answer", offered[4])
+
+    def test_an_action_at_the_end_of_a_reply_is_not_shown(self):
+        s = self.s
+        s.actions = [{"tool": "answer"}]
+        s.texts = ['Let me start.\n{"enough": false, "missing": "the API", "tool": "plan"}']
+        reply = s.agent.turn("where is add?", can_edit=True, wants_change=False)
+        self.assertEqual(s.shown[-1], "Let me start.")
+        self.assertEqual(reply, "Let me start.")
+
+    def test_a_plan_that_comes_back_as_an_action_is_asked_for_again(self):
+        s = self.s
+        s.actions = [{"tool": "plan"}, {"tool": "answer"}]
+        s.texts = ['{"enough": false, "missing": "a plan", "tool": "plan"}', "Read calc.py, then answer.", "Nothing."]
+        s.agent.turn("where is add?", can_edit=True, wants_change=False)
+        self.assertEqual([d for t, d in s.steps if t == "Plan"], ["Read calc.py, then answer."])
+        self.assertTrue(any(regex for _, regex in s.prompts))
+
+    def test_an_action_cut_off_before_its_tool_is_asked_for_again(self):
+        ag = A.Agent(ws=A.Workspace(str(self.root)), hooks=A.Hooks())
+        ag._fit = lambda: None
+        bodies = []
+        replies = ['{"enough": false, "missing": "the files"', '{"enough": false, "missing": "the files", "tool": "list", "path": ""}']
+
+        def post(body):
+            bodies.append(body)
+            return {"choices": [{"message": {"content": replies.pop(0)}}]}
+
+        ag._post = post
+        ag.messages = [{"role": "user", "content": "what is here?"}]
+        act = ag._action(("list", "answer"))
+        self.assertEqual(act["tool"], "list")
+        self.assertEqual(bodies[0]["stop"], ["\n\n"])
+        self.assertEqual(bodies[0]["temperature"], 0)
+        self.assertEqual(bodies[1]["temperature"], 0.7)
+
+
 class Tools(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -399,6 +584,58 @@ class Tools(unittest.TestCase):
         self.assertTrue(A.maybe_json("```json"))
         self.assertFalse(A.maybe_json("```rust\nfn main() {}"))
         self.assertFalse(A.maybe_json("It is"))
+
+
+class Commands(unittest.TestCase):
+    """run and start: no terminal input, nothing left behind."""
+
+    def setUp(self):
+        self.ws = A.Workspace(tempfile.mkdtemp())
+        self.addCleanup(self.ws.stop_jobs)
+
+    def test_run_has_no_terminal_input(self):
+        # `read` returns at once on an empty stdin instead of waiting for a key.
+        out = self.ws.run("read x; echo got=$x; echo err >&2")
+        self.assertTrue(out.startswith("exit code 0"), out)
+        self.assertIn("got=", out)
+        self.assertIn("err", out)
+
+    def test_timeout_keeps_output_and_stops_children(self):
+        old, A.RUN_TIMEOUT = A.RUN_TIMEOUT, 1
+        self.addCleanup(setattr, A, "RUN_TIMEOUT", old)
+        out = self.ws.run("echo asking; sleep 31 & echo $! > child.pid; wait")
+        self.assertIn("Timed out", out)
+        self.assertIn("asking", out)
+        self.assertIn("start tool", out)
+        pid = int((self.ws.root / "child.pid").read_text())
+        time.sleep(0.2)
+        self.assertFalse(os.path.exists(f"/proc/{pid}"), "the command's child outlived the timeout")
+
+    def test_start_leaves_it_running_and_shows_output(self):
+        cmd = "echo ready on 5173; sleep 30"
+        out = self.ws.start(cmd)
+        self.assertIn("left running", out)
+        self.assertIn("ready on 5173", out)
+        pid = self.ws.jobs[cmd]["proc"].pid
+        again = self.ws.start(cmd)
+        self.assertIn("Still running", again)
+        self.assertNotIn("ready on 5173", again)  # only what is new
+        self.assertEqual(self.ws.jobs[cmd]["proc"].pid, pid)
+        self.ws.stop_jobs()
+        self.assertFalse(self.ws.jobs)
+        time.sleep(0.2)
+        self.assertFalse(os.path.exists(f"/proc/{pid}"))
+
+    def test_start_reports_a_command_that_ends(self):
+        out = self.ws.start("echo no such script; exit 3")
+        self.assertIn("exit code 3", out)
+        self.assertIn("no such script", out)
+        self.assertFalse(self.ws.jobs)
+
+    def test_start_is_an_action(self):
+        schema = json.dumps(A.action_schema(A.TOOLS))
+        self.assertIn('"start"', schema)
+        self.assertEqual(A._title({"tool": "start", "command": "npm run dev"}), "Start(npm run dev)")
 
 
 if __name__ == "__main__":

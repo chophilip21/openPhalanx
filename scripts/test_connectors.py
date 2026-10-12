@@ -221,6 +221,16 @@ class InTheAgent(Sandbox):
         ag._text = lambda *a, **k: "All done."
         return ag
 
+    def test_a_connectors_name_as_a_shell_command_is_not_run(self):
+        ag = self.agent([{"why": "save", "tool": "run", "command": "notes add_note Deploy"}, {"why": "done", "tool": "answer"}], [])
+        ran = []
+        ag.hooks.confirm_run = lambda c: ran.append(c) or True
+        ag.turn("Save a note titled Deploy")
+        self.assertEqual(ran, [])  # nobody was asked to run a program that doesn't exist
+        said = [m["content"] for m in ag.messages if "is not a program here" in m["content"]]
+        self.assertEqual(len(said), 1)
+        self.assertIn('{"tool": "notes.add_note"}', said[0])
+
     def test_calls_the_tool_with_schema_constrained_arguments(self):
         ag = self.agent([{"why": "save it", "tool": "notes.add_note"}, {"why": "done", "tool": "answer"}],
                         [{"title": "Deploy", "body": "Friday"}])
@@ -315,6 +325,15 @@ class InTheAgent(Sandbox):
         self.assertIn("Connector tools that ran in this request: notes.add_note", facts[0])
         self.assertNotIn("you made none", facts[0], "not told that nothing was done")
         self.assertFalse(any("haven't changed anything yet" in m["content"] for m in ag.messages))
+        self.assertNotIn("only read", facts[0])
+
+    def test_a_reply_after_only_reading_is_told_nothing_was_written(self):
+        ag = self.agent([{"why": "look", "tool": "notes.list_notes"}, {"why": "done", "tool": "answer"}], [])
+        facts = []
+        answer = ag._answer
+        ag._answer = lambda text="", f="", stuck="": facts.append(f) or answer(text, f, stuck)
+        ag.turn("Save a note titled A")
+        self.assertIn("All of them only read: nothing was created", facts[-1])
 
 
 class Browser(Sandbox):

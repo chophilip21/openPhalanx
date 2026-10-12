@@ -26,6 +26,8 @@
   const need = $derived(selected?.requirement.total_bytes ?? 0);
   const needFrac = $derived(total > 0 ? Math.min(need / total, 1) : 0);
   const over = $derived(need > total);
+  // Every slice is a GPU of this machine (several selected, no cluster to split across).
+  const local = $derived(nodes.every((n) => n.this));
 </script>
 
 <section class="card pool">
@@ -49,11 +51,11 @@
     </svg>
   </div>
   <div class="legend">
-    <span class="eyebrow titled"><Icon name="users" size={14} /> Split cluster · {nodes.length} servers</span>
+    <span class="eyebrow titled"><Icon name="users" size={14} /> {local ? `This machine · ${nodes.length} GPUs (experimental)` : `Split cluster · ${nodes.length} servers`}</span>
     {#each slices as s (s.node.id)}
       <div class="row">
         <span class="sw" style="background:{s.color}"></span>
-        <span class="name">{s.node.this ? "This machine" : s.node.name}</span>
+        <span class="name">{local ? s.node.name : s.node.this ? "This machine" : s.node.name}</span>
         <span class="muted gpu">{s.node.gpu ?? "no GPU"}</span>
         <span class="num"><strong>{gib(s.node.available_bytes)}</strong> <span class="muted">of {gib(s.node.total_bytes)} · {Math.round(s.pct)}%</span></span>
       </div>
@@ -65,12 +67,21 @@
         <span class="muted">{over ? `${gib(need - total)} more than the pool` : `${Math.round(needFrac * 100)}% of the pool`}</span>
       </div>
     {/if}
+    {#if local}
+      <p class="muted note">
+        Free VRAM on each selected GPU (Settings chooses which). A model that fits one card runs on the one with the
+        most free memory. One that doesn't is spread over these cards when you start it, each card paying its own
+        runtime memory, which is added to the need below. That is experimental: it has not been tried on a machine
+        with several GPUs yet.
+      </p>
+    {:else}
     <p class="muted note">
       Free VRAM on each server's largest GPU, as last reported. With the split strategy the weights and KV cache are
       shared out, but every server needs its own runtime memory, so each extra server adds that to the need below.
       A model that fits this machine's GPU runs here alone (faster, and it keeps serving if a member drops out); one
       that doesn't is split across the servers when you start it.
     </p>
+    {/if}
   </div>
 </section>
 

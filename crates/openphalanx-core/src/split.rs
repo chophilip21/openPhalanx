@@ -75,13 +75,26 @@ pub struct Stage {
 /// model left SGLang a KV cache shorter than the context window, with
 /// gigabytes unused). Every server gets at least one layer.
 pub fn plan(req: &Requirement, shape: &ModelShape, nodes: &[Capacity]) -> Result<Vec<Stage>, String> {
+    plan_over(req, shape, nodes, "servers")
+}
+
+/// `plan` for the GPUs of one machine: the same shares, one stage per card.
+pub fn plan_gpus(req: &Requirement, shape: &ModelShape, gpus: &[crate::gpu::GpuInfo]) -> Result<Vec<Stage>, String> {
+    let caps: Vec<Capacity> = gpus
+        .iter()
+        .map(|g| Capacity { id: g.index.to_string(), name: format!("GPU {}", g.index), free_bytes: g.free_bytes })
+        .collect();
+    plan_over(req, shape, &caps, "GPUs")
+}
+
+fn plan_over(req: &Requirement, shape: &ModelShape, nodes: &[Capacity], what: &str) -> Result<Vec<Stage>, String> {
     let n = nodes.len();
     let total_layers = shape.layers.max(1);
     if n == 0 {
-        return Err("No servers to split the model across.".into());
+        return Err(format!("No {what} to split the model across."));
     }
     if (n as u32) > total_layers {
-        return Err(format!("The model has {total_layers} layers, too few for {n} servers."));
+        return Err(format!("The model has {total_layers} layers, too few for {n} {what}."));
     }
     let ends = |i: usize| shape.embed_bytes * (u64::from(i == 0) + u64::from(i == n - 1));
     let body_weights = req.weight_bytes.saturating_sub(2 * shape.embed_bytes);
@@ -104,7 +117,7 @@ pub fn plan(req: &Requirement, shape: &ModelShape, nodes: &[Capacity]) -> Result
         let need: u64 = (0..n).map(fixed).sum::<u64>() + per_layer * u64::from(total_layers);
         let free: u64 = nodes.iter().map(|c| c.free_bytes).sum();
         return Err(format!(
-            "Split across {n} servers it needs about {} but they have {} free together. Pick a smaller model or a shorter context.",
+            "Split across {n} {what} it needs about {} but they have {} free together. Pick a smaller model or a shorter context.",
             fmt_gib(need),
             fmt_gib(free)
         ));
