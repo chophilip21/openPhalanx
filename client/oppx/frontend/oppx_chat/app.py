@@ -23,7 +23,7 @@ from .mcp import Hub
 from . import browser
 from .agent import Agent, Hooks, Workspace
 from .permissions import Permissions
-from .routing import wants_edit
+from .routing import announces_change, wants_edit
 from .context import CONTEXT_MGR, PRI_EDITED, _check_tokens, _fitted_format_messages
 from .oppx_io import OppxIO
 from .cache import ASK_NOTE, _ask_file_mentions, _ask_init, _coder_init, _dump_requests, _stable_ranked_map
@@ -258,7 +258,10 @@ def make_agent(coder) -> Agent:
                 options.append(("a", ACCENT, f"always in this project: {', '.join(keep)}  ·  this session: {inline}"))
             options.append(("s", ACCENT, f"this session only: {', '.join(session)}  (not saved)"))
         options += [("n", RED, "no  (Enter)"), ("…", MUTED, "or type what to do instead")]
-        said = coder.io.ask_options("Run this command?", command.splitlines(), options).strip()
+        # `start` leaves it running (a dev server): say so, it is not the same yes.
+        starting = getattr(UI.agent, "asking", "") == "start"
+        question = "Start this command and leave it running? (it is stopped when the chat ends)" if starting else "Run this command?"
+        said = coder.io.ask_options(question, command.splitlines(), options).strip()
         SPIN.start()
         result, shown = perms.answered(command, said)
         step(shown, GREEN if result is True else MUTED)
@@ -298,7 +301,9 @@ def make_agent(coder) -> Agent:
 
     hooks = Hooks(step=on_step, stream=on_stream, edited=on_edited, confirm_run=on_confirm, notice=on_notice,
                   confirm_tool=on_confirm_tool, start_browser=lambda: start_browser(SESSION.coder or coder, ask=True),
-                  waiting=lambda label: SPIN.start(label), interrupted=lambda: UI.interrupted)
+                  waiting=lambda label: SPIN.start(label), interrupted=lambda: UI.interrupted,
+                  announces=lambda reply: announces_change(reply, {"session": UI.agent.session, "turn": UI.agent.turns,
+                                                                   "step": 0, "kind": "route"} if UI.agent else None))
     agent = Agent(ws=Workspace(coder.root, getattr(coder, "repo_map", None), coder.io.encoding),
                   hooks=hooks, context=CONTEXT, reasoning=REASONING, trace=TRACE, web=WEB, memory=_memory(coder),
                   connectors=UI.connectors,
@@ -348,7 +353,8 @@ def agent_turn(coder, text: str):
     agent = UI.agent
     # The ask/edit check belongs to the turn that is about to start (for the server's Trace page).
     route = {"session": agent.session, "turn": agent.turns + 1, "step": 0, "kind": "route"}
-    wants_change = can_edit and wants_edit(text, route)
+    # Read with what it may be an answer to: alone, "yes, go ahead" is a question.
+    wants_change = can_edit and wants_edit(text, route, agent.last_reply(), agent.pending)
     agent = UI.agent
     if agent.memory != _memory(coder):  # # notes and /init change it
         agent.memory = _memory(coder)
@@ -386,6 +392,7 @@ def agent_turn(coder, text: str):
         else:
             step(f"The request failed: {escape(msg[:300])}", RED)
     finally:
+        UI.unannounced.clear()  # each is shown as "> …" when its turn starts, right after this one
         SESSION.watcher = None
         SPIN.stop()
     if UI.interrupted:
