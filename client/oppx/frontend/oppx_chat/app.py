@@ -247,16 +247,19 @@ def make_agent(coder) -> Agent:
             step("Not run: " + ("a deny rule forbids it" if "deny rule" in why else "edits are off, and it doesn't only read"), MUTED)
             return why
         rules, session = perms.offer(command), perms.offer_session(command)
-        options = [("y", GREEN, "yes, this once")]
+        covered = session or rules  # what one yes allows until the chat ends
+        # One yes is enough for a session. What is asked every time (rm, sudo, git push) has no such yes.
+        options = [("y", GREEN, f"yes, and don't ask again this session: {', '.join(covered)}" if covered else "yes, this once")]
         if rules:
             options.append(("a", ACCENT, f"always in this project: {', '.join(rules)}"))
-        if session:
+        elif session:
             # Inline code (python -c) gets no saved rule; the rest of the line may.
             keep = perms.savable(session)
             if keep:
                 inline = ", ".join(r for r in session if r not in keep)
                 options.append(("a", ACCENT, f"always in this project: {', '.join(keep)}  ·  this session: {inline}"))
-            options.append(("s", ACCENT, f"this session only: {', '.join(session)}  (not saved)"))
+        if covered:
+            options.append(("o", ACCENT, "only this once"))
         options += [("n", RED, "no  (Enter)"), ("…", MUTED, "or type what to do instead")]
         # `start` leaves it running (a dev server): say so, it is not the same yes.
         starting = getattr(UI.agent, "asking", "") == "start"
@@ -276,21 +279,21 @@ def make_agent(coder) -> Agent:
         connector = name.split(".", 1)[0]
         known = getattr(UI.connectors, "connectors", {}).get(connector)
         trusted = known is None or known.definition.scope != "project"
-        verdict, why = perms.judge_tool(name, read_only, trusted)
+        verdict, why = perms.judge_tool(name, read_only, trusted, arguments)
         if verdict == "run":
             return True
         if verdict == "refuse":
             step(f"Not run: a deny rule forbids {escape(name)}", MUTED)
             return why
-        options = [("y", GREEN, "yes, this once")]
-        if not perms.every_time(name):  # running JavaScript in the browser: asked every time, nothing lasting on offer
+        # One yes is enough for a session, for any tool of any connector.
+        options = [("y", GREEN, f"yes, and don't ask again this session: {name}")]
+        if not perms.every_time(name):  # running JavaScript in the browser is never saved between sessions
             options += [("a", ACCENT, f"always in this project: {name}"),
-                        ("c", ACCENT, f"always in this project: every {connector} tool"),
-                        ("s", ACCENT, f"this session only: {name}  (not saved)")]
-        options += [("n", RED, "no  (Enter)"), ("…", MUTED, "or type what to do instead")]
+                        ("c", ACCENT, f"always in this project: every {connector} tool")]
+        options += [("o", ACCENT, "only this once"), ("n", RED, "no  (Enter)"), ("…", MUTED, "or type what to do instead")]
         said = coder.io.ask_options("Call this connector tool?", f"{name} {arguments}".splitlines()[:30], options)
         SPIN.start()
-        result, shown = perms.answered_tool(name, said)
+        result, shown = perms.answered_tool(name, said, arguments)
         step(shown, GREEN if result is True else MUTED)
         return result
 

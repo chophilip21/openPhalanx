@@ -186,6 +186,7 @@ YES = {"y", "yes", "ok", "okay", "k", "sure", "yep", "yeah", "yup", "yes please"
        "go ahead", "do it", "run it", "fine", "alright"}
 ALWAYS = {"a", "always"}
 SESSION = {"s", "session"}
+ONCE = {"o", "once", "only once", "just once", "this once", "only this once", "just this once"}
 
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _OPS = ("&&", "||", ";;", "|&", "&>>", "&>", ">>", ">&", ">|", "<<<", "<<", "<&", "<>", "<(", ">(",
@@ -1150,6 +1151,10 @@ class Permissions:
         self.session_dirs: list[str] = []
         self.session_inline: set[str] = set()
         self.session_except: set[str] = set()
+        # Tools the user said yes to in this session: one yes is enough until the chat ends, for any
+        # tool of any connector, also one that is never remembered between sessions. (The same call
+        # was asked about three times running.)
+        self.session_yes: set[str] = set()
         self.connectors: set[str] = set()  # connector names, so `/permissions allow linear.x` is a tool rule
         self._stamp = None
         self.load()
@@ -1369,9 +1374,15 @@ class Permissions:
                 return True, (f"Allowed, and from now on without asking: {names(keep)} (/permissions to change); "
                               f"for this session: {names(inline)}")
             return True, f"Allowed, and for the rest of this session without asking: {names(session)}"
+        if answer in ONCE:
+            return True, "Allowed this once"
+        if answer in YES and session:
+            # One yes is enough for a session: the same kind of command isn't
+            # asked about again until the chat ends. Nothing is saved.
+            self._allow_session(session)
+            return True, f"Allowed, and for the rest of this session without asking: {names(session)} (a = always)"
         if answer in YES | ALWAYS | SESSION:
-            once = answer in ALWAYS | SESSION
-            return True, "Allowed" + (" this once (this kind of command is asked every time)" if once else "")
+            return True, "Allowed this once (this kind of command is asked every time)"
         if answer in ("", "n", "no"):
             return False, "Declined"
         return f"The user declined to run this command and said: {said.strip()}", "Declined, with your note"
@@ -1456,9 +1467,15 @@ class Permissions:
         return name in self.session_except
 
     def tool_allowed(self, name: str) -> bool:
-        """Allowed by its own rule, or by its connector's ("linear.*")."""
+        """Allowed by a yes earlier in this session, by its own rule, or by
+        its connector's ("linear.*"). A tool marked asked-every-time is
+        covered by the yes only: no rule, saved or for a whole connector."""
         self._fresh()
-        if self.tool_denied(name) or self.every_time(name):
+        if self.tool_denied(name):
+            return False
+        if name in self.session_yes:
+            return True
+        if self.every_time(name):
             return False
         wild = f"{self._connector_of(name)}.*"
         return name in self.tools or wild in self.tools or name in self.session_tools or wild in self.session_tools
@@ -1477,7 +1494,7 @@ class Permissions:
     def allow_tool(self, name: str):
         self._change("tools", add=[name])
 
-    def judge_tool(self, name: str, read_only: bool, trusted: bool = True) -> tuple[str, str]:
+    def judge_tool(self, name: str, read_only: bool, trusted: bool = True, arguments: str | None = None) -> tuple[str, str]:
         """("run", ""), ("refuse", why) or ("ask", "") for a connector call.
         A tool its connector marks as only reading runs without a question,
         like a command that only reads; deny rules still win. `trusted`: the
@@ -1489,11 +1506,12 @@ class Permissions:
             return "run", ""
         return "ask", ""
 
-    def answered_tool(self, name: str, said: str) -> tuple[bool | str, str]:
-        """The answer to "Call this connector tool?": y once, a always for this
-        tool, c always for every tool of its connector, s until the chat ends,
-        N, or what to do instead. For a tool that is asked every time the
-        lasting answers are a yes for this once."""
+    def answered_tool(self, name: str, said: str, arguments: str | None = None) -> tuple[bool | str, str]:
+        """The answer to "Call this connector tool?": y (and that tool isn't
+        asked about again in this session, whatever connector it is from), a
+        always for this tool, c always for every tool of its connector, o only
+        this once, N, or what to do instead. A tool marked asked-every-time is
+        never saved: for it a, c and s are a yes for the session too."""
         answer = _norm(said)
         connector = self._connector_of(name)
         lasting = not self.every_time(name)
@@ -1503,13 +1521,12 @@ class Permissions:
         if answer in ("c", "connector") and connector != name and lasting:
             self.allow_tool(f"{connector}.*")
             return True, f"Allowed, and from now on without asking: every {connector} tool (/permissions to change)"
-        if answer in SESSION and lasting:
-            self.session_tools.add(name)
-            return True, f"Allowed, and for the rest of this session without asking: {name}"
-        if answer in YES:
-            return True, "Allowed"
-        if answer in ALWAYS | SESSION | {"c", "connector"}:
-            return True, "Allowed this once (this tool is asked every time)"
+        if answer in ONCE:
+            return True, "Allowed this once"
+        if answer in YES | ALWAYS | SESSION | {"c", "connector"}:
+            self.session_yes.add(name)
+            kept = "" if lasting or answer in YES | SESSION else " (this tool is never saved between sessions)"
+            return True, f"Allowed, and for the rest of this session without asking: {name}{kept}"
         if answer in ("", "n", "no"):
             return False, "Declined"
         return f"The user declined this call and said: {said.strip()}", "Declined, with your note"
