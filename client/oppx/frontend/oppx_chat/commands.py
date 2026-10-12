@@ -44,7 +44,7 @@ HELP = [
         ("/web <url>", "add a web page to the chat"),
         ("!<command>", "run a shell command and share its output"),
         ("/test, /lint", "run your tests or linter and fix failures"),
-        ("/mcp", "connectors (MCP servers): list, add, remove, tools, reconnect"),
+        ("/mcp", "connectors (MCP servers): list with what is wrong and how to fix it, add, remove, tools, reconnect [name]"),
         ("/browser", "the headless web browser for this session: start, stop, on/off for every session"),
         ("/permissions", "what runs without asking in this project: list, remove <rule>, clear"),
     ]),
@@ -169,7 +169,8 @@ def show_cost(coder):
 # Connectors (MCP servers): /mcp
 # ---------------------------------------------------------------------------
 
-MCP_USAGE = "/mcp add <name> -- <command> [args] (or --url <https://…>) · remove <name> · tools <name> · reconnect"
+MCP_USAGE = ("/mcp add <name> -- <command> [args] (or --url <https://…>) · remove <name> · tools <name> · "
+             "reconnect [<name>] (start again; with a name it waits for a login in the browser)")
 
 
 def connector_names(hub) -> str:
@@ -205,10 +206,18 @@ def show_connector_problems(hub, adding: bool = False):
         step(f"Connectors: {escape(hub.error)}", YELLOW)
     for name, c in hub.connectors.items():
         if c.state != "connected":
-            step(f"Connector [bold]{escape(name)}[/] isn't running: {escape(c.error)}", YELLOW)
+            show_recovery(name, c)
     warning = cost_warning(hub.tokens(), CONTEXT, adding)
     if warning:
         step(f"⚠ {escape(warning)}", YELLOW)
+
+
+def show_recovery(name: str, c):
+    """A connector that isn't running: why, and the steps that bring it back."""
+    why, steps = c.recovery()
+    step(f"[{YELLOW}]Connector [bold]{escape(name)}[/] isn't running: {escape(why)}.[/] [{MUTED}]{escape(c.error[:160])}[/]")
+    for i, line in enumerate(steps, 1):
+        out(f"       [{ACCENT}]{i}.[/] {escape(line)}")
 
 
 def show_connectors(hub):
@@ -232,7 +241,10 @@ def show_connectors(hub):
             state = f"[{RED if c.state == 'failed' else YELLOW}]{'✗' if c.state == 'failed' else '!'}[/] {name:<{width}}  {'failed' if c.state == 'failed' else 'waiting':<9}"
         step(f"{state}  [{MUTED}]{where:<9}[/]  {escape(d.summary()[:70])}")
         if c.state != "connected":
-            out(f"       [{MUTED}]{escape(c.error)}[/]")
+            why, steps = c.recovery()
+            out(f"       [{YELLOW}]{escape(why)}[/] [{MUTED}]· {escape(c.error[:160])}[/]")
+            for i, line in enumerate(steps, 1):
+                out(f"       [{ACCENT}]{i}.[/] {escape(line)}")
     step(f"[{MUTED}]{escape(MCP_USAGE)}[/]")
 
 
@@ -248,6 +260,32 @@ def show_connector_tools(hub, name: str):
     for t in c.tools:
         mark = f" [{MUTED}](read-only)[/]" if t.read_only else ""
         step(f"[{ACCENT}]{escape(t.qualified)}[/]{mark}  [{MUTED}]{escape(t.summary)}[/]")
+
+
+def reconnect_one(coder, name: str):
+    """/mcp reconnect <name>: starts one connector again and waits for it, long
+    enough for a login in the browser (mcp-remote opens one)."""
+    from .mcp import LOGIN_TIMEOUT, uses_mcp_remote
+    hub = UI.connectors
+    before = {n: (t.description, t.schema) for n, t in hub.tools().items()}
+    known = hub.builtin.get(name) or next((d for d in hub.definitions() if d.name == name), None)
+    if known is None:
+        step(f"No connector named {escape(name)}. /mcp lists them.", YELLOW)
+        return
+    if uses_mcp_remote(known):
+        step(f"Starting {escape(name)}. If a browser window opens, finish the login there; this waits up to "
+             f"{LOGIN_TIMEOUT // 60} minutes.")
+    SPIN.start(f"Connecting to {name}")
+    c = hub.reconnect(name, ask_about_connector(coder))
+    SPIN.stop()
+    if c.state == "connected":
+        n = len(c.tools)
+        step(f"[{GREEN}]✓[/] {escape(name)} is connected again ({n} tool{'s' if n != 1 else ''}). Say \"continue\" to pick up "
+             "what was waiting for it.")
+    else:
+        show_recovery(name, c)
+    if {n: (t.description, t.schema) for n, t in hub.tools().items()} != before and UI.agent is not None:
+        UI.agent.reset_system()
 
 
 def reconnect_connectors(coder, adding: bool = False):
@@ -403,6 +441,8 @@ def mcp_command(coder, arg: str):
         show_connectors(hub)
     elif sub == "tools" and rest:
         show_connector_tools(hub, rest)
+    elif sub in ("reconnect", "reload", "auth", "login") and rest:
+        reconnect_one(coder, rest.split()[0])
     elif sub in ("reconnect", "reload"):
         reconnect_connectors(coder)
     else:
@@ -496,6 +536,8 @@ def permissions_command(arg: str):
         return
     word, _, rest = arg.partition(" ")
     rule = " ".join(rest.strip().strip("`").split())
+    # So `allow linear.save_issue` is a rule for that tool, not for a command of that name.
+    perms.connectors = set(getattr(UI.connectors, "connectors", {}) or ())
     if word == "clear":
         perms.clear()
         step("Cleared. Commands that change things are asked about again.")
@@ -511,16 +553,20 @@ def permissions_command(arg: str):
         step(f"Denied from now on: {escape(rule)} (refused without asking; it wins over allow rules)", YELLOW)
     else:
         headline("Permissions in this project")
-        step("never asked: commands that only read, inside the project (git status/log/diff/show, ls, cat, rg, grep, find …)")
+        step("never asked: commands that only read, inside the project (git status/log/diff/show, ls, cat, rg, grep, find, "
+             "sed -n, a version check …)")
         for r in perms.run:
-            step(f"[{GREEN}]allow[/] {escape(r)}")
+            step(f"[{GREEN}]allow[/] {escape(perms.label(('run', r)))}")
+        for d in perms.dirs:
+            step(f"[{GREEN}]allow[/] {escape(perms.label(('dirs', d)))} [dim](outside the project; remove with its path)[/]")
         for t in perms.tools:
             step(f"[{GREEN}]allow[/] {escape(t)} [dim](connector tool)[/]")
         for r in perms.deny:
             step(f"[{RED}]deny[/]  {escape(r)}")
-        if not (perms.run or perms.tools or perms.deny):
+        if not (perms.run or perms.tools or perms.deny or perms.dirs):
             step("no rules yet: answer [bold]a[/] to a question, or /permissions allow <command>")
-        step("asked every time: rm, sudo, chmod, git push, git reset, git clean, bash -c, eval, xargs, python -c …")
+        step("asked every time: rm, sudo, chmod, kill, git push/reset/clean/rebase, git checkout -- <file>, publishing "
+             "(npm publish, gh pr merge), bash -c, eval, python -c, and anything outside the project that holds credentials")
         step(f"/permissions allow|deny|remove <rule> · /permissions clear · saved in {escape(str(perms.path))}")
 
 

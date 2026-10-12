@@ -34,6 +34,7 @@ from typing import Callable
 PROTOCOL = "2025-06-18"
 CONNECT_TIMEOUT = 30  # start, initialize and tools/list, per connector
 CALL_TIMEOUT = 120  # one tool call
+LOGIN_TIMEOUT = 180  # a reconnect the user asked for: time to finish a login in the browser
 PROJECT_FILE = ".mcp.json"
 NAME_OK = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 SUMMARY_CHARS = 140  # of a tool's description, in the system prompt
@@ -412,6 +413,77 @@ class Tool:
         return cut if len(cut) <= SUMMARY_CHARS else cut[:SUMMARY_CHARS - 1].rstrip() + "…"
 
 
+# Why a connector isn't working, read from its error: each kind has its own way back.
+# Narrow on purpose: a tool that refuses its arguments ("the login field is required") is not a lost login.
+_AUTH = re.compile(r"\bHTTP (401|403)\b|\b401\b|unauthori[sz]ed|authentication (is )?(required|failed|needed)|not authenticated|"
+                   r"needs authorization|invalid[_ ]token|token (has |is )?expired|expired token|re-?authenticate", re.I)
+_MISSING = re.compile(r"command not found|no such file|not found: |ENOENT|couldn't start", re.I)
+_GONE = re.compile(r"the connector (has )?exited|broken pipe|closed the connection|isn't running", re.I)
+_SLOW = re.compile(r"no answer within|didn't start within|timed out", re.I)
+_NETWORK = re.compile(r"can't reach|connect(ion)? (error|refused|reset)|name or service|getaddrinfo|network is unreachable|ECONNREFUSED|ENOTFOUND", re.I)
+
+KINDS = {"auth": "it needs you to log in again", "missing": "its program isn't installed", "gone": "its program stopped",
+         "slow": "it didn't answer in time", "network": "it can't be reached", "other": "it failed"}
+
+
+def uses_mcp_remote(d: ServerDef) -> bool:
+    """A remote server reached through `npx mcp-remote <url>`, which does the OAuth login in the browser."""
+    return d.kind != "http" and any("mcp-remote" in str(a) for a in [d.spec.get("command"), *(d.spec.get("args") or [])])
+
+
+def diagnose(d: ServerDef, error: str) -> tuple[str, list[str]]:
+    """What went wrong with a connector, and how the user gets it back: the
+    kind (a key of KINDS) and the steps, most likely first. Shown by /mcp and
+    when a call fails, and given to the model so it can say them instead of
+    retrying. A dropped Linear login used to surface as "linear.save_issue
+    failed: …" eight times, with nothing about what to do."""
+    name = d.name
+    command, url = str(d.spec.get("command") or ""), str(d.spec.get("url") or "")
+    remote = uses_mcp_remote(d)
+    bearer = next((str(v) for k, v in (d.spec.get("headers") or {}).items() if k.lower() == "authorization"), "")
+    var = re.search(r"\$\{(\w+)", bearer)
+    log = f"Its own output is in ~/.local/state/oppx/mcp-{name}.log."
+    login = (f"Type /mcp reconnect {name}. It starts the connector again and waits up to {LOGIN_TIMEOUT // 60} minutes "
+             "while you finish the login in the browser window it opens.")
+    stale = ("If no browser opens or the login keeps failing, its saved logins are stale: exit the chat, delete the folder "
+             "~/.mcp-auth (the saved logins of every mcp-remote connector), run oppx -c to come back to this conversation, "
+             f"then /mcp reconnect {name}.")
+    if _MISSING.search(error):
+        program = Path(command).name if command else "its command"
+        hint = " (it comes with Node.js 18 or newer)" if program in ("npx", "node", "npm") else ""
+        return "missing", [f"Install {program}{hint} and make sure it is on the PATH of the shell you start oppx from.",
+                           f"Then type /mcp reconnect {name}."]
+    if _AUTH.search(error) or (remote and _SLOW.search(error)):
+        if remote:
+            # mcp-remote opens a browser login and answers nothing until it is done.
+            return "auth", [login, stale]
+        if d.kind == "http":
+            steps = ([f"The server refused the token. It is read from ${var.group(1)} when oppx starts: exit the chat, set it in "
+                      f"that shell (export {var.group(1)}=…), and run oppx -c to come back to this conversation."] if var else
+                     ["The server refused the request: the token in its Authorization header is missing, wrong or expired."])
+            return "auth", steps + [f"To save a new token: oppx mcp add {name} --url {url} -H 'Authorization: Bearer <token>' "
+                                    f"--force, then /mcp reconnect {name}."]
+        return "auth", [f"Log in to the service the way this connector expects (its documentation says how), then type "
+                        f"/mcp reconnect {name}.", log]
+    if _GONE.search(error):
+        return "gone", [f"Type /mcp reconnect {name} to start it again.", log]
+    if _NETWORK.search(error):
+        return "network", ["Check this machine's network connection" + (f" and that {url} is right." if d.kind == "http" else "."),
+                           f"Then type /mcp reconnect {name}."]
+    if _SLOW.search(error):
+        return "slow", [f"Type /mcp reconnect {name} to start it again.", log]
+    return "other", [f"Type /mcp reconnect {name} to try again.", log if d.kind != "http" else "/mcp shows its last error."]
+
+
+class ConnectorDown(McpError):
+    """A call failed because the connector itself is not working (not because
+    the tool refused the arguments). Carries what to tell the user."""
+
+    def __init__(self, name: str, kind: str, steps: list[str], error: str):
+        super().__init__(f"the {name} connector stopped working: {KINDS[kind]} ({error[:200]})")
+        self.name, self.kind, self.steps, self.error = name, kind, steps, error
+
+
 @dataclass
 class Connector:
     definition: ServerDef
@@ -419,6 +491,14 @@ class Connector:
     error: str = ""
     tools: list = field(default_factory=list)
     client: object = None
+
+    def recovery(self) -> tuple[str, list[str]]:
+        """For a connector that isn't running: why (in a few words) and the steps back."""
+        if self.state == "waiting":
+            return "it is this repository's connector and you haven't agreed to it yet", [
+                f"Type /mcp reconnect {self.definition.name}: it asks again whether to start it."]
+        kind, steps = diagnose(self.definition, self.error)
+        return KINDS[kind], steps
 
     def connect(self, root: Path, timeout: float = CONNECT_TIMEOUT):
         d = self.definition
@@ -625,12 +705,35 @@ class Hub:
         if t is None:
             raise McpError(f"{name} isn't connected (the user can run /mcp reconnect)")
         c = self.connectors[t.server]
+        request = {"name": t.name, "arguments": args}
         try:
-            result = c.client.request("tools/call", {"name": t.name, "arguments": args}, CALL_TIMEOUT, cancelled)
+            result = c.client.request("tools/call", request, CALL_TIMEOUT, cancelled)
         except McpError as e:
-            if "exited" in str(e):
-                c.state, c.error = "failed", str(e)
-            raise
+            error = str(e)
+            if error == "interrupted":
+                raise
+            kind, steps = diagnose(c.definition, error)
+            if kind == "other" or (kind == "slow" and not uses_mcp_remote(c.definition)):
+                raise  # the tool's own refusal, or one slow call: the connector is still there
+            if kind == "gone":
+                # Its program stopped (a crash, a laptop that slept): start it once more and ask again.
+                c.connect(self.root)
+                if c.state == "connected":
+                    try:
+                        result = c.client.request("tools/call", request, CALL_TIMEOUT, cancelled)
+                    except McpError as again:
+                        error = str(again)
+                    else:
+                        return self._text(t, result)
+                else:
+                    error = c.error or error
+                kind, steps = diagnose(c.definition, error)
+            c.close()
+            c.state, c.error, c.tools = "failed", error, []
+            raise ConnectorDown(t.server, kind, steps, error) from None
+        return self._text(t, result)
+
+    def _text(self, t: Tool, result: dict) -> str:
         text = render(result)
         post = self.postprocess.get(t.server)
         if post is not None:
@@ -639,8 +742,34 @@ class Hub:
             except Exception:  # noqa: BLE001 - the raw result is still useful
                 pass
         if result.get("isError"):
+            if _AUTH.search(text[:600]):
+                # The service refused the login itself: every call will, until the user logs in again.
+                c = self.connectors[t.server]
+                kind, steps = diagnose(c.definition, text[:600])
+                c.close()
+                c.state, c.error, c.tools = "failed", " ".join(text[:300].split()), []
+                raise ConnectorDown(t.server, kind, steps, c.error)
             raise McpError(text[:2000])
         return text
+
+    def reconnect(self, name: str, ask: Callable[[ServerDef], bool] | None = None, timeout: float = LOGIN_TIMEOUT) -> Connector | None:
+        """Starts one connector again from its definition as it is now, with
+        time for a login in the browser. None when nothing has that name."""
+        d = self.builtin.get(name) or next((x for x in self.definitions() if x.name == name), None)
+        if d is None:
+            return None
+        old = self.connectors.pop(name, None)
+        if old is not None:
+            old.close()
+        c = self.connectors[name] = Connector(d)
+        if name not in self.builtin and not is_approved(d, self.root):
+            if ask is not None and ask(d):
+                approve(d, self.root)
+            else:
+                c.state, c.error = "waiting", "not approved yet (a repository's connector; /mcp reconnect asks again)"
+                return c
+        c.connect(self.root, timeout)
+        return c
 
     def close(self):
         for c in self.connectors.values():

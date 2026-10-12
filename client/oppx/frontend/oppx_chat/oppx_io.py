@@ -296,6 +296,15 @@ class OppxIO(InputOutput):
         if SESSION.watcher:
             SESSION.watcher.pause()
         try:
+            # What was typed before the question appeared was not an answer
+            # to it: a line meant as the next message must not allow a command.
+            try:
+                import sys
+                import termios
+                if sys.stdin.isatty():
+                    termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            except (ImportError, OSError, ValueError):
+                pass
             # Plain line input: no prompt_toolkit, so no cursor-position
             # requests whose replies the paused Esc reader could swallow.
             if markup:
