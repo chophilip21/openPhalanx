@@ -13,7 +13,7 @@ use openphalanx_core::cluster::{self, Cluster, ClusterView, Role, Strategy};
 use openphalanx_core::server::{self, CheckStatus, StartProgress};
 use openphalanx_core::settings::{CustomModel, Settings};
 use openphalanx_core::vram::{self, FitCheck, Requirement};
-use openphalanx_core::{catalog, docker, download, gpu, model, net, paths, split};
+use openphalanx_core::{catalog, docker, download, gpu, model, net, paths, report, split};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -91,6 +91,9 @@ pub struct AppState {
     /// Set by an update's relaunch: the backend keeps running for the new
     /// copy of the app to adopt. Every other exit stops it (see `shutdown`).
     keep_backend: AtomicBool,
+    /// The previous run, when it did not end cleanly (the app was killed or
+    /// crashed, or the machine froze): offered as a problem report until dismissed.
+    unclean: Mutex<Option<report::RunMarker>>,
 }
 
 impl AppState {
@@ -145,6 +148,8 @@ struct Snapshot {
     settings: Settings,
     warnings: Vec<String>,
     cluster: Option<ClusterSnapshot>,
+    /// The previous run did not end cleanly: when it was last seen, and what the server was doing.
+    unclean: Option<report::RunMarker>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -317,6 +322,7 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
         spawn_log_follower(app.clone());
     }
 
+    let unclean = st.unclean.lock().unwrap().clone();
     Snapshot {
         server: ServerView {
             state,
@@ -341,6 +347,7 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
         settings,
         warnings,
         cluster: st.cluster.as_ref().map(|c| ClusterSnapshot { view: c.view(), error: st.cluster_error.lock().unwrap().clone() }),
+        unclean,
     }
 }
 
@@ -389,8 +396,40 @@ fn spawn_log_follower(app: AppHandle) {
 }
 
 async fn monitor(app: AppHandle) {
+    // What a problem report shows as "what the app recorded": every change of
+    // the server's state, of the cluster service's trouble, and of who is in
+    // the cluster and online. Written to disk as it happens, since the
+    // machine may not be there to ask afterwards.
+    let dir = paths::data_dir();
+    let (mut state, mut cluster_error, mut members) = (String::new(), None::<String>, String::new());
+    let mut tick = 0u32;
     loop {
         let snap = build_snapshot(&app).await;
+        let now = match &snap.server.detail {
+            Some(d) if snap.server.state != "starting" => format!("{}: {d}", snap.server.state),
+            _ => snap.server.state.to_string(),
+        };
+        if now != state {
+            report::record("server", &now);
+            state = now;
+        }
+        let trouble = snap.cluster.as_ref().and_then(|c| c.error.clone());
+        if trouble != cluster_error {
+            report::record("cluster", trouble.as_deref().unwrap_or("the cluster service is running"));
+            cluster_error = trouble;
+        }
+        let who = snap.cluster.as_ref().map_or(String::new(), |c| {
+            let each = c.view.members.iter().enumerate();
+            each.map(|(i, m)| format!("member {} {}", i + 1, if m.online { "online" } else { "offline" })).collect::<Vec<_>>().join(", ")
+        });
+        if who != members {
+            report::record("cluster", if who.is_empty() { "no members" } else { &who });
+            members = who;
+        }
+        if tick.is_multiple_of(5) {
+            report::heartbeat(&dir, snap.server.state);
+        }
+        tick = tick.wrapping_add(1);
         let _ = app.emit("snapshot", &snap);
         tokio::time::sleep(MONITOR_INTERVAL).await;
     }
@@ -534,6 +573,19 @@ fn plan_split(state: &AppState, settings: &Settings, pf: &mut server::Preflight)
 /// ticked "I understand the risk"). Only the VRAM check can be overridden.
 async fn start_server(app: AppHandle, state: State<'_, AppState>, force: Option<bool>) -> CmdResult<()> {
     let force = force.unwrap_or(false);
+    {
+        let s = state.settings();
+        let model = s.selected_model.as_deref().unwrap_or("no model");
+        report::record("server", &format!("Start pressed: {model}, {} tokens{}", s.context_len, if force { ", force load" } else { "" }));
+    }
+    let result = start_server_inner(app, state, force).await;
+    if let Err(e) = &result {
+        report::record("error", &format!("start failed: {e}"));
+    }
+    result
+}
+
+async fn start_server_inner(app: AppHandle, state: State<'_, AppState>, force: bool) -> CmdResult<()> {
     {
         let inner = state.inner.lock().unwrap();
         if matches!(inner.phase, Phase::Starting { .. } | Phase::Stopping) {
@@ -685,6 +737,7 @@ async fn start_server(app: AppHandle, state: State<'_, AppState>, force: Option<
 
 #[tauri::command]
 async fn stop_server(state: State<'_, AppState>) -> CmdResult<()> {
+    report::record("server", "Stop pressed");
     {
         let mut inner = state.inner.lock().unwrap();
         if matches!(inner.phase, Phase::Starting { .. }) {
@@ -1593,7 +1646,86 @@ async fn port_holders() -> CmdResult<Vec<openphalanx_core::ports::Holder>> {
 /// what was stopped and what still holds a port.
 #[tauri::command]
 async fn free_ports() -> CmdResult<(Vec<String>, Vec<openphalanx_core::ports::Holder>)> {
-    openphalanx_core::ports::free().await.map_err(err)
+    let result = openphalanx_core::ports::free().await.map_err(err);
+    let or_nothing = |names: Vec<String>| if names.is_empty() { "nothing".to_string() } else { names.join(", ") };
+    match &result {
+        Ok((stopped, left)) => report::record("ports", &format!(
+            "freed the ports: stopped {}; still held by {}",
+            or_nothing(stopped.clone()),
+            or_nothing(left.iter().map(|h| h.name.clone()).collect())
+        )),
+        Err(e) => report::record("error", &format!("freeing the ports failed: {e}")),
+    }
+    result
+}
+
+// --------------------------------------------------------------------------
+// Commands: the problem report
+// --------------------------------------------------------------------------
+
+/// Everything a bug report needs, gathered: what the user says happened, the
+/// app's version and settings, the machine, the backend container and its
+/// log, the kernel log's signs of trouble, and what the app recorded. Saved
+/// to a file and returned with a link that opens a filled-in GitHub issue.
+/// Nothing is sent from here.
+#[tauri::command]
+async fn make_report(app: AppHandle, state: State<'_, AppState>, description: String) -> CmdResult<report::Report> {
+    let snap = build_snapshot(&app).await;
+    let s = &snap.settings;
+    let gpus = s.gpus.as_ref().map_or("all".to_string(), |g| g.iter().map(u32::to_string).collect::<Vec<_>>().join(", "));
+    let mut settings = vec![
+        format!("Model: {}", s.selected_model.as_deref().unwrap_or("none selected")),
+        format!("Context window: {} tokens{}", s.context_len, if s.long_context { " (long context on)" } else { "" }),
+        format!("GPUs: {gpus}"),
+        format!("Web search for clients: {}", if s.web_search { "on" } else { "off" }),
+        format!("Ports: client {}, admin {}, control {}", s.agent_port, s.admin_port, s.control_port),
+    ];
+    if let Some(m) = &snap.server.model {
+        let context = m.context_len.map_or("?".to_string(), |n| n.to_string());
+        let split = m.split.as_ref().map_or(String::new(), |p| format!(", split: {p}"));
+        settings.push(format!("Running: {}, {context} tokens{split}", m.label));
+    }
+    let cluster = snap.cluster.as_ref().map_or(vec!["The cluster service could not be opened.".to_string()], |c| {
+        let role = match &c.view.role {
+            Role::Standalone => "standalone",
+            Role::Host => "host",
+            Role::Member { .. } => "member",
+        };
+        let mut lines = vec![format!("This machine: {role}, strategy {:?}", c.view.strategy)];
+        if let Some(e) = &c.error {
+            lines.push(format!("Cluster service: {e}"));
+        }
+        // Members by number: their names and addresses stay out of a report.
+        lines.extend(c.view.members.iter().enumerate().map(|(i, m)| {
+            format!("Member {}: {}", i + 1, if m.online { "online" } else { "offline" })
+        }));
+        lines.push(format!("Other servers seen on the network: {}", c.view.candidates.len()));
+        lines
+    });
+    let install = match Install::detect() {
+        Install::AppImage { .. } => "AppImage",
+        Install::Deb => ".deb",
+        Install::Source => "built from source",
+    };
+    let ctx = report::Context {
+        version: env!("CARGO_PKG_VERSION").into(),
+        install: install.into(),
+        description,
+        state: snap.server.state.into(),
+        detail: snap.server.detail.clone().unwrap_or_default(),
+        settings,
+        cluster,
+        unclean: state.unclean.lock().unwrap().clone(),
+    };
+    let made = report::gather(ctx).await;
+    report::record("app", "a problem report was made");
+    Ok(made)
+}
+
+/// The user has seen (or reported) that the last run didn't end cleanly.
+#[tauri::command]
+fn dismiss_unclean(state: State<'_, AppState>) {
+    *state.unclean.lock().unwrap() = None;
 }
 
 fn require_cluster(state: &AppState) -> CmdResult<Arc<Cluster>> {
@@ -1690,6 +1822,7 @@ pub fn run() {
                 cluster,
                 cluster_error: Mutex::new(cluster_error),
                 keep_backend: AtomicBool::new(false),
+                unclean: Mutex::new(report::begin_run(&paths::data_dir(), env!("CARGO_PKG_VERSION"))),
             }
         })
         .setup(|app| {
@@ -1757,6 +1890,8 @@ pub fn run() {
             cluster_set_nickname,
             port_holders,
             free_ports,
+            make_report,
+            dismiss_unclean,
             cluster_set_strategy,
             cluster_approve_download,
             check_update,
@@ -1769,6 +1904,7 @@ pub fn run() {
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 tauri::async_runtime::block_on(shutdown(&app.state::<AppState>()));
+                report::end_run(&paths::data_dir());
             }
         });
 }

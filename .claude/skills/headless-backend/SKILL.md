@@ -49,6 +49,7 @@ oppxs gpus [all | 0,2]                  # this machine's GPUs and which the serv
 oppxs start | stop | status             # start follows progress until it serves or fails
 oppxs pair | devices | revoke <device>  # pairing code with the fingerprint; paired clients
 oppxs logs [-n LINES] [<member>]        # the backend's log, or a cluster member's
+oppxs report [what happened]           # a problem report (machine, backend, kernel log's signs of trouble) and a link that opens a GitHub issue
 oppxs servers | invite | make-host | approve | decline | remove | leave | dissolve | strategy | model
 ```
 

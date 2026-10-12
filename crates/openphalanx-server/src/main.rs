@@ -56,6 +56,11 @@ enum Command {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Gather a problem report (version, settings, this machine, the backend's state and log, the kernel log's signs of trouble) and print it with a link that opens a filled-in GitHub issue. Nothing is sent.
+    Report {
+        /// What happened, in your words.
+        description: Vec<String>,
+    },
     /// The catalog: what each model needs, whether it fits this GPU, what is downloaded.
     Models {
         /// Also list models that don't fit this GPU.
@@ -708,6 +713,7 @@ async fn control(cmd: Command) -> Result<()> {
             println!("Strategy set to {}.", strategy.to_lowercase());
         }
         Command::Run { .. }
+        | Command::Report { .. }
         | Command::FreePorts { .. }
         | Command::Models { .. }
         | Command::Download { .. }
@@ -1052,6 +1058,35 @@ async fn backend_logs(lines: u32) -> Result<()> {
     Ok(())
 }
 
+/// `oppxs report`: the same report the desktop app makes, for a machine without one.
+async fn problem_report(description: String) -> anyhow::Result<()> {
+    use openphalanx_core::report;
+    let s = Settings::load();
+    let gpus = s.gpus.as_ref().map_or("all".to_string(), |g| g.iter().map(u32::to_string).collect::<Vec<_>>().join(", "));
+    let ctx = report::Context {
+        version: env!("CARGO_PKG_VERSION").into(),
+        install: "oppxs (headless)".into(),
+        description,
+        state: "unknown (asked from the command line)".into(),
+        detail: String::new(),
+        settings: vec![
+            format!("Model: {}", s.selected_model.as_deref().unwrap_or("none selected")),
+            format!("Context window: {} tokens{}", s.context_len, if s.long_context { " (long context on)" } else { "" }),
+            format!("GPUs: {gpus}"),
+            format!("Ports: client {}, admin {}, control {}", s.agent_port, s.admin_port, s.control_port),
+        ],
+        cluster: Vec::new(),
+        unclean: None,
+    };
+    let made = report::gather(ctx).await;
+    println!("{}", made.markdown);
+    if let Some(path) = &made.path {
+        eprintln!("\nSaved as {path}");
+    }
+    eprintln!("Open this link to file it as an issue (it holds the start of the report; paste the rest):\n{}", made.url);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     // Output piped into `head` or `less` ends quietly instead of panicking.
@@ -1060,6 +1095,7 @@ async fn main() {
     let result = match cli.command {
         Command::Run { name } => run(name).await,
         Command::FreePorts { yes } => free_ports(yes).await,
+        Command::Report { description } => problem_report(description.join(" ")).await,
         Command::Models { all } => models(all).await,
         Command::Download { model } => download_model(&model).await,
         Command::Use { model } => use_model(&model),

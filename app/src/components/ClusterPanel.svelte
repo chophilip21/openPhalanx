@@ -82,38 +82,6 @@
 
   /** The cluster service can't start because another server process on this
    *  machine holds its ports: show which, and stop it if it is one of ours. */
-  async function freePorts() {
-    busy = "ports";
-    error = "";
-    notice = "";
-    try {
-      const holders = await api.portHolders();
-      const ours = holders.filter((h) => h.ours && h.pid != null);
-      const others = holders.filter((h) => !h.ours);
-      const describe = (h: (typeof holders)[number]) =>
-        h.pid != null ? `${h.name} (pid ${h.pid}) on port ${h.port}` : `another user's process on port ${h.port}`;
-      if (!ours.length) {
-        error = others.length
-          ? `The ports are held by something that isn't OpenPhalanx: ${others.map(describe).join("; ")}. Stop it yourself; this app won't.`
-          : "Nothing is holding the ports now; the cluster service starts by itself within a few seconds.";
-        return;
-      }
-      const names = [...new Set(ours.map((h) => `${h.name} (pid ${h.pid})`))].join(", ");
-      const yes = await ask(
-        `Stop ${names}? It is another OpenPhalanx server on this machine holding the ports this app needs. If it is serving a model, that stops too.`,
-        { title: "Free the ports", kind: "warning" },
-      );
-      if (!yes) return;
-      const [stopped, left] = await api.freePorts();
-      notice = `Stopped ${stopped.join(", ")}. The cluster service starts within a few seconds.`;
-      if (left.length) error = `Still held by something else: ${left.map(describe).join("; ")}.`;
-    } catch (e) {
-      error = errorText(e);
-    } finally {
-      busy = "";
-    }
-  }
-
   async function leave() {
     if (role.role !== "member") return;
     const yes = await ask(`Leave ${role.host.name}'s cluster? This machine becomes standalone.`, { title: "Leave cluster", kind: "warning" });
@@ -308,10 +276,7 @@
   {#if notice}<p class="ok small">{notice}</p>{/if}
   {#if error}<p class="err small">{error}</p>{/if}
   {#if cluster.error}
-    <p class="err small">
-      {cluster.error}
-      <button class="ghost tiny-btn" disabled={!!busy} onclick={freePorts}>Free the ports…</button>
-    </p>
+    <p class="err small">{cluster.error} Use <strong>Free the ports</strong> in the alert at the top right.</p>
   {/if}
 </div>
 

@@ -12,6 +12,7 @@ pub mod model;
 pub mod net;
 pub mod paths;
 pub mod ports;
+pub mod report;
 pub mod server;
 pub mod service;
 pub mod settings;
