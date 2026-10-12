@@ -15,7 +15,7 @@ from rich.markdown import Markdown
 from rich.markup import escape
 from rich.text import Text
 
-from .config import (ACCENT, CONTEXT, ENGINE, EXTRA_MEMORY, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, PRINT_MODE,
+from .config import (ACCENT, CONTEXT, ENGINE, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, PRINT_MODE,
                      REASONING, RED, SERVER, TESTED_AIDER, TRACE, WEB, YELLOW)
 from .term import EscWatcher, SESSION, SPIN, Thinking, UI, console, out, step
 from .render import BulletStream, _bullet, hide_reasoning, show_diff, show_edits, snapshot
@@ -27,7 +27,7 @@ from .routing import announces_change, wants_edit
 from .context import CONTEXT_MGR, PRI_EDITED, _check_tokens, _fitted_format_messages
 from .oppx_io import OppxIO
 from .cache import ASK_NOTE, _ask_file_mentions, _ask_init, _coder_init, _dump_requests, _stable_ranked_map
-from .commands import (ask_about_connector, connector_names, load_memory, show_connector_problems, start_browser,
+from .commands import (ask_about_connector, connector_names, load_memory, memory_files, show_connector_problems, start_browser,
                        translate)
 
 
@@ -331,13 +331,11 @@ def connect_connectors(coder) -> Hub:
 
 def _memory(coder) -> str:
     parts = []
-    for name in (MEMORY_FILE, *EXTRA_MEMORY):
-        p = Path(coder.root) / name
-        if p.is_file():
-            try:
-                parts.append(p.read_text(encoding="utf-8"))
-            except OSError:
-                pass
+    for p in memory_files(coder.root):
+        try:
+            parts.append(p.read_text(encoding="utf-8"))
+        except OSError:
+            pass
     return "\n\n".join(parts)
 
 
@@ -392,9 +390,9 @@ def agent_turn(coder, text: str):
         else:
             step(f"The request failed: {escape(msg[:300])}", RED)
     finally:
-        UI.unannounced.clear()  # each is shown as "> …" when its turn starts, right after this one
         SESSION.watcher = None
         SPIN.stop()
+        UI.unannounced.clear()  # each is shown as "> …" when its turn starts, right after this one
     if UI.interrupted:
         step("Interrupted by user", YELLOW)
     if reply:

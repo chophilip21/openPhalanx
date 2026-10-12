@@ -30,4 +30,4 @@ MODEL_NAME = os.environ.get("OPPX_MODEL_ID", "").rstrip("/").rsplit("/", 1)[-1] 
 # "aider": Aider's own loop (whole files and a repo map in every request).
 ENGINE = os.environ.get("OPPX_ENGINE", "agent")
 MEMORY_FILE = "OPENPHALANX.md"  # our CLAUDE.md
-EXTRA_MEMORY = ("AGENTS.md",)  # read too when present
+EXTRA_MEMORY = ("OPPX.md", "AGENTS.md")  # read too when present, in any letter case (OPPX.MD)

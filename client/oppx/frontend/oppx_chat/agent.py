@@ -980,7 +980,7 @@ class Agent:
     context: int = 32768
     reasoning: bool = False
     web: bool = True
-    memory: str = ""  # OPENPHALANX.md / AGENTS.md
+    memory: str = ""  # OPENPHALANX.md / OPPX.md / AGENTS.md
     connectors: object = None  # mcp.Hub: the user's MCP connectors, as extra tools (None: none)
     # The headless browser: "none" (this session can't have one), "offer" (the
     # browser action is offered; the user is asked), "running", "declined".
