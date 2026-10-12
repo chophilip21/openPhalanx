@@ -246,13 +246,19 @@ def make_agent(coder) -> Agent:
         if verdict == "refuse":
             step("Not run: " + ("a deny rule forbids it" if "deny rule" in why else "edits are off, and it doesn't only read"), MUTED)
             return why
-        rules = perms.offer(command)
-        SPIN.stop()
-        out(f"\n[{YELLOW}]⏺[/] [bold]Run this command?[/]")
-        for line in command.splitlines():
-            out(f"  [{MUTED}]│[/] {escape(line)}")
-        always = f"a = always allow {', '.join(f'`{r}`' for r in rules)} in this project, " if rules else ""
-        said = coder.io._ask_line(f"  Allow? (y = yes, {always}N = no, or type what to do instead) ").strip()
+        rules, session = perms.offer(command), perms.offer_session(command)
+        options = [("y", GREEN, "yes, this once")]
+        if rules:
+            options.append(("a", ACCENT, f"always in this project: {', '.join(rules)}"))
+        if session:
+            # Inline code (python -c) gets no saved rule; the rest of the line may.
+            keep = perms.savable(session)
+            if keep:
+                inline = ", ".join(r for r in session if r not in keep)
+                options.append(("a", ACCENT, f"always in this project: {', '.join(keep)}  ·  this session: {inline}"))
+            options.append(("s", ACCENT, f"this session only: {', '.join(session)}  (not saved)"))
+        options += [("n", RED, "no  (Enter)"), ("…", MUTED, "or type what to do instead")]
+        said = coder.io.ask_options("Run this command?", command.splitlines(), options).strip()
         SPIN.start()
         result, shown = perms.answered(command, said)
         step(shown, GREEN if result is True else MUTED)
@@ -262,20 +268,24 @@ def make_agent(coder) -> Agent:
         """A connector tool reaches outside the repository. Tools its connector
         marks as only reading run without a question (like commands that only
         read); the rest are asked once, with "always" for the tool or for the
-        whole connector, saved for this project."""
-        verdict, why = perms.judge_tool(name, read_only)
+        whole connector, saved for this project. A connector that came with
+        the repository isn't taken at its word about "only reading"."""
+        connector = name.split(".", 1)[0]
+        known = getattr(UI.connectors, "connectors", {}).get(connector)
+        trusted = known is None or known.definition.scope != "project"
+        verdict, why = perms.judge_tool(name, read_only, trusted)
         if verdict == "run":
             return True
         if verdict == "refuse":
             step(f"Not run: a deny rule forbids {escape(name)}", MUTED)
             return why
-        connector = name.split(".", 1)[0]
-        SPIN.stop()
-        out(f"\n[{YELLOW}]⏺[/] [bold]Call this connector tool?[/]")
-        for line in f"{name} {arguments}".splitlines()[:30]:
-            out(f"  [{MUTED}]│[/] {escape(line)}")
-        said = coder.io._ask_line(f"  Allow? (y = yes, a = always allow {name}, c = always allow every {connector} tool, "
-                                  "N = no, or type what to do instead) ")
+        options = [("y", GREEN, "yes, this once")]
+        if not perms.every_time(name):  # running JavaScript in the browser: asked every time, nothing lasting on offer
+            options += [("a", ACCENT, f"always in this project: {name}"),
+                        ("c", ACCENT, f"always in this project: every {connector} tool"),
+                        ("s", ACCENT, f"this session only: {name}  (not saved)")]
+        options += [("n", RED, "no  (Enter)"), ("…", MUTED, "or type what to do instead")]
+        said = coder.io.ask_options("Call this connector tool?", f"{name} {arguments}".splitlines()[:30], options)
         SPIN.start()
         result, shown = perms.answered_tool(name, said)
         step(shown, GREEN if result is True else MUTED)

@@ -330,6 +330,47 @@ class AgentLoop(unittest.TestCase):
         self.assertEqual(asked, ["make deploy"])
         self.assertTrue(any("already" in m["content"] for m in s2.agent.messages))
 
+    def test_a_command_that_just_failed_is_not_run_again_unchanged(self):
+        s = self.s
+        ran = []
+        s.agent.hooks.confirm_run = lambda c: ran.append(c) or True
+        bad = {"tool": "run", "command": "python3 -c 'import sys; sys.exit(1)'"}
+        s.actions = [dict(bad), dict(bad), {"tool": "run", "command": "true"}, dict(bad)]
+        s.agent.turn("check the api", can_edit=False)
+        # Asked for twice in a row, it ran once; after another command worked, it may run again.
+        self.assertEqual(ran, [bad["command"], "true", bad["command"]])
+        self.assertTrue(any("already failed at step" in m["content"] for m in s.agent.messages))
+
+    def test_nearly_the_same_web_search_is_answered_from_the_session(self):
+        s = self.s
+
+        class Ok:
+            status_code = 200
+            headers = {}
+
+            def __init__(self, q):
+                self.q = q
+
+            def json(self):
+                return {"results": [{"title": "T", "snippet": "about " + self.q, "url": "https://example.com"}]}
+
+        sent = []
+        real = A.httpx.post
+        A.httpx.post = lambda url, **kw: sent.append(kw["json"]["query"]) or Ok(kw["json"]["query"])
+        try:
+            s.actions = [{"tool": "web_search", "query": "Algolia Hacker News API sort by date latest stories"},
+                         {"tool": "web_search", "query": "Hacker News Algolia API: sort stories by latest date"},
+                         {"tool": "web_search", "query": "vite 8 release notes"}]
+            s.agent.turn("how do I sort the HN api by date?", can_edit=False)
+            self.assertEqual(sent, ["Algolia Hacker News API sort by date latest stories", "vite 8 release notes"])
+            self.assertTrue(any("Not searched again" in m["content"] and "about Algolia" in m["content"] for m in s.agent.messages))
+            # In a later message of the same session too.
+            s.actions = [{"tool": "web_search", "query": "sort by date latest stories Algolia Hacker News API"}]
+            s.agent.turn("and once more?", can_edit=False)
+            self.assertEqual(len(sent), 2)
+        finally:
+            A.httpx.post = real
+
     def test_a_refused_command_tells_the_model_why(self):
         s = self.s
         seen = []

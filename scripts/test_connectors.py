@@ -47,7 +47,9 @@ for line in sys.stdin:
         res = {"tools": TOOLS[2:]} if params.get("cursor") else {"tools": TOOLS[:2], "nextCursor": "2"}
     elif method == "tools/call":
         name, a = params["name"], params.get("arguments") or {}
-        if name == "add_note":
+        if os.path.exists(NOTES + ".locked"):
+            res = {"content": [{"type": "text", "text": "401 Unauthorized: the access token has expired"}], "isError": True}
+        elif name == "add_note":
             open(NOTES, "a").write(a["title"] + "\n")
             res = {"content": [{"type": "text", "text": "Saved " + a["title"]}]}
         elif name == "list_notes":
@@ -199,6 +201,73 @@ class Client(Sandbox):
         self.assertEqual(mcp.cost_warning(0, 32768, adding=True), "")
 
 
+class Recovery(Sandbox):
+    """A connector that stops working: why, how to get it back, and getting it back."""
+
+    def definition(self, spec: dict, name: str = "linear") -> mcp.ServerDef:
+        return mcp.ServerDef(name, "user", spec)
+
+    def test_says_what_went_wrong_and_how_to_fix_it(self):
+        remote = self.definition({"command": "npx", "args": ["-y", "mcp-remote", "https://mcp.linear.app/mcp"]})
+        # mcp-remote answers nothing while it waits for the login in the browser.
+        kind, steps = mcp.diagnose(remote, "it didn't start within 30 s")
+        self.assertEqual(kind, "auth")
+        self.assertIn("/mcp reconnect linear", steps[0])
+        self.assertIn("login in the browser", steps[0])
+        self.assertIn("~/.mcp-auth", steps[1])
+        self.assertIn("oppx -c", steps[1])
+        self.assertEqual(mcp.diagnose(remote, "no answer within 120 s")[0], "auth")
+        # A token in a header, read from the environment: say which variable.
+        http = self.definition({"url": "https://mcp.linear.app/mcp", "headers": {"Authorization": "Bearer ${LINEAR_API_KEY}"}})
+        kind, steps = mcp.diagnose(http, "it refused the request (HTTP 401): it needs authorization.")
+        self.assertEqual(kind, "auth")
+        self.assertIn("export LINEAR_API_KEY=", steps[0])
+        self.assertIn("--force", steps[1])
+        # The other ways it goes wrong.
+        self.assertEqual(mcp.diagnose(remote, "command not found: npx")[0], "missing")
+        self.assertIn("Node.js", mcp.diagnose(remote, "command not found: npx")[1][0])
+        local = self.definition(self.notes(), "notes")
+        self.assertEqual(mcp.diagnose(local, "the connector exited (Traceback …)")[0], "gone")
+        self.assertIn("mcp-notes.log", mcp.diagnose(local, "the connector exited")[1][1])
+        self.assertEqual(mcp.diagnose(http, "can't reach https://mcp.linear.app/mcp: ConnectError")[0], "network")
+        # A tool that refuses its arguments is not a connector that is down.
+        self.assertEqual(mcp.diagnose(local, "Invalid arguments: the login field is required")[0], "other")
+        self.assertEqual(mcp.diagnose(local, "no answer within 120 s")[0], "slow")
+
+    def test_a_connector_whose_program_stopped_is_started_again_for_the_call(self):
+        self.write({"notes": self.notes()})
+        hub = self.hub()
+        hub.connectors["notes"].client.proc.kill()
+        hub.connectors["notes"].client.proc.wait()
+        time.sleep(0.3)
+        self.assertIn("Saved Deploy", hub.call("notes.add_note", {"title": "Deploy", "body": "x"}))
+        self.assertEqual(hub.connectors["notes"].state, "connected")
+
+    def test_a_lost_login_takes_the_connector_down_with_the_way_back(self):
+        self.write({"notes": self.notes()})
+        hub = self.hub()
+        lock = Path(os.environ["NOTES_FILE"] + ".locked")
+        lock.write_text("")
+        with self.assertRaises(mcp.ConnectorDown) as e:
+            hub.call("notes.add_note", {"title": "Deploy", "body": "x"})
+        self.assertEqual((e.exception.name, e.exception.kind), ("notes", "auth"))
+        self.assertIn("/mcp reconnect notes", " ".join(e.exception.steps))
+        self.assertEqual(hub.connectors["notes"].state, "failed")
+        self.assertNotIn("notes.add_note", hub.tools())  # no longer offered to the model
+        why, steps = hub.connectors["notes"].recovery()
+        self.assertEqual(why, "it needs you to log in again")
+        # Once the user has logged in again, one reconnect brings it back.
+        lock.unlink()
+        self.assertEqual(hub.reconnect("notes").state, "connected")
+        self.assertIn("Saved Deploy", hub.call("notes.add_note", {"title": "Deploy", "body": "x"}))
+        self.assertIsNone(hub.reconnect("nothing-by-that-name"))
+        # A tool's own failure leaves the connector alone.
+        with self.assertRaises(mcp.McpError) as e:
+            hub.call("notes.fail", {})
+        self.assertNotIsInstance(e.exception, mcp.ConnectorDown)
+        self.assertEqual(hub.connectors["notes"].state, "connected")
+
+
 class InTheAgent(Sandbox):
     """The agent picks a connector tool by name, then writes its arguments."""
 
@@ -220,6 +289,31 @@ class InTheAgent(Sandbox):
         ag._post = post
         ag._text = lambda *a, **k: "All done."
         return ag
+
+    def test_a_connector_that_goes_down_is_reported_with_the_steps(self):
+        ag = self.agent([{"why": "save", "tool": "notes.add_note"}, {"why": "again", "tool": "notes.add_note"},
+                         {"why": "done", "tool": "answer"}], [{"title": "Deploy", "body": "Friday"}, {"title": "Deploy", "body": "Friday"}])
+        notices, prompts = [], []
+        ag.hooks.notice = notices.append
+        ag._text = lambda *a, **k: prompts.append(ag.messages[-1]["content"]) or "The notes connector stopped working."
+        Path(os.environ["NOTES_FILE"] + ".locked").write_text("")
+        ag.turn("Save a note titled Deploy")
+        # The user is told at once, with numbered steps.
+        self.assertEqual(len(notices), 1)
+        self.assertIn("The notes connector stopped working: it needs you to log in again.", notices[0])
+        self.assertIn("1. ", notices[0])
+        self.assertIn("/mcp reconnect notes", notices[0])
+        # The model is told not to retry, and its tools are gone: the second call never happened.
+        down = [m["content"] for m in ag.messages if m["content"].startswith("Result of step") and A.CONNECTOR_DOWN in m["content"]]
+        self.assertEqual(len(down), 1)
+        self.assertIn("don't try it again", down[0])
+        self.assertEqual(len(self.asked), 1)
+        later = json.dumps(self.bodies[-1].get("response_format") or {})
+        self.assertNotIn("notes.add_note", later)
+        # And the reply is written with the steps to pass on.
+        self.assertIn("stopped working during this request", prompts[-1])
+        self.assertIn("/mcp reconnect notes", prompts[-1])
+        self.assertIn("ask you to continue", prompts[-1])
 
     def test_a_connectors_name_as_a_shell_command_is_not_run(self):
         ag = self.agent([{"why": "save", "tool": "run", "command": "notes add_note Deploy"}, {"why": "done", "tool": "answer"}], [])

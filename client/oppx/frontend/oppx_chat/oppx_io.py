@@ -256,7 +256,7 @@ class OppxIO(InputOutput):
             if subject:
                 for line in str(subject).splitlines():
                     out(f"  [{MUTED}]│[/] {escape(line)}")
-            answer = self._ask_line("  Allow? (y/N) ").strip().lower()
+            answer = self.ask_options(None, (), [("y", GREEN, "yes"), ("n", RED, "no  (Enter)")]).strip().lower()
             ok = answer in ("y", "yes")
             step("Allowed" if ok else "Declined", GREEN if ok else MUTED)
             return ok
@@ -273,15 +273,42 @@ class OppxIO(InputOutput):
         answer = self._ask_line(f"  {question.strip()} ")
         return answer or default
 
-    def _ask_line(self, message: str) -> str:
+    def ask_options(self, question: str | None, subject, options: list[tuple[str, str, str]]) -> str:
+        """A question the user must not miss, with what it is about and the
+        answers one per line, each key in its own colour and always in the
+        same order (yes, the lasting yeses, no, then free text). On one grey
+        line in parentheses they were easy to overlook, and easy to misread."""
+        if PRINT_MODE:
+            return ""
+        SPIN.stop()
+        if question:
+            out(f"\n[bold {YELLOW}]{BULLET} {escape(question)}[/]")
+        for line in subject:
+            out(f"  [{YELLOW}]│[/] {escape(line)}")
+        for key, color, text in options:
+            out(f"    [bold {color}]{escape(key)}[/]  {escape(text)}")
+        return self._ask_line(f"  [bold {YELLOW}]Allow?[/] ", markup=True)
+
+    def _ask_line(self, message: str, markup: bool = False) -> str:
         if PRINT_MODE:
             return ""  # never block a one-shot run on a question
         SPIN.stop()
         if SESSION.watcher:
             SESSION.watcher.pause()
         try:
+            # What was typed before the question appeared was not an answer
+            # to it: a line meant as the next message must not allow a command.
+            try:
+                import sys
+                import termios
+                if sys.stdin.isatty():
+                    termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            except (ImportError, OSError, ValueError):
+                pass
             # Plain line input: no prompt_toolkit, so no cursor-position
             # requests whose replies the paused Esc reader could swallow.
+            if markup:
+                return console.input(message)
             return input(message)
         except (EOFError, KeyboardInterrupt):
             print()

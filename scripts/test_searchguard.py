@@ -46,6 +46,20 @@ class GuardTests(unittest.TestCase):
         self.clock.t += G.CACHE_S + 1
         self.assertIsNone(self.g.cached_results("vite latest release"))
 
+    def test_nearly_the_same_query_is_answered_from_memory_too(self):
+        self.assertTrue(self.search("Algolia Hacker News API sort by date latest stories"))
+        # Another order, other punctuation, filler words: the same query.
+        self.assertFalse(self.search("latest stories: sort by date, Hacker News Algolia API"))
+        self.assertFalse(self.search("how to sort the Algolia Hacker News API stories by latest date"))
+        # One word of many changed: near enough. Half of them changed: a new search.
+        self.assertFalse(self.search("Algolia Hacker News API sort by date newest latest stories"))
+        self.assertTrue(self.search("Algolia Hacker News API front page tag"))
+        # Short queries must match word for word: one word is the whole question.
+        self.assertTrue(self.search("vite latest release"))
+        self.assertTrue(self.search("react latest release"))
+        self.assertFalse(self.search("release latest vite"))
+        self.assertEqual(self.g.sent, 4)
+
     def test_an_empty_answer_from_working_engines_is_a_result(self):
         self.assertTrue(self.search("zxqv nothing matches", results=[]))
         self.assertEqual(self.g.cached_results("zxqv nothing matches"), [])
