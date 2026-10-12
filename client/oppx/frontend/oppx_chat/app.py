@@ -11,13 +11,14 @@ import aider.main as aider_main
 from aider.coders.ask_coder import AskCoder
 from aider.commands import SwitchCoder
 from aider.repomap import RepoMap
+from rich.markdown import Markdown
 from rich.markup import escape
 from rich.text import Text
 
 from .config import (ACCENT, CONTEXT, ENGINE, EXTRA_MEMORY, GREEN, MEMORY_FILE, MODEL_NAME, MUTED, PRINT_MODE,
                      REASONING, RED, SERVER, TESTED_AIDER, TRACE, WEB, YELLOW)
-from .term import EscWatcher, SESSION, SPIN, Thinking, UI, out, step
-from .render import BulletStream, hide_reasoning, show_diff, show_edits, snapshot
+from .term import EscWatcher, SESSION, SPIN, Thinking, UI, console, out, step
+from .render import BulletStream, _bullet, hide_reasoning, show_diff, show_edits, snapshot
 from .mcp import Hub
 from . import browser
 from .agent import Agent, Hooks, Workspace
@@ -25,7 +26,7 @@ from .permissions import Permissions
 from .routing import wants_edit
 from .context import CONTEXT_MGR, PRI_EDITED, _check_tokens, _fitted_format_messages
 from .oppx_io import OppxIO
-from .cache import _ask_file_mentions, _ask_init, _coder_init, _dump_requests, _stable_ranked_map
+from .cache import ASK_NOTE, _ask_file_mentions, _ask_init, _coder_init, _dump_requests, _stable_ranked_map
 from .commands import (ask_about_connector, connector_names, load_memory, show_connector_problems, start_browser,
                        translate)
 
@@ -88,6 +89,56 @@ def welcome(coder):
     if not memory:
         out(f"\n [{MUTED}]Tip: run /init to write {MEMORY_FILE}, a project summary loaded every session.[/]")
     print()
+
+
+HISTORY_SHOWN = 30  # messages of a resumed conversation printed at start
+HISTORY_LINES = 40  # ... and at most this many lines of each
+
+
+def earlier_messages(coder) -> list[tuple[str, str]]:
+    """The restored conversation as (role, text) the way it read on screen:
+    without the notes we append to a message, the reasoning, or commands."""
+    shown = []
+    for m in coder.done_messages or []:
+        role, text = m.get("role"), m.get("content")
+        if role not in ("user", "assistant") or not isinstance(text, str):
+            continue
+        if role == "user":
+            for note in (READ_ONLY_NOTE, ASK_NOTE):
+                text = text.replace(note, "")
+            if text.lstrip().startswith("/") or text.strip() == INTERRUPT_NOTE:
+                continue
+        else:
+            text = hide_reasoning(text)
+        if text.strip():
+            shown.append((role, text.strip()))
+    return shown
+
+
+def show_history(coder):
+    """-c / -r: what was said before, so a resumed conversation doesn't look
+    like a new one. Only messages and replies are kept in a session file;
+    the steps in between (searches, edits, commands) are not."""
+    shown = earlier_messages(coder)
+    if not shown:
+        return
+    skipped = max(0, len(shown) - HISTORY_SHOWN)
+    if skipped:
+        out(f" [{MUTED}]… {skipped} earlier messages not shown[/]\n")
+    for role, text in shown[skipped:]:
+        lines = text.splitlines()
+        more = len(lines) - HISTORY_LINES
+        if more > 0:
+            text = "\n".join(lines[:HISTORY_LINES])
+        if role == "user":
+            out(f"[{MUTED}]>[/] " + escape(text).replace("\n", "\n  "))
+        else:
+            console.print(Markdown(_bullet(text)))
+        if more > 0:
+            out(f"  [{MUTED}]… {more} more lines[/]")
+        print()
+    out(f" [{MUTED}]Resumed: {len(shown)} messages above. The steps in between (files read, commands, "
+        f"searches) aren't kept, so the model will look things up again.[/]\n")
 
 
 INTERRUPT_NOTE = "I see that you interrupted my previous reply."
@@ -424,6 +475,7 @@ def run(argv) -> int:
         return 0
 
     welcome(coder)
+    show_history(coder)
     show_connector_problems(UI.connectors)
     pending = initial
     while True:

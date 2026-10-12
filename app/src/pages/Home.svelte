@@ -3,7 +3,6 @@
   import ContextSlider from "../components/ContextSlider.svelte";
   import Dashboard from "../components/Dashboard.svelte";
   import Icon from "../components/Icon.svelte";
-  import Notice from "../components/Notice.svelte";
   import PairingCard from "../components/PairingCard.svelte";
   import PowerButton from "../components/PowerButton.svelte";
   import RunningModel from "../components/RunningModel.svelte";
@@ -12,20 +11,23 @@
   import { gib, tokens } from "../lib/format";
   import { app } from "../lib/store.svelte";
   import { forceLoad, goto as navigate, nav } from "../lib/nav.svelte";
+  import { condition, type NoteBody } from "../lib/notify.svelte";
+  import { onDestroy } from "svelte";
 
   let { goto }: { goto: (page: string) => void } = $props();
 
   let preflight = $state<Preflight | null>(null);
   let actionError = $state("");
-  // Closed messages stay closed until something new comes up.
-  let dismissedWarnings = $state<string[]>([]);
-  let hideDownloadAsk = $state(false);
-  let hideFetching = $state(false);
-  // A newly chosen model brings its cluster prompts back.
-  $effect(() => {
-    void wanted?.key;
-    hideDownloadAsk = hideFetching = false;
-  });
+  // What this page has to say goes to the window's notification stack, not
+  // into the page: a state that holds (a member lacks the model, GPU memory is
+  // almost full) is one note that updates in place and leaves by itself; only
+  // hints and errors can be closed. Leaving the page takes them along.
+  const mine = new Set<string>();
+  function note(id: string, body: () => NoteBody | null) {
+    mine.add(id);
+    $effect(() => condition(id, body()));
+  }
+  onDestroy(() => mine.forEach((id) => condition(id, null)));
   let acting = $state(false);
 
   const snap = $derived(app.snapshot);
@@ -124,6 +126,50 @@
   }
 
   const blocking = $derived(preflight?.checks.find((c) => c.status === "fail") ?? null);
+
+  note("start-hint", () =>
+    showHint
+      ? {
+          kind: canToggle || !blocking ? "info" : "warn",
+          text: `${nav.startHint} is selected. ` + (canToggle
+            ? "Press the power button to start the server."
+            : blocking ? `It can't start yet: ${blocking.detail}` : "Checking whether it can start…"),
+          onclose: () => (nav.startHint = null),
+        }
+      : null);
+  note("cluster-download", () =>
+    idle && wanted && missing.length
+      ? {
+          kind: "info",
+          text: `${missing.map((m) => m.name).join(", ")} ${missing.length === 1 ? "doesn't" : "don't"} have ${wanted.label} `
+            + `(${gib(wanted.weight_bytes)}). Download it there, so the model can be split across the cluster?`,
+          action: { label: `Download on ${missing.length === 1 ? missing[0].name : "them"}`, run: approveDownload, busy: approving },
+        }
+      : null);
+  note("cluster-fetching", () =>
+    idle && wanted && !missing.length && fetching.length
+      ? {
+          kind: "info",
+          text: fetching.map((m) => `${m.name} is downloading ${wanted.label}: ${pct(m.sync!)}%`).join(" · ") + ". Start when it's done.",
+        }
+      : null);
+  note("logs-hint", () =>
+    showLogsHint
+      ? {
+          kind: "info",
+          text: "Loading the model can take up to a few minutes. Follow its progress live in Logs.",
+          action: { label: "Open Logs", run: () => navigate("logs") },
+          onclose: () => (logsHintClosed = true),
+        }
+      : null);
+  note("context-note", () => (ctxNote ? { kind: "warn", text: ctxNote, onclose: () => (ctxNote = "") } : null));
+  note("server-error", () => (actionError ? { kind: "error", text: actionError, onclose: () => (actionError = "") } : null));
+  // The server's own warnings (GPU memory almost full). The number in the text
+  // changes with every snapshot; the note is the same one.
+  note("server-warning", () => {
+    const w = snap?.warnings ?? [];
+    return w.length ? { kind: "warn", text: w.join(" ") } : null;
+  });
   // Not enough VRAM is the one check the user may override, by ticking a box.
   const forceable = $derived(
     idle && !locked && !preflight?.running && preflight?.checks.filter((c) => c.status === "fail").every((c) => c.id === "vram") === true && blocking?.id === "vram",
@@ -196,46 +242,6 @@
         <span class="eyebrow">{snap?.endpoint ? `Agent API · ${snap.endpoint}` : "Agent API"}</span>
       </div>
 
-      {#if showHint}
-        <div class="hint" class:blocked-hint={!canToggle} role="status">
-          <span>
-            <strong>{nav.startHint}</strong> is selected.
-            {#if canToggle}
-              Press the power button to start the server.
-            {:else if blocking}
-              It can't start yet: {blocking.detail}
-            {:else}
-              Checking whether it can start…
-            {/if}
-          </span>
-          <button class="ghost close" onclick={() => (nav.startHint = null)} aria-label="Dismiss"><Icon name="x" size={14} /></button>
-        </div>
-      {/if}
-
-      {#if idle && wanted && missing.length && !hideDownloadAsk}
-        <div class="hint download-ask" role="status">
-          <Icon name="download" size={16} />
-          <span>
-            <strong>{missing.map((m) => m.name).join(", ")}</strong>
-            {missing.length === 1 ? "doesn't" : "don't"} have <strong>{wanted.label}</strong> ({gib(wanted.weight_bytes)}).
-            Download it there, so the model can be split across the cluster?
-          </span>
-          <button class="primary" disabled={approving} onclick={approveDownload}>
-            <Icon name="download" size={14} /> Download on {missing.length === 1 ? missing[0].name : "them"}
-          </button>
-          <button class="ghost close" onclick={() => (hideDownloadAsk = true)} aria-label="Dismiss"><Icon name="x" size={14} /></button>
-        </div>
-      {:else if idle && fetching.length && !hideFetching}
-        <div class="hint info" role="status">
-          <Icon name="download" size={16} />
-          <span>
-            {#each fetching as m, i}{i ? " · " : ""}<strong>{m.name}</strong> is downloading {wanted?.label}: {pct(m.sync!)}%{/each}.
-            Start when it's done.
-          </span>
-          <button class="ghost close" onclick={() => (hideFetching = true)} aria-label="Dismiss"><Icon name="x" size={14} /></button>
-        </div>
-      {/if}
-
       <div class="power-wrap" class:beckon={showHint && canToggle}>
         <PowerButton state={st} {locked} disabled={!canToggle} onclick={toggle} />
       </div>
@@ -274,25 +280,6 @@
           </span>
         </label>
       {/if}
-
-      {#if showLogsHint}
-      <div class="hint info" role="status">
-        <Icon name="terminal" size={16} />
-        <span>Loading the model can take up to a few minutes. Follow its progress live in Logs.</span>
-        <button class="logs-btn" onclick={() => navigate("logs")}>Open Logs</button>
-        <button class="ghost close" onclick={() => (logsHintClosed = true)} aria-label="Dismiss"><Icon name="x" size={14} /></button>
-      </div>
-    {/if}
-
-    {#if ctxNote}
-        <Notice kind="warn" onclose={() => (ctxNote = "")}>{ctxNote}</Notice>
-      {/if}
-    {#if actionError}
-        <Notice onclose={() => (actionError = "")}>{actionError}</Notice>
-      {/if}
-      {#each snap?.warnings ?? [] as w}
-        {#if !dismissedWarnings.includes(w)}<Notice kind="warn" onclose={() => (dismissedWarnings = [...dismissedWarnings, w])}>{w}</Notice>{/if}
-      {/each}
 
       {#if snap?.cluster?.role.role === "member"}
         <p class="member-note">
@@ -361,14 +348,12 @@
   .dot.running { background: var(--on); box-shadow: 0 0 10px var(--on); }
   .dot.starting, .dot.stopping, .dot.external { background: var(--busy); }
   .dot.error, .dot.paused { background: var(--bad); }
-  .download-ask { border-color: var(--on); background: var(--on-soft); }
   .force {
     display: flex; gap: 10px; align-items: flex-start; max-width: 560px; margin: 4px auto 0; padding: 10px 14px;
     border: 1px solid var(--busy-glow); border-radius: 10px; background: var(--busy-soft); color: var(--warn-text);
     font-size: 13px; text-align: left; cursor: pointer;
   }
   .force input { margin-top: 2px; flex: none; }
-  .download-ask .primary { white-space: nowrap; display: inline-flex; gap: 6px; align-items: center; }
   .running-model { display: flex; justify-content: center; margin: 2px 0 6px; }
   .locked-note { color: var(--violet); display: inline-flex; gap: 6px; align-items: baseline; max-width: 560px; }
   .paused-note { color: var(--bad); display: inline-flex; gap: 6px; align-items: baseline; max-width: 560px; font-weight: 500; }
@@ -376,8 +361,6 @@
   .detail { margin: 0; color: var(--muted); max-width: 460px; min-height: 20px; }
   .forced { color: var(--warn-text); display: inline-flex; gap: 6px; align-items: flex-start; text-align: left; }
   .blocked { color: var(--bad-text); display: inline-flex; gap: 6px; align-items: flex-start; text-align: left; }
-  .error-banner { max-width: 560px; text-align: left; }
-  .error-banner.warn { border-color: var(--busy-glow); background: var(--busy-soft); color: var(--warn-text); }
   /* Side by side, the model card and the pre-flight list are always the same height. */
   .setup { width: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; align-items: stretch; }
   .setup > .card { display: flex; flex-direction: column; }
@@ -387,52 +370,11 @@
   .small-text { font-size: 12.5px; }
   .vram { margin-top: 14px; }
   .ctx { margin-top: 14px; display: flex; flex-direction: column; gap: 2px; }
-  .hint {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    max-width: 520px;
-    padding: 10px 12px 10px 16px;
-    border-radius: 12px;
-    background: var(--on-soft);
-    border: 1px solid var(--on);
-    color: var(--text);
-    font-size: 13.5px;
-    text-align: left;
-    box-shadow: var(--shadow);
-    animation: drop 0.35s ease-out;
-  }
-  .hint::after {
-    content: "";
-    position: absolute;
-    left: 50%;
-    bottom: -7px;
-    width: 12px;
-    height: 12px;
-    transform: translateX(-50%) rotate(45deg);
-    background: inherit;
-    border-right: 1px solid var(--on);
-    border-bottom: 1px solid var(--on);
-    background-color: var(--surface);
-    background-image: linear-gradient(var(--on-soft), var(--on-soft));
-  }
-  .hint.blocked-hint { background: var(--busy-soft); border-color: var(--busy); }
-  .hint.blocked-hint::after { border-color: var(--busy); background-image: linear-gradient(var(--busy-soft), var(--busy-soft)); }
-  .hint .close { padding: 4px; margin-left: auto; }
   .power-wrap { border-radius: 50%; }
   .power-wrap.beckon { animation: beckon 1.6s ease-in-out infinite; }
   @keyframes beckon {
     0%, 100% { filter: drop-shadow(0 0 0 transparent); }
     50% { filter: drop-shadow(0 0 22px var(--on-glow)); }
   }
-  @keyframes drop {
-    from { opacity: 0; transform: translateY(-6px); }
-    to { opacity: 1; transform: none; }
-  }
-  .hint.info { background: var(--surface); border-color: var(--busy); animation: drop 0.35s ease-out; }
-  .hint.info::after { bottom: auto; top: -7px; transform: translateX(-50%) rotate(225deg); border-color: var(--busy); background-image: none; }
-  .hint.info :global(svg) { color: var(--busy); flex-shrink: 0; }
-  .logs-btn { padding: 5px 12px; font-size: 12.5px; white-space: nowrap; }
   .member-note { max-width: 560px; margin: 0; padding: 12px 16px; border-radius: 12px; background: var(--surface); border: 1px solid var(--border); font-size: 13.5px; }
 </style>

@@ -169,11 +169,9 @@
          own maximum, gone once it moves below. -->
     <p class="cap">{limit?.model} supports up to {tokens(max)} of context (the model's own maximum), so the slider stops there.</p>
   {:else if !byModel && (blocked || hitLimit) && !locked && max != null}
-    <div class="note-box">
-      <Notice kind="warn" onclose={() => (hitLimit = false)}>
-        Past {tokens(max)} {limit?.model} would run out of VRAM ({gib(limit?.available_bytes ?? 0)} {where}), so the slider stops there.
-      </Notice>
-    </div>
+    <!-- An explanation like the one above, with no close button: closing it
+         did nothing while the slider sat at the limit. -->
+    <p class="cap">Past {tokens(max)} {limit?.model} would run out of VRAM ({gib(limit?.available_bytes ?? 0)} {where}), so the slider stops there.</p>
   {:else if !locked && over}
     <p class="warn">
       {#if byModel}
