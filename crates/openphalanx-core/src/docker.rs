@@ -21,6 +21,7 @@ pub const BUILD_FILES: &[(&str, &str)] = &[
     ("Dockerfile.server", include_str!("../../../docker/Dockerfile.server")),
     ("server/gateway.py", include_str!("../../../docker/server/gateway.py")),
     ("server/reqtrace.py", include_str!("../../../docker/server/reqtrace.py")),
+    ("server/searchguard.py", include_str!("../../../docker/server/searchguard.py")),
     ("server/start-sglang.sh", include_str!("../../../docker/server/start-sglang.sh")),
     ("server/supervisord.conf", include_str!("../../../docker/server/supervisord.conf")),
 ];
@@ -252,7 +253,8 @@ pub async fn inspect() -> Result<Option<ContainerInfo>> {
 #[derive(Debug, Clone)]
 pub struct RunSpec {
     pub image: String,
-    pub gpu_index: u32,
+    /// The GPUs the container gets, by index. More than one only with `local_split`.
+    pub gpus: Vec<u32>,
     pub agent_port: u16,
     pub admin_port: u16,
     pub model: ModelMount,
@@ -275,6 +277,21 @@ pub struct RunSpec {
     pub pairing_ttl_days: Option<u32>,
     /// Rank 0 of a model split across servers.
     pub split: Option<SplitRank>,
+    /// One model across this machine's GPUs (experimental): the layers each
+    /// holds, in the order of `gpus`.
+    pub local_split: Option<String>,
+}
+
+/// `--gpus` for these cards: `"device=0,2"`.
+fn gpu_devices(gpus: &[u32]) -> String {
+    format!("\"device={}\"", gpus.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(","))
+}
+
+/// SGLang's arguments for one model over `n` GPUs of this machine: pipeline
+/// parallel with every rank on this node (rank r on the r-th visible card),
+/// and the settings every rank must share (see `SplitRank::args`).
+fn local_split_args(n: usize) -> String {
+    format!("--pp-size {n} --chunked-prefill-size {SPLIT_PREFILL_CHUNK} --max-mamba-cache-size {SPLIT_STATE_SLOTS}")
 }
 
 /// One rank of a pipeline-parallel SGLang run across machines. These
@@ -328,7 +345,7 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
         "--name".into(),
         CONTAINER_NAME.into(),
         "--gpus".into(),
-        format!("\"device={}\"", spec.gpu_index),
+        gpu_devices(&spec.gpus),
         "--ipc=host".into(),
     ];
     if spec.split.is_some() {
@@ -391,6 +408,10 @@ pub fn run_args(spec: &RunSpec) -> Vec<String> {
             a.push(format!("{k}={v}"));
         }
         extra.push(split.args());
+    } else if let Some(partition) = spec.local_split.as_ref().filter(|_| spec.gpus.len() > 1) {
+        a.push("-e".into());
+        a.push(format!("SGLANG_PP_LAYER_PARTITION={partition}"));
+        extra.push(local_split_args(spec.gpus.len()));
     }
     for (k, v) in [("MODEL_ID", spec.model_id.clone()), ("EDIT_FORMAT", spec.edit_format.clone())] {
         a.push("-e".into());
@@ -668,7 +689,7 @@ mod tests {
     fn spec() -> RunSpec {
         RunSpec {
             image: default_image(),
-            gpu_index: 0,
+            gpus: vec![0],
             agent_port: 9090,
             admin_port: ADMIN_PORT,
             model: ModelMount { dirs: vec!["/m".into(), "/blobs".into()], model_path: "/m".into() },
@@ -685,7 +706,24 @@ mod tests {
             yarn: None,
             pairing_ttl_days: Some(7),
             split: None,
+            local_split: None,
         }
+    }
+
+    #[test]
+    fn one_model_over_this_machines_gpus() {
+        let a = run_args(&RunSpec { gpus: vec![0, 2], local_split: Some("40,24".into()), ..spec() });
+        assert!(a.windows(2).any(|w| w[0] == "--gpus" && w[1] == "\"device=0,2\""), "{a:?}");
+        assert!(a.iter().any(|x| x == "SGLANG_PP_LAYER_PARTITION=40,24"));
+        let extra = a.iter().find(|x| x.starts_with("SGLANG_EXTRA_ARGS=")).unwrap();
+        assert!(extra.contains("--pp-size 2 "), "{extra}");
+        // Every rank is on this node: no node count, no rendezvous address, the usual network.
+        assert!(!extra.contains("--nnodes") && !extra.contains("--dist-init-addr"));
+        assert!(a.windows(2).any(|w| w[0] == "--network" && w[1] == NETWORK));
+        // One card: nothing of this, whatever partition is passed.
+        let one = run_args(&RunSpec { local_split: Some("64".into()), ..spec() });
+        assert!(one.windows(2).any(|w| w[0] == "--gpus" && w[1] == "\"device=0\""));
+        assert!(!one.iter().any(|x| x.contains("PP_LAYER_PARTITION") || x.contains("--pp-size")));
     }
 
     #[test]

@@ -220,3 +220,6 @@ __marimo__/
 
 # Frontend source lives in app/src/lib (the Python "lib/" rule above would hide it)
 !app/src/lib/
+
+# Dummy apps for the agent evals (scripts/eval_app.py): local only, never committed
+scripts/fixtures/

@@ -84,6 +84,8 @@ jobs:
         run: python3 scripts/test_agent.py
       - name: Request trace tests (the gateway's trace module; no dependencies)
         run: python3 scripts/test_reqtrace.py
+      - name: Search guard tests (the gateway's pacing and pause for web search; no dependencies)
+        run: python3 scripts/test_searchguard.py
       - name: Command allowlist tests (what the agent may run without asking; no dependencies)
         run: python3 scripts/test_permissions.py
       - name: Shell syntax

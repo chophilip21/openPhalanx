@@ -221,6 +221,16 @@ class InTheAgent(Sandbox):
         ag._text = lambda *a, **k: "All done."
         return ag
 
+    def test_a_connectors_name_as_a_shell_command_is_not_run(self):
+        ag = self.agent([{"why": "save", "tool": "run", "command": "notes add_note Deploy"}, {"why": "done", "tool": "answer"}], [])
+        ran = []
+        ag.hooks.confirm_run = lambda c: ran.append(c) or True
+        ag.turn("Save a note titled Deploy")
+        self.assertEqual(ran, [])  # nobody was asked to run a program that doesn't exist
+        said = [m["content"] for m in ag.messages if "is not a program here" in m["content"]]
+        self.assertEqual(len(said), 1)
+        self.assertIn('{"tool": "notes.add_note"}', said[0])
+
     def test_calls_the_tool_with_schema_constrained_arguments(self):
         ag = self.agent([{"why": "save it", "tool": "notes.add_note"}, {"why": "done", "tool": "answer"}],
                         [{"title": "Deploy", "body": "Friday"}])

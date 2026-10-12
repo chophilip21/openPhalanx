@@ -31,7 +31,13 @@ pub struct Settings {
     /// `catalog:<repo>` or a custom model key.
     pub selected_model: Option<String>,
     pub context_len: u32,
+    /// The first selected GPU. Kept for versions that know only one card;
+    /// `gpus` is what decides.
     pub gpu_index: u32,
+    /// The GPUs the server may use, by index; `None`: every GPU in the
+    /// machine (the default). A model that fits one of them runs on one;
+    /// only a model that doesn't is spread over them (experimental).
+    pub gpus: Option<Vec<u32>>,
     pub agent_port: u16,
     /// The admin API (this app ↔ the backend, loopback only).
     pub admin_port: u16,
@@ -70,6 +76,7 @@ impl Default for Settings {
             selected_model: Some("catalog:Qwen/Qwen2.5-Coder-14B-Instruct-AWQ".into()),
             context_len: 32_768,
             gpu_index: 0,
+            gpus: None,
             agent_port: 9090,
             admin_port: crate::docker::ADMIN_PORT,
             control_port: crate::ports::CONTROL_PORT,
@@ -114,6 +121,18 @@ impl Settings {
     /// Settings from a file's bytes, field by field (None: not a JSON object).
     pub fn from_json(bytes: &[u8]) -> Option<Settings> {
         let serde_json::Value::Object(saved) = serde_json::from_slice(bytes).ok()? else { return None };
+        // A file from before several GPUs could be chosen: it keeps the one
+        // card it names, so an update doesn't move a working setup onto
+        // other cards. Only a new install starts with all of them.
+        let one_card = saved.contains_key("gpu_index") && !saved.contains_key("gpus");
+        let mut s = Self::read_fields(saved)?;
+        if one_card {
+            s.gpus = Some(vec![s.gpu_index]);
+        }
+        Some(s)
+    }
+
+    fn read_fields(saved: serde_json::Map<String, serde_json::Value>) -> Option<Settings> {
         if let Ok(s) = serde_json::from_value(serde_json::Value::Object(saved.clone())) {
             return Some(s);
         }
@@ -126,6 +145,29 @@ impl Settings {
             }
         }
         serde_json::from_value(serde_json::Value::Object(kept)).ok()
+    }
+
+    /// The selected GPUs that are in the machine, in index order.
+    pub fn selected_gpus(&self, present: &[crate::gpu::GpuInfo]) -> Vec<crate::gpu::GpuInfo> {
+        let mut out: Vec<_> =
+            present.iter().filter(|g| self.gpus.as_ref().is_none_or(|sel| sel.contains(&g.index))).cloned().collect();
+        out.sort_by_key(|g| g.index);
+        out
+    }
+
+    /// Selects GPUs by index (`None`: every GPU). An empty list is refused.
+    pub fn set_gpus(&mut self, gpus: Option<Vec<u32>>) -> std::result::Result<(), String> {
+        let gpus = gpus.map(|mut g| {
+            g.sort_unstable();
+            g.dedup();
+            g
+        });
+        if gpus.as_ref().is_some_and(|g| g.is_empty()) {
+            return Err("At least one GPU has to stay selected.".into());
+        }
+        self.gpu_index = gpus.as_ref().and_then(|g| g.first().copied()).unwrap_or(0);
+        self.gpus = gpus;
+        Ok(())
     }
 
     pub fn save(&self) -> Result<()> {
@@ -141,6 +183,39 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn card(index: u32) -> crate::gpu::GpuInfo {
+        crate::gpu::GpuInfo {
+            index,
+            name: format!("GPU {index}"),
+            total_bytes: 24 << 30,
+            used_bytes: 0,
+            free_bytes: 24 << 30,
+            utilization_pct: None,
+            temperature_c: None,
+            compute_capability: Some(8.6),
+        }
+    }
+
+    #[test]
+    fn every_gpu_unless_some_are_chosen() {
+        let present = [card(2), card(0), card(1)];
+        let mut s = Settings::default();
+        assert_eq!(s.selected_gpus(&present).iter().map(|g| g.index).collect::<Vec<_>>(), [0, 1, 2]);
+        s.set_gpus(Some(vec![2, 0, 2])).unwrap();
+        assert_eq!(s.gpus, Some(vec![0, 2]));
+        assert_eq!(s.gpu_index, 0);
+        assert_eq!(s.selected_gpus(&present).iter().map(|g| g.index).collect::<Vec<_>>(), [0, 2]);
+        // A chosen card that is gone is simply not there; nothing else is picked for it.
+        s.set_gpus(Some(vec![1, 7])).unwrap();
+        assert_eq!(s.selected_gpus(&present).iter().map(|g| g.index).collect::<Vec<_>>(), [1]);
+        assert!(s.set_gpus(Some(vec![])).is_err());
+        s.set_gpus(None).unwrap();
+        assert_eq!(s.selected_gpus(&present).len(), 3);
+        // Saved and read back, the choice holds (and "all" stays "all").
+        let again = Settings::from_json(&serde_json::to_vec(&s).unwrap()).unwrap();
+        assert_eq!(again.gpus, None);
+    }
 
     #[test]
     fn a_bad_value_costs_only_that_value() {
@@ -158,7 +233,9 @@ mod tests {
         assert_eq!(s.gpu_index, 1);
         let again = serde_json::to_value(&s).unwrap();
         assert_eq!(again["future_toggle"]["on"], true, "written back when saved");
+        assert_eq!(s.gpus, Some(vec![1]), "a file from before several GPUs keeps its one card");
         let old = Settings::from_json(br#"{"web_search": false}"#).unwrap();
+        assert_eq!(old.gpus, None, "no card named: every GPU");
         assert!(!old.web_search);
         assert!(!old.hide_ips, "a field this file predates gets its default");
     }

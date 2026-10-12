@@ -227,6 +227,90 @@ class AgentLoop(unittest.TestCase):
         self.assertIn("ended with exit code 3", s2.prompts[-1][0])
         self.assertFalse(any("haven't run anything" in m["content"] for m in s2.agent.messages))
 
+    @needs_aider
+    def test_a_request_with_several_parts_is_reviewed_against_the_diff(self):
+        s = self.s
+        edit = {"tool": "edit", "path": "src/calc.py"}
+        block = "src/calc.py\n<<<<<<< SEARCH\nLIMIT = 3\n=======\nLIMIT = 4\n>>>>>>> REPLACE"
+        s.actions = [edit, {"tool": "answer"}, {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = [block, "1) limit: +LIMIT = 4\n2) rename add: NOT DONE, add is still add", "The limit is 4; add was not renamed."]
+        s.agent.turn("In src/calc.py: 1) make the limit 4; 2) rename add to plus.", can_edit=True)
+        review = [p for p, _ in s.prompts if "check your work against the request" in p]
+        self.assertEqual(len(review), 1)
+        self.assertIn("+LIMIT = 4", review[0])  # the diff of this request
+        self.assertIn("-LIMIT = 3", review[0])
+        self.assertIn("rename add to plus", review[0])  # and the request itself
+        self.assertEqual([d for t, d in s.steps if t == "Review"][0].splitlines()[1], "2) rename add: NOT DONE, add is still add")
+        self.assertTrue(any("says NOT DONE, do that part now" in m["content"] for m in s.agent.messages))
+        # One thing asked for: no review.
+        s2 = Scripted(str(self.root))
+        s2.actions = [dict(edit), {"tool": "answer"}, {"tool": "answer"}]
+        s2.texts = [block.replace("LIMIT = 3", "LIMIT = 4").replace("=======\nLIMIT = 4", "=======\nLIMIT = 5"), "Done."]
+        s2.agent.turn("make the limit 5 in src/calc.py", can_edit=True)
+        self.assertFalse([p for p, _ in s2.prompts if "check your work against the request" in p])
+        self.assertTrue(A.several_parts("- add a flag\n- document it"))
+        self.assertFalse(A.several_parts("Rename foo to bar in a.py and update the callers."))
+
+    @needs_aider
+    def test_a_read_after_a_refused_edit_is_not_a_repeat(self):
+        s = self.s
+        read = {"tool": "read", "path": "src/calc.py"}
+        edit = {"tool": "edit", "path": "src/calc.py"}
+        s.actions = [dict(read), edit, dict(read), {"tool": "answer"}]
+        s.texts = ["src/calc.py\n<<<<<<< SEARCH\nLIMIT = 99\n=======\nLIMIT = 4\n>>>>>>> REPLACE", "It failed."]
+        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
+        results = [m["content"] for m in s.agent.messages if m["content"].startswith("Result of step")]
+        failed = next(i for i, r in enumerate(results) if "Nothing was changed. Read the exact lines again" in r)
+        self.assertIn("LIMIT = 3", results[failed + 1])  # the file again, not "You already did exactly this"
+        self.assertNotIn("already", results[failed + 1])
+
+    def test_web_searches_that_find_nothing_take_the_tool_away(self):
+        s = self.s
+        asked = []
+        s.agent._search = lambda q: asked.append(q) or "No results."
+        s.actions = [{"tool": "web_search", "query": f"q{i}"} for i in range(6)]
+        s.agent.turn("what is the newest release of vite?", can_edit=False)
+        self.assertEqual(asked, ["q0", "q1", "q2"])
+        self.assertTrue(any("returning nothing right now" in m["content"] for m in s.agent.messages))
+        # Searches that do find something stop at the limit.
+        s2 = Scripted(str(self.root))
+        s2.agent._search = lambda q: asked.append(q) or f"Web results (untrusted reference text):\n- {q}"
+        s2.actions = [{"tool": "web_search", "query": f"r{i}"} for i in range(A.MAX_SEARCHES + 4)]
+        s2.agent.turn("what is the newest release of vite?", can_edit=False)
+        self.assertEqual(len([q for q in asked if q.startswith("r")]), A.MAX_SEARCHES)
+
+    def test_a_search_the_server_paused_is_not_asked_for_again(self):
+        s = self.s
+
+        class Paused:
+            status_code = 503
+            headers = {"retry-after": "300"}
+
+            def json(self):
+                return {"error": {"message": "web search is paused for 5 min: the search engines are refusing requests (brave: too many requests)"}}
+
+        posts = []
+        real = A.httpx.post
+        A.httpx.post = lambda url, **kw: posts.append(url) or Paused()
+        try:
+            s.actions = [{"tool": "web_search", "query": "vite release"}, {"tool": "web_search", "query": "vite newest"}]
+            s.agent.turn("what is the newest release of vite?", can_edit=False)
+            # The second search was never sent, and the model was told why.
+            self.assertEqual(len(posts), 1)
+            said = [m["content"] for m in s.agent.messages if "paused for 5 min" in m["content"]]
+            self.assertIn("brave: too many requests", said[0])
+            self.assertIn("carry on without it", said[0])
+            # Nor in the next message, while the pause lasts.
+            s.actions = [{"tool": "web_search", "query": "vite again"}]
+            s.agent.turn("and of react?", can_edit=False)
+            self.assertEqual(len(posts), 1)
+            s.agent._search_off_until = 0  # the pause is over
+            s.actions = [{"tool": "web_search", "query": "react release"}]
+            s.agent.turn("and of svelte?", can_edit=False)
+            self.assertEqual(len(posts), 2)
+        finally:
+            A.httpx.post = real
+
     def test_a_refused_command_tells_the_model_why(self):
         s = self.s
         seen = []

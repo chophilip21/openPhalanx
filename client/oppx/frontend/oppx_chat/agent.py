@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import json
 import atexit
+import difflib
 import os
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -33,6 +35,10 @@ from .mcp import McpError, constraint, missing_required
 
 MODEL = "openphalanx-coder"
 MAX_STEPS = 40  # actions per turn before the model must answer
+# ...and for a turn that is changing files: five changes with lint, build and a
+# browser check ended at step 40 in 4 of 5 runs, mid-work, before its own review.
+MAX_STEPS_CHANGING = 80
+MAX_SEARCHES = 8  # web searches per turn
 READ_LINES = 250  # most lines one read returns
 READ_PAD = 6  # extra lines shown around a requested range
 WHOLE_FILE = 300  # files up to this many lines are always read whole
@@ -186,6 +192,19 @@ ASK_EDIT_CHECK = ("The user's latest message reads as a question, and you are ab
                   "again; otherwise choose answer.")
 MAX_PLANS = 2
 THINK_TOKENS = 350  # a plan or a stock-take; the model writes ~36 tokens a second
+# Before the reply to a request with several parts: each part against what
+# really changed. Asked for five changes, Qwen3.6 reported "front page by
+# default" as done in 4 of 5 runs with the request to the API untouched, though
+# a search result two steps earlier had named the right parameter.
+REVIEW_PROMPT = ("Before you reply, check your work against the request. In plain text (no JSON), write one line for each "
+                 "thing the user asked for: the thing in a few words, then the evidence that it is done: an added line of "
+                 "the diff below (a + line, quoted), or a command or browser step you ran and what it returned. If no "
+                 "line of the diff does it and nothing you ran shows it, write NOT DONE and what is missing. Intending "
+                 "to do it, or having written it in your plan, is not evidence. For a value you didn't invent (a URL, a "
+                 "parameter, a name), compare the line with what the files and search results above said, not with "
+                 "what you remember.\n\nThe request:\n{request}\n\nEverything this request changed:\n{diff}")
+REVIEW_TOKENS = 500
+REVIEW_DIFF = 9000  # characters of diff shown; the rest is named by file
 # A small model answered five different messages with the same sentences (its own
 # earlier replies made them the likeliest text): a repeat is redone once with this.
 REPEAT_PROMPT = ("You just wrote a reply you already gave earlier, word for word, but the user's message is a "
@@ -274,6 +293,13 @@ def clean_arguments(args: dict, schema: dict) -> dict:
 
 
 _ACTION_TAIL = re.compile(r'\n\s*(?:```(?:json)?\s*)?\{\s*"(?:enough|missing|tool)"[\s\S]*$')
+
+
+def several_parts(text: str) -> bool:
+    """A request that asks for several things: numbered or bulleted items, or
+    simply a long one. Those get a review of each part before the reply."""
+    items = re.findall(r"(?:^|[\s:;])(?:\d{1,2}[.)]|[-*•])\s+\S", text)
+    return len(items) >= 2 or len(text) >= 400
 
 
 def strip_action(text: str) -> str:
@@ -897,6 +923,8 @@ class Agent:
     changed_session: list = field(default_factory=list)
     _replies: list = field(default_factory=list)  # (user message, reply), the latest few
     _trail: list = field(default_factory=list)  # this turn's actions and results, one line each
+    _before: dict = field(default_factory=dict)  # path -> its text before this request first changed it
+    _search_off_until: float = 0.0  # the server paused or paced web search until then (monotonic)
     stuck: str = ""  # why the last turn stopped early ("" when it didn't)
     # Labels sent with every request (`oppx_trace`), for the server's Trace
     # page: which conversation, turn and step a request belongs to and what
@@ -1242,9 +1270,14 @@ class Agent:
                                       f"relying on one):\n{related}"})
         # Connector tools sit before "answer". With edits off, only those
         # their connector marks as read-only are offered.
+        def searching() -> bool:
+            # Not while the server says its search engines are refusing: asking
+            # again only keeps them blocked.
+            return self.web and time.monotonic() >= self._search_off_until
+
         def offered() -> tuple[tuple, tuple]:
             extra = self.connectors.names(read_only=not can_edit) if self.connectors is not None else ()
-            tools = tuple(t for t in TOOLS if (can_edit or t not in EDIT_TOOLS) and (self.web or t != "web_search")
+            tools = tuple(t for t in TOOLS if (can_edit or t not in EDIT_TOOLS) and (searching() or t != "web_search")
                           and (self.browser == "offer" or t != "browser") and t != "answer") + extra + ("answer",)
             return extra, tools
 
@@ -1258,11 +1291,12 @@ class Agent:
         outputs: dict[str, int] = {}  # a search's output -> the step that first returned it
         results: dict[int, dict] = {}  # step -> its result message (cut from the window later, maybe)
         reads: dict[str, list] = {}  # path -> [(first, last, step)] shown this turn
-        repeats = search_errors = failed_edits = plans = 0
+        repeats = search_errors = searches = search_empty = failed_edits = plans = 0
         searched = opened = changed = 0  # find/grep/list, read/outline, edit/create steps this turn
         act_forced = must_act = False  # a change request that keeps choosing answer gets one step without it
-        nudged = edit_nudged = checked = rethought = edit_checked = edit_planned = False
+        nudged = edit_nudged = checked = reviewed = rethought = edit_checked = edit_planned = False
         changed_files: list[str] = []
+        self._before = {}  # path -> its text before this request's first change to it
         last_repeat = ""
         check: str | None = None  # the first line of the last command run after the latest edit ("exit code 0")
         queued: list[dict] = []  # lookups asked for in one step, still to run
@@ -1277,7 +1311,12 @@ class Agent:
         def note(content: str):
             self.messages.append({"role": "user", "_result": True, "content": content})
 
-        for n in range(1, MAX_STEPS + 1):
+        limit = MAX_STEPS
+        for n in range(1, MAX_STEPS_CHANGING + 1):
+            limit = MAX_STEPS_CHANGING if changed else MAX_STEPS
+            if n > limit:
+                self.stuck = f"it used all {limit} steps without finishing"
+                break
             self._step = n
             if self.hooks.interrupted():
                 return ""
@@ -1360,6 +1399,15 @@ class Agent:
                          "a test you meant to add), do it now with edit; grep for an old name to check. "
                          "Otherwise choose answer, and describe only these changes." + verify)
                     continue
+                if changed and not reviewed and several_parts(text):
+                    # The work is done as far as the model is concerned: now
+                    # each part of the request against the diff, once.
+                    reviewed = True
+                    self._think(REVIEW_PROMPT.format(request=text.strip(), diff=self._diff()), "Review", REVIEW_TOKENS)
+                    note("If a line of your review says NOT DONE, do that part now (look up what you need first), then "
+                         "choose answer. Otherwise choose answer. Either way the reply must not call a part done "
+                         "that your review couldn't show.")
+                    continue
                 return self._answer(text, self._facts(changed_files, failed_edits, wants_change, called, check))
             if tool == "plan":
                 plans += 1
@@ -1436,9 +1484,18 @@ class Agent:
                     # A failing search fails the same way rephrased; small
                     # models kept rewording the query until the steps ran out.
                     search_errors += 1
-                    if search_errors >= 2:
+                    if search_errors >= 2 or not searching():
                         tools = tuple(t for t in tools if t != "web_search")
-                        result += "\n\nWeb search isn't working right now; carry on without it."
+                        result += "\n\nWeb search isn't working right now; carry on without it, and say so if the answer needed it."
+                elif tool == "web_search":
+                    # Nor does a search that finds nothing get better reworded:
+                    # 41 in one turn, the last ones for "a", "b", "c"…
+                    searches += 1
+                    search_empty = search_empty + 1 if result == "No results." else 0
+                    if search_empty >= 3 or searches >= MAX_SEARCHES:
+                        tools = tuple(t for t in tools if t != "web_search")
+                        result += ("\n\nWeb search is returning nothing right now; carry on without it." if search_empty >= 3 else
+                                   f"\n\nThat was web search number {searches} in this request, the last one: work with what you found.")
                 if tool in ("find", "grep", "list") and not result.startswith("Error:"):
                     # A reworded search that returns the very same lines is a repeat too.
                     first = outputs.setdefault(result, n)
@@ -1468,6 +1525,12 @@ class Agent:
                     if result.startswith("Error:"):
                         failed_edits += 1
                         result += "\n\nNothing was changed. Read the exact lines again and retry, or say that it failed."
+                        # ...and that read must not be refused as a repeat: told to
+                        # read again, Qwen3.6 did, got "you already did exactly
+                        # this" three times and the turn ended stuck.
+                        done.clear()
+                        reads.clear()
+                        outputs.clear()
                     else:
                         changed += 1
                         check = None  # a new edit: whatever ran before says nothing about it
@@ -1475,7 +1538,7 @@ class Agent:
                         changed_files.append(path)
                         if path not in self.changed_session:
                             self.changed_session.append(path)
-            left = MAX_STEPS - n
+            left = (MAX_STEPS_CHANGING if changed else MAX_STEPS) - n
             if left <= 5:
                 foot = f"\n\n[{left} steps left: wrap up]"
             elif n % 6 == 0 and not changed:
@@ -1486,7 +1549,7 @@ class Agent:
             note(f"Result of step {n} ({tool}):\n{result}{foot}")
             results[n] = self.messages[-1]
         else:
-            self.stuck = f"it used all {MAX_STEPS} steps without finishing"
+            self.stuck = f"it used all {limit} steps without finishing"
         return self._answer(text, self._facts(changed_files, failed_edits, wants_change, called, check), self.stuck)
 
     def _unseen(self) -> str:
@@ -1497,22 +1560,42 @@ class Agent:
         unseen = [d for d in top if not re.search(rf"(?:\(| in ){re.escape(d)}(?:[/):]|$)", trail, re.M)]
         return (" Folders you haven't looked in this turn: " + ", ".join(d + "/" for d in unseen[:20]) + ".") if unseen else ""
 
-    def _think(self, prompt: str, title: str) -> str:
+    def _diff(self) -> str:
+        """Everything this request changed so far, as one diff."""
+        out, size = [], 0
+        for rel, before in self._before.items():
+            try:
+                after = self.ws.path(rel, must_exist=False).read_text(encoding=self.ws.encoding, errors="replace")
+            except OSError:
+                after = ""
+            if size > REVIEW_DIFF:
+                out.append(f"(also changed: {rel}; not shown)")
+                continue
+            lines = list(difflib.unified_diff((before or "").splitlines(), after.splitlines(), f"a/{rel}" if before is not None
+                                              else "/dev/null", f"b/{rel}", lineterm="", n=2))
+            text = "\n".join(lines)
+            if size + len(text) > REVIEW_DIFF:
+                text = text[:max(0, REVIEW_DIFF - size)] + f"\n(the rest of {rel}'s changes is not shown)"
+            size += len(text)
+            out.append(text)
+        return "\n".join(out) or "(nothing)"
+
+    def _think(self, prompt: str, title: str, tokens: int = THINK_TOKENS) -> str:
         """A free-text step (a plan, a rethink): written by the model, kept in
         the conversation and shown to the user as one step."""
-        kind = {"Rethink": "rethink", "Taking stock": "stock"}.get(title, "plan")
+        kind = {"Rethink": "rethink", "Taking stock": "stock", "Review": "review"}.get(title, "plan")
         self._call = {"kind": kind}
         self._event(kind)
         self.messages.append({"role": "user", "content": prompt})
         self.hooks.waiting("Planning")
         try:
-            plan = strip_action(self._text(THINK_TOKENS, stream=False))
+            plan = strip_action(self._text(tokens, stream=False))
             if not plan or as_action(plan) is not None:
                 # The action again instead of the text (the conversation is
                 # full of them): once more, the first character constrained.
                 self._event("retry")
                 try:
-                    plan = strip_action(self._text(THINK_TOKENS, stream=False, regex=r"[^{\s`][\s\S]*"))
+                    plan = strip_action(self._text(tokens, stream=False, regex=r"[^{\s`][\s\S]*"))
                 except ContextOverflow:
                     raise
                 except RuntimeError:  # a server without regex constraints
@@ -1686,6 +1769,7 @@ class Agent:
                 cmd = act.get("command", "").strip()
                 if not cmd:
                     raise ToolError(f"{tool} needs a command")
+                self._not_a_connector(cmd)
                 allowed = self.hooks.confirm_run(cmd)
                 if allowed is not True:
                     # A refusal can carry what the user said instead, or why
@@ -1871,6 +1955,7 @@ class Agent:
         # Keep the blocks in the conversation as the action's text.
         self.messages[-1] = {"role": "assistant", "content": self.messages[-1]["content"] + "\n" + reply}
         rel, before, after = apply_edit(self.ws, path, reply)
+        self._before.setdefault(rel, before)
         self.hooks.edited(rel, before, after)
         return f"Edited {rel}. The changed lines now read:\n{changed_region(before, after)}{balance_warning(before, after)}"
 
@@ -1894,10 +1979,25 @@ class Agent:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding=self.ws.encoding)
         rel = self.ws.rel(p)
+        self._before.setdefault(rel, before)
         self.hooks.edited(rel, before, content)
         if before is not None:
             return f"Replaced the whole of {rel} ({len(content.splitlines())} lines; it had {len(before.splitlines())})."
         return f"Created {rel} ({len(content.splitlines())} lines)."
+
+    def _not_a_connector(self, cmd: str):
+        """A connector's name typed as a shell command ("playwright browser
+        navigate http://…", with the browser's tools on offer): say what it is,
+        instead of asking the user to run a program that doesn't exist."""
+        if self.connectors is None:
+            return
+        names = sorted(self.connectors.tools())
+        first = cmd.split()[0].lower()
+        mine = [n for n in names if n.split(".", 1)[0].lower() == first or n in cmd]
+        if mine and not shutil.which(cmd.split()[0]):
+            raise ToolError(f"{first} is not a program here: it is a connector, and its tools are chosen directly as the "
+                            f'action, e.g. {{"tool": "{mine[0]}"}}. Its tools: ' + ", ".join(mine[:12])
+                            + (" …" if len(mine) > 12 else ""))
 
     def _search(self, query: str) -> str:
         if not query:
@@ -1905,7 +2005,15 @@ class Agent:
         r = httpx.post(f"{self.base}/search", headers={"Authorization": f"Bearer {self.key}"},
                        json={"query": query, "max_results": 5}, timeout=30)
         if r.status_code >= 400:
-            raise ToolError(f"search failed ({r.status_code})")
+            try:
+                why = r.json()["error"]["message"]
+            except (ValueError, KeyError, TypeError):
+                why = f"search failed ({r.status_code})"
+            wait = r.headers.get("retry-after", "")
+            if r.status_code in (429, 503) and wait.isdigit():
+                # Paused or paced by the server: not offered again until then, in this turn or the next.
+                self._search_off_until = time.monotonic() + int(wait)
+            raise ToolError(why)
         results = r.json().get("results") or []
         if not results:
             return "No results."

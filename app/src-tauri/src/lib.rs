@@ -294,7 +294,8 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
 
     let mut warnings = Vec::new();
     if running {
-        if let Some(g) = gpus.iter().find(|g| g.index == settings.gpu_index) {
+        // The fullest of the cards the backend may be on.
+        if let Some(g) = settings.selected_gpus(&gpus).into_iter().min_by_key(|g| g.free_bytes) {
             if g.free_bytes < LOW_VRAM_WARNING {
                 warnings.push(format!(
                     "GPU memory is almost full ({} free). Avoid starting other GPU programs.",
@@ -975,8 +976,8 @@ struct VramBudget {
 }
 
 async fn vram_budget(state: &AppState, settings: &Settings) -> VramBudget {
-    let gpus = gpu::query().await.unwrap_or_default();
-    let gpu = gpus.into_iter().find(|g| g.index == settings.gpu_index);
+    let selected = settings.selected_gpus(&gpu::query().await.unwrap_or_default());
+    let gpu = server::best_gpu(&selected);
     let running = docker::inspect().await.ok().flatten().is_some_and(|c| c.state.running);
     let (available, basis) = match &gpu {
         Some(g) if running => {
@@ -986,11 +987,34 @@ async fn vram_budget(state: &AppState, settings: &Settings) -> VramBudget {
         Some(g) => (Some(g.free_bytes), "free right now"),
         None => (None, "no GPU detected"),
     };
-    let pool = cluster_pool(state, gpu.as_ref(), available, running);
+    let cluster = cluster_pool(state, gpu.as_ref(), available, running);
+    // No cluster to split across, but several GPUs selected here: a model
+    // that doesn't fit one is spread over them (experimental), so they count
+    // together, each paying its own runtime memory like a server would.
+    let local = (cluster.is_none() && selected.len() > 1).then(|| {
+        let idle = state.inner.lock().unwrap().idle_free_vram.clone();
+        selected
+            .iter()
+            .map(|g| PoolNode {
+                id: format!("gpu-{}", g.index),
+                name: format!("GPU {}", g.index),
+                this: true,
+                gpu: Some(g.name.clone()),
+                available_bytes: if running { idle.get(&g.index).copied().unwrap_or(g.total_bytes) } else { g.free_bytes },
+                total_bytes: g.total_bytes,
+            })
+            .collect::<Vec<_>>()
+    });
+    let basis = match (&cluster, &local) {
+        (Some(_), _) => "pooled across the cluster (split)",
+        (None, Some(_)) => "this machine's selected GPUs together (experimental)",
+        _ => basis,
+    };
+    let pool = cluster.or(local);
     let servers = pool.as_ref().map_or(1, |p| p.len() as u32);
-    let (available, basis) = match &pool {
-        Some(p) => (Some(p.iter().map(|n| n.available_bytes).sum()), "pooled across the cluster (split)"),
-        None => (available, basis),
+    let available = match &pool {
+        Some(p) => Some(p.iter().map(|n| n.available_bytes).sum()),
+        None => available,
     };
     VramBudget { gpu, available, basis, pool, servers }
 }
@@ -1196,10 +1220,21 @@ async fn backend_busy(state: &AppState) -> bool {
 
 #[tauri::command]
 async fn set_gpu(state: State<'_, AppState>, index: u32) -> CmdResult<Settings> {
+    set_gpus(state, Some(vec![index])).await
+}
+
+/// Which GPUs the server may use, by index; `None`: every GPU in the machine.
+#[tauri::command]
+async fn set_gpus(state: State<'_, AppState>, indices: Option<Vec<u32>>) -> CmdResult<Settings> {
     if backend_busy(&state).await {
-        return Err("Stop the server to change the GPU; it applies at the next start.".into());
+        return Err("Stop the server to change the GPUs; it applies at the next start.".into());
     }
-    state.update_settings(|s| s.gpu_index = index)
+    let mut problem = None;
+    let saved = state.update_settings(|s| problem = s.set_gpus(indices).err())?;
+    match problem {
+        Some(p) => Err(p),
+        None => Ok(saved),
+    }
 }
 
 /// Moves one of the server's own ports: "agent_port" (the client API; clients
@@ -1437,7 +1472,7 @@ async fn inspect_source(state: &AppState, input: &str) -> CmdResult<CustomInspec
         }
     };
     let ctx = settings.context_len.min(info.max_context);
-    let gpu = gpu::query().await.ok().and_then(|g| g.into_iter().find(|g| g.index == settings.gpu_index));
+    let gpu = server::best_gpu(&settings.selected_gpus(&gpu::query().await.unwrap_or_default()));
     let requirement = vram::requirement(
         info.weight_bytes,
         info.quant.as_deref(),
@@ -1696,6 +1731,7 @@ pub fn run() {
             set_context_len,
             set_long_context,
             set_gpu,
+            set_gpus,
             set_port,
             set_hide_ips,
             set_theme,
