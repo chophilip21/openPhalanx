@@ -104,6 +104,7 @@ Read the topic's file before working on that part; add what you measure or verif
 | web-search | [`.claude/skills/web-search/SKILL.md`](.claude/skills/web-search/SKILL.md) | SearXNG, the gateway's search router, the search guard (cache, pacing, pause) |
 | security-and-ports | [`.claude/skills/security-and-ports/SKILL.md`](.claude/skills/security-and-ports/SKILL.md) | Every port and state file, and the security model |
 | model-catalog | [`.claude/skills/model-catalog/SKILL.md`](.claude/skills/model-catalog/SKILL.md) | The model catalog, the VRAM estimate, KV cache sizing, YaRN, what was validated on hardware |
+| benchmark | [`.claude/skills/benchmark/SKILL.md`](.claude/skills/benchmark/SKILL.md) | `scripts/bench_speed.py` and `BENCHMARK.md`: how the numbers are made on each machine, the test rig, pitfalls and open findings |
 | releasing | [`.claude/skills/releasing/SKILL.md`](.claude/skills/releasing/SKILL.md) | CI, the release and publish workflows, repository settings |
 
 ## Development
@@ -123,6 +124,7 @@ cargo run -p openphalanx-core --example download -- <repo> <dir>  # verified, re
 
 docker build -f docker/Dockerfile.server -t openphalanx-backend:dev docker/   # the backend image by hand (the app builds its own; see below)
 scripts/bench_session.py --oppx target/debug/oppx               # prefix-cache benchmark (in a scratch copy of a repo)
+scripts/bench_speed.py --label 3090 --models <id,id>            # speed per model for BENCHMARK.md (app closed); --summary <results.jsonl…> for the tables
 scripts/gen_docs.py --oppx target/debug/oppx --out target/docs  # docs sources; then: mdbook build target/docs
 OPENAI_API_BASE=… OPENAI_API_KEY=… scripts/probe_routing.py     # via `oppx proxy --no-web`; run after any model change
 OPENAI_API_BASE=… OPENAI_API_KEY=… scripts/probe_kv.py          # long-context recall + coding tasks run against tests (e.g. KV dtype checks)
@@ -184,6 +186,8 @@ scripts/probe_browser.py does the loaded model ask for the browser when a messag
 scripts/probe_routing.py score the search router and ask/edit check against the loaded model
 scripts/catalog_entry.py catalog entries from Hugging Face (pinned commit, weight size, attention shape); --check re-verifies
 scripts/bench_session.py 10-turn prefix-cache benchmark through a real oppx session
+scripts/bench_speed.py   speed per model through oppxs (one user per prompt length, several users), for BENCHMARK.md
+benchmarks/results/      the raw results behind BENCHMARK.md (one JSON line per measurement, per machine and date)
 scripts/bump_version.py  version bump from a PR title, plus the CHANGELOG.md entry
 scripts/gen_docs.py      docs site sources (README, CLI and API reference, CLAUDE.md and its topic files, changelog)
 scripts/install*.sh      client and server installers (attached to each release)

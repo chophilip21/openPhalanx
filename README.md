@@ -25,6 +25,21 @@ Run a coding model on your own Linux GPU machine and use it from any laptop on y
 * ✅ **Web search**: the server searches the web through its own private SearXNG when a request needs current information.
 * ✅ **Clusters**: servers on one network can form a cluster and split a model too big for one GPU across them.
 
+### How fast is it?
+
+Measured on our own hardware with OpenPhalanx 0.7.4, one user, nothing cached:
+
+| Model | RTX 3090 (24 GB) | RTX 4090 Laptop (16 GB) |
+|---|---|---|
+| Qwen2.5-Coder-7B AWQ | 148 tok/s · 32k context | 108 tok/s · 32k context |
+| Qwen2.5-Coder-14B AWQ (default) | 81 tok/s · 32k context | 57 tok/s · 16k context |
+| gpt-oss-20b | 107 tok/s · 32k context | doesn't fit |
+
+* **First token on an 8k-token prompt:** 4.0 s with the default model on the 3090 (2.0 s with the 7B). When the prompt starts with text the server has already seen, as in every turn of an agent session, that part is served from the prefix cache: a 7.2k-token request dropped from 3.7 s to 0.2 s.
+* **Shared by a team:** eight people at once on the 3090 with the default model get 179 tok/s in total, 42 tok/s each.
+
+Method, the full tables and what fits where: [BENCHMARK.md](BENCHMARK.md).
+
 ## Quick Start
 
 Every GPU machine needs Linux, a working `nvidia-smi` (24 GB or above VRAM recommended, 8GB absolute minimum), Docker (your user in the `docker` group) and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). The installers check these first.
