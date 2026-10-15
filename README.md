@@ -14,6 +14,8 @@ Run a coding model on your own Linux GPU machine and use it from any laptop on y
 
 </div>
 
+https://github.com/user-attachments/assets/5d7663b2-fe50-4a05-8f86-5bbd8b08f9b3
+
 ---
 
 ## Why OpenPhalanx?
