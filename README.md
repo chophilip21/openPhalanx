@@ -14,6 +14,8 @@ Run a coding model on your own Linux GPU machine and use it from any laptop on y
 
 </div>
 
+https://github.com/user-attachments/assets/5d7663b2-fe50-4a05-8f86-5bbd8b08f9b3
+
 ---
 
 ## Why OpenPhalanx?
@@ -24,6 +26,44 @@ Run a coding model on your own Linux GPU machine and use it from any laptop on y
 * ✅ **Managed context**: when a conversation grows, older content is trimmed or summarized automatically.
 * ✅ **Web search**: the server searches the web through its own private SearXNG when a request needs current information.
 * ✅ **Clusters**: servers on one network can form a cluster and split a model too big for one GPU across them.
+
+### How fast is it?
+
+Measured on our own hardware with OpenPhalanx 0.7.4: an RTX 3090 (24 GB) desktop and an RTX 4090 Laptop GPU (16 GB), alone and as a cluster. Full method and tables: [BENCHMARK.md](BENCHMARK.md).
+
+**Speed, one user, nothing cached.** "Writes" is how fast the answer streams; the other columns are the wait before it starts, by prompt length.
+
+| Model | Hardware | Context | Writes | 2k prompt | 8k prompt | 32k prompt |
+|---|---|---|---|---|---|---|
+| Qwen2.5-Coder-7B AWQ | RTX 3090 | 32k | 148 tok/s | 0.5 s | 2.0 s | 9.9 s |
+| Qwen2.5-Coder-14B AWQ (default) | RTX 3090 | 32k | 81 tok/s | 0.9 s | 4.0 s | 21.6 s |
+| gpt-oss-20b | RTX 3090 | 32k | 107 tok/s | 0.9 s | 3.3 s | 14.5 s |
+| Qwen2.5-Coder-7B AWQ | RTX 4090 Laptop | 32k | 108 tok/s | 0.4 s | 1.8 s | 9.0 s |
+| Qwen2.5-Coder-14B AWQ (default) | RTX 4090 Laptop | 16k | 57 tok/s | 0.8 s | 3.5 s | 7.7 s (16k) |
+| Qwen3.6-27B AWQ | both, split | 64k | 35 tok/s | 1.9 s | 6.7 s | 28.0 s |
+
+Qwen3.6-27B fits neither card alone; split across both machines over gigabit Ethernet it runs with a 64k context (a 60k prompt: 56 s to start, then 29 tok/s). gpt-oss-20b, Devstral-24B and the 27B models don't fit the 16 GB laptop by the app's estimate.
+
+**A real agent session.** Ten turns of questions and edits on this repository, Qwen3.6-27B split:
+
+| | |
+|---|---|
+| Prompt tokens served from the prefix cache | **92%** (1.33M of 1.45M) |
+| Reply starts on screen, follow-up turns | 0.2–1.1 s |
+| Turn time (several model requests each) | 10–72 s |
+
+Each turn resends the conversation so far; the server keeps what it has already read (SGLang's RadixAttention), so only the new part is processed.
+
+**Shared by a team.** Several people at once, 2k-token prompts:
+
+| Model | Hardware | 1 user | 4 users | 8 users | Each of 8 gets |
+|---|---|---|---|---|---|
+| Qwen2.5-Coder-7B AWQ | RTX 3090 | 120 tok/s | 284 tok/s | 369 tok/s | 77 tok/s |
+| Qwen2.5-Coder-14B AWQ | RTX 3090 | 61 tok/s | 136 tok/s | 179 tok/s | 42 tok/s |
+| Qwen2.5-Coder-14B AWQ | RTX 4090 Laptop | 49 tok/s | 124 tok/s | 142 tok/s | 37 tok/s |
+| Qwen3.6-27B AWQ | both, split | 27 tok/s | 65 tok/s | 65 tok/s | 22 tok/s (4 at a time) |
+
+**Does the agent finish the job?** Nine edit tasks on this repository, each checked by compiling or running the tests (three name no file): **7 of 9** with Qwen3.6-27B split, 14–41 s each; 9 of 9 with Qwen3.8-27B split in an earlier run.
 
 ## Quick Start
 

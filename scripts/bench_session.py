@@ -65,6 +65,8 @@ class Pty:
             os.execvp(argv[0], argv)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
         self.buf = b""
+        self.answered = 0  # byte offset after the last permission question answered
+        self.declined = 0
 
     def send(self, text: str):
         os.write(self.fd, text.encode())
@@ -83,6 +85,13 @@ class Pty:
                 # Answer cursor-position requests like a terminal, or prompt_toolkit stalls.
                 for _ in range(chunk.count(b"\x1b[6n")):
                     os.write(self.fd, b"\x1b[30;1R")
+                # A permission question (a check command after an edit) would
+                # wait for ever: decline it, so the turn ends and the reply
+                # says the change is unverified.
+                if "Allow?" in clean(self.buf[self.answered:]):
+                    self.answered = len(self.buf)
+                    self.declined += 1
+                    os.write(self.fd, b"n\r")
             if re.search(pattern, clean(self.buf[since:])):
                 return time.time() - start
         return None
@@ -135,7 +144,8 @@ def main():
         fmt = lambda s: "   -   " if s is None else f"{s:6.1f}s"
         print(f"{i:>4}  {len(rows):>7} {new:>9,} {cached:>8,} {hit:>5.0%} {fmt(first)} {fmt(total)}  {text[:50]}")
         if total is None:
-            print("      turn did not finish; stopping")
+            print("      turn did not finish; stopping. Last screen:")
+            print("\n".join("      | " + l for l in clean(session.buf[-3000:]).splitlines()[-25:]))
             break
 
     session.send("\x03")
@@ -143,7 +153,8 @@ def main():
     session.send("\x03")
     new = sum(r["computed"] for r in results)
     cached = sum(r["cached"] for r in results)
-    print(f"\nall turns: {new:,} computed, {cached:,} cached, hit rate {cached / max(1, new + cached):.0%}")
+    print(f"\nall turns: {new:,} computed, {cached:,} cached, hit rate {cached / max(1, new + cached):.0%}"
+          f"; {session.declined} permission question(s) declined")
     if args.json:
         json.dump(results, open(args.json, "w"), indent=1)
     with open(os.environ.get("BENCH_SCREEN", os.devnull), "wb") as f:

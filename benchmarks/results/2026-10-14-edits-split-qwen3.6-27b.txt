@@ -1,0 +1,27 @@
+engine: agent
+ # pass   time batches  computed   cached  task
+ 1    ✓    28s      16    12,105   88,128  In client/oppx/src/ui.rs, add a unit test that `dim("x")` returns plai
+ 2    ✓    21s      14     6,949   46,336  In scripts/bump_version.py, make a [hotfix] PR title prefix bump the p
+ 3    ✓    41s      14     6,349   42,496  In crates/openphalanx-core/src/vram.rs, add a unit test checking that 
+ 4    ✗    30s      15     9,797   60,480  Rename the function `short_fingerprint` in crates/openphalanx-core/src
+     changed: nothing
+     output:  
+              ⏺ Read(crates/openphalanx-core/src/cluster.rs:1538-1542)
+                ⎿  crates/openphalanx-core/src/cluster.rs lines 1532-1548 of 2307
+              ⏺ I couldn't complete the rename because the edit tool failed to match the      
+              search text. Let me retry with the exact content:                               
+                ✓ local ready · cyankiwi/Qwen3.6-27B-AWQ-INT4 · 64k context
+ 5    ✓    18s      13     6,723   37,376  In docker/server/gateway.py, change the default per-device rate limit 
+ 6    ✓    14s       8     4,660   22,912  Add a --version flag to scripts/probe_routing.py that prints "probe_ro
+ 7    ✗    21s      12     4,448   40,448  Pairing codes should stay valid for 15 minutes instead of 10.
+     changed: nothing
+     output:  
+              ⏺ Read(docker/server/gateway.py:99-105)
+                ⎿  docker/server/gateway.py lines 93-111 of 1098
+              ⏺ I'll change the pairing code TTL from 10 minutes (600 seconds) to 15 minutes  
+              (900 seconds) in docker/server/gateway.py:101.                                  
+                ✓ local ready · cyankiwi/Qwen3.6-27B-AWQ-INT4 · 64k context
+ 8    ✓    26s      15     6,217   29,504  A cluster member should count as offline after 30 seconds without a re
+ 9    ✓    23s      15     5,722   30,208  Each paired device should be allowed 6 requests in flight at once inst
+
+7/9 passed

@@ -10,7 +10,7 @@
   import { api, errorText, type Preflight } from "../lib/api";
   import { gib, tokens } from "../lib/format";
   import { app } from "../lib/store.svelte";
-  import { forceLoad, goto as navigate, nav } from "../lib/nav.svelte";
+  import { forceLoad, goto as navigate, nav, probe } from "../lib/nav.svelte";
   import { condition, type NoteBody } from "../lib/notify.svelte";
   import { onDestroy } from "svelte";
 
@@ -64,21 +64,12 @@
     s.total_bytes ? Math.floor((100 * s.done_bytes) / s.total_bytes) : 0;
   const hostName = $derived(cluster?.role.role === "member" ? cluster.role.host.name : "");
 
-  const headline = $derived(
-    locked ? `${hostName} is running the cluster` : {
-      stopped: "Server is off",
-      starting: "Starting…",
-      running: "Server is running",
-      stopping: "Stopping…",
-      error: "Server stopped with an error",
-      paused: "Serving paused",
-      external: "Running outside the app",
-    }[st],
-  );
-
+  let preflightAt = $state(0); // when the shown pre-flight was asked for
   async function refreshPreflight() {
+    const asked = Date.now();
     try {
       preflight = await api.preflight();
+      preflightAt = asked;
     } catch (e) {
       actionError = errorText(e);
     }
@@ -91,6 +82,63 @@
     const t = setInterval(refreshPreflight, 5000);
     return () => clearInterval(t);
   });
+
+  // The first look after launch (`probe`). Members report every 5 s and count
+  // as offline until their first report, so the first pre-flight often sees
+  // this GPU alone and would say "not enough VRAM" or offer Force load for a
+  // model the cluster holds. Until the GPU, the checks and every known member
+  // (or, as a member, the link to the host) have answered, or 20 s have
+  // passed, the page says what it is checking instead of giving a verdict.
+  const PROBE_MIN_MS = 1500; // long enough to read, not a flash
+  const PROBE_CLUSTER_MS = 20_000; // the backend's OFFLINE_AFTER_SECS
+  let clock = $state(Date.now());
+  $effect(() => {
+    if (probe.done) return;
+    const t = setInterval(() => (clock = Date.now()), 250);
+    return () => clearInterval(t);
+  });
+  const elapsed = $derived(clock - probe.started);
+  const expected = $derived(cluster?.role.role === "host" ? cluster.members : []);
+  const answered = $derived(expected.filter((m) => m.online && m.report).length);
+  const waitingHost = $derived(cluster?.role.role === "member" && !cluster.host_link?.connected);
+  const clusterSettled = $derived(
+    (answered === expected.length && !waitingHost) || elapsed >= PROBE_CLUSTER_MS,
+  );
+  // Once the cluster has settled, the verdict comes from a pre-flight asked
+  // for after that moment, so members that just appeared are in the pool.
+  let settledAt = $state<number | null>(null);
+  $effect(() => {
+    if (probe.done || settledAt != null || !clusterSettled) return;
+    settledAt = Date.now();
+    refreshPreflight();
+  });
+  $effect(() => {
+    if (probe.done) return;
+    if (snap && !idle) probe.done = true; // a server already running (adopted): nothing to wait for
+    else if (snap && settledAt != null && preflight && preflightAt >= settledAt && elapsed >= PROBE_MIN_MS) probe.done = true;
+  });
+  const probing = $derived(idle && !probe.done);
+  const probeText = $derived(
+    !snap || !preflight
+      ? "Checking free GPU memory…"
+      : !clusterSettled && waitingHost && cluster?.role.role === "member"
+        ? `Connecting to ${cluster.role.host.name}…`
+        : !clusterSettled
+          ? `Looking for the cluster's servers: ${answered} of ${expected.length} answered…`
+          : `Working out whether ${preflight.model?.label ?? "the model"} fits…`,
+  );
+
+  const headline = $derived(
+    locked ? `${hostName} is running the cluster` : probing ? "Checking this machine" : {
+      stopped: "Server is off",
+      starting: "Starting…",
+      running: "Server is running",
+      stopping: "Stopping…",
+      error: "Server stopped with an error",
+      paused: "Serving paused",
+      external: "Running outside the app",
+    }[st],
+  );
 
   // "Press start" hint after choosing a model; gone once the server moves.
   $effect(() => {
@@ -130,10 +178,10 @@
   note("start-hint", () =>
     showHint
       ? {
-          kind: canToggle || !blocking ? "info" : "warn",
+          kind: canToggle || !blocking || probing ? "info" : "warn",
           text: `${nav.startHint} is selected. ` + (canToggle
             ? "Press the power button to start the server."
-            : blocking ? `It can't start yet: ${blocking.detail}` : "Checking whether it can start…"),
+            : blocking && !probing ? `It can't start yet: ${blocking.detail}` : "Checking whether it can start…"),
           onclose: () => (nav.startHint = null),
         }
       : null);
@@ -172,7 +220,7 @@
   });
   // Not enough VRAM is the one check the user may override, by ticking a box.
   const forceable = $derived(
-    idle && !locked && !preflight?.running && preflight?.checks.filter((c) => c.status === "fail").every((c) => c.id === "vram") === true && blocking?.id === "vram",
+    idle && !probing && !locked && !preflight?.running && preflight?.checks.filter((c) => c.status === "fail").every((c) => c.id === "vram") === true && blocking?.id === "vram",
   );
   // The tick lives outside the page (it survives a visit to another tab) and
   // is dropped once the checks are in and no longer ask for it: the model
@@ -214,10 +262,17 @@
   }
   const MIN_CONTEXT = 2048;
   // Forced: the VRAM check is overridden, so it reads as a warning, not a stop.
-  const checks = $derived((preflight?.checks ?? []).map((c) => (forced && c.id === "vram" ? { ...c, status: "warn" as const } : c)));
+  // While probing, the VRAM row is a spinner saying what is being waited for.
+  const checks = $derived(
+    (preflight?.checks ?? []).map((c) =>
+      c.id !== "vram" ? c
+      : probing ? { ...c, status: "pending" as const, detail: probeText }
+      : forced ? { ...c, status: "warn" as const }
+      : c),
+  );
   const canToggle = $derived(
     !acting &&
-      (idle ? !locked && (!!preflight?.can_start || forced) : st === "running" || st === "starting" || st === "external"),
+      (idle ? !probing && !locked && (!!preflight?.can_start || forced) : st === "running" || st === "starting" || st === "external"),
   );
   // The same setting as the Models page's slider; locked while a backend runs.
   const ctxLocked = $derived(["starting", "running", "stopping", "external"].includes(st));
@@ -231,7 +286,7 @@
     }
     await refreshPreflight();
   }
-  const passed = $derived(preflight?.checks.filter((c) => c.status === "pass").length ?? 0);
+  const passed = $derived(checks.filter((c) => c.status === "pass").length);
 </script>
 
 <div class="page">
@@ -242,7 +297,7 @@
         <span class="eyebrow">{snap?.endpoint ? `Agent API · ${snap.endpoint}` : "Agent API"}</span>
       </div>
 
-      <div class="power-wrap" class:beckon={showHint && canToggle}>
+      <div class="power-wrap" class:beckon={showHint && canToggle} class:probing>
         <PowerButton state={st} {locked} disabled={!canToggle} onclick={toggle} />
       </div>
 
@@ -260,6 +315,8 @@
           <span class="paused-note"><Icon name="alert" size={14} /> {snap.server.detail}</span>
         {:else if snap?.server.detail}
           {snap.server.detail}
+        {:else if probing}
+          <span class="probe-note" aria-live="polite">{probeText}</span>
         {:else if idle && blocking && forced}
           <span class="forced"><Icon name="alert" size={14} /> Force load is on. {blocking.detail}</span>
         {:else if idle && blocking}
@@ -311,7 +368,7 @@
                   overhead={preflight.requirement.overhead_bytes}
                   available={gpu.free_bytes}
                   total={gpu.total_bytes}
-                  fit={forced ? "tight" : (preflight.fit?.fit ?? null)}
+                  fit={probing ? null : forced ? "tight" : (preflight.fit?.fit ?? null)}
                 />
               </div>
             {/if}
@@ -328,9 +385,17 @@
           <div class="card">
             <div class="row">
               <span class="eyebrow titled"><Icon name="checklist" size={14} /> Pre-flight checks</span>
-              <span class="muted small-text">{passed} of {preflight.checks.length} passed</span>
+              <span class="muted small-text">{probing ? "Checking…" : `${passed} of ${checks.length} passed`}</span>
             </div>
             <Checklist {checks} />
+          </div>
+        {:else if probing}
+          <div class="card">
+            <div class="row">
+              <span class="eyebrow titled"><Icon name="checklist" size={14} /> Pre-flight checks</span>
+              <span class="muted small-text">Checking…</span>
+            </div>
+            <Checklist checks={[{ id: "vram", label: "GPU memory", status: "pending", detail: probeText }]} />
           </div>
         {/if}
       </section>
@@ -372,6 +437,18 @@
   .ctx { margin-top: 14px; display: flex; flex-direction: column; gap: 2px; }
   .power-wrap { border-radius: 50%; }
   .power-wrap.beckon { animation: beckon 1.6s ease-in-out infinite; }
+  /* Probing: a ring sweeps out from the button while the machine is checked. */
+  .power-wrap.probing { position: relative; }
+  .power-wrap.probing::after {
+    content: ""; position: absolute; inset: -6px; border-radius: 50%; pointer-events: none;
+    border: 2px solid var(--busy-glow); animation: sweep 1.8s ease-out infinite;
+  }
+  @keyframes sweep {
+    0% { transform: scale(0.92); opacity: 0.9; }
+    100% { transform: scale(1.25); opacity: 0; }
+  }
+  .probe-note { color: var(--muted); animation: breathe 1.6s ease-in-out infinite; }
+  @keyframes breathe { 50% { opacity: 0.55; } }
   @keyframes beckon {
     0%, 100% { filter: drop-shadow(0 0 0 transparent); }
     50% { filter: drop-shadow(0 0 22px var(--on-glow)); }
