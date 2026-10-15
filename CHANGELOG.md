@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.7.5 (2026-10-15)
+
+### Fixes
+
+- Benchmarks on a 3090 and a 4090 Laptop, and a check at launch before the VRAM verdict (#16)
+
 ## v0.7.4 (2026-10-12)
 
 ### Fixes
