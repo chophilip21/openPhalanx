@@ -15,3 +15,9 @@ export function suggestStart(modelLabel: string) {
   nav.startHint = modelLabel;
   nav.page = "home";
 }
+
+/** The first look at this machine after launch: until the GPU, the pre-flight
+ *  checks and the cluster's servers have answered, the Server page shows it is
+ *  checking instead of a "not enough VRAM" verdict that misses members still
+ *  on their way. Once over, it stays over for this run of the app. */
+export const probe = $state<{ done: boolean; started: number }>({ done: false, started: Date.now() });

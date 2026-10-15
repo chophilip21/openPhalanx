@@ -2,14 +2,18 @@
   import Icon from "./Icon.svelte";
   import type { Check } from "../lib/api";
 
-  let { checks }: { checks: Check[] } = $props();
+  // "pending": still being checked (a spinner instead of a verdict).
+  type Row = Omit<Check, "status"> & { status: Check["status"] | "pending" };
+  let { checks }: { checks: Row[] } = $props();
   const icon = { pass: "check", warn: "alert", fail: "x" } as const;
 </script>
 
 <ul>
   {#each checks as c (c.id)}
     <li class={c.status}>
-      <span class="ic"><Icon name={icon[c.status]} size={14} stroke={2.6} /></span>
+      <span class="ic">
+        {#if c.status === "pending"}<span class="spin"></span>{:else}<Icon name={icon[c.status]} size={14} stroke={2.6} />{/if}
+      </span>
       <span class="label">{c.label}</span>
       <!-- Passed checks take one line (full text on hover), so a failure further
            down isn't pushed out of the window; problems keep their whole text. -->
@@ -25,6 +29,9 @@
   .pass .ic { color: var(--on); background: var(--on-soft); }
   .warn .ic { color: var(--busy); background: var(--busy-soft); }
   .fail .ic { color: var(--bad); background: var(--bad-soft); }
+  .pending .ic { color: var(--muted); }
+  .spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--muted); animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .label { color: var(--text); font-weight: 500; }
   .detail { color: var(--muted); }
   .pass .detail { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
