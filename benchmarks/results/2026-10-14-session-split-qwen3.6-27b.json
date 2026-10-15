@@ -1,0 +1,102 @@
+[
+ {
+  "turn": 1,
+  "message": "Explain what this repository does, in a short paragraph.",
+  "requests": 7,
+  "computed": 6122,
+  "cached": 13312,
+  "hit": 0.685,
+  "first_s": 3.7,
+  "total_s": 12.8
+ },
+ {
+  "turn": 2,
+  "message": "How does device pairing work, and which files implement it?",
+  "requests": 21,
+  "computed": 21475,
+  "cached": 209280,
+  "hit": 0.907,
+  "first_s": 3.3,
+  "total_s": 71.5
+ },
+ {
+  "turn": 3,
+  "message": "/add client/oppx/src/ui.rs",
+  "requests": 0,
+  "computed": 0,
+  "cached": 0,
+  "hit": 0.0,
+  "first_s": null,
+  "total_s": 0.9
+ },
+ {
+  "turn": 4,
+  "message": "What does the banner function in ui.rs do?",
+  "requests": 6,
+  "computed": 6687,
+  "cached": 53056,
+  "hit": 0.888,
+  "first_s": 1.1,
+  "total_s": 16.6
+ },
+ {
+  "turn": 5,
+  "message": "In client/oppx/src/ui.rs, extend the doc comment of the `line` function to say it is indented by two spaces.",
+  "requests": 10,
+  "computed": 5750,
+  "cached": 231936,
+  "hit": 0.976,
+  "first_s": 0.3,
+  "total_s": 14.0
+ },
+ {
+  "turn": 6,
+  "message": "What does client/oppx/src/tls.rs do?",
+  "requests": 8,
+  "computed": 8431,
+  "cached": 114688,
+  "hit": 0.932,
+  "first_s": 0.2,
+  "total_s": 24.1
+ },
+ {
+  "turn": 7,
+  "message": "In client/oppx/src/ui.rs, add a unit test that `dim(\"x\")` returns plain \"x\" when colors are disabled.",
+  "requests": 12,
+  "computed": 6701,
+  "cached": 415040,
+  "hit": 0.984,
+  "first_s": 0.3,
+  "total_s": 26.5
+ },
+ {
+  "turn": 8,
+  "message": "Summarize the changes we made so far in two sentences.",
+  "requests": 6,
+  "computed": 5965,
+  "cached": 98560,
+  "hit": 0.943,
+  "first_s": 1.0,
+  "total_s": 9.8
+ },
+ {
+  "turn": 9,
+  "message": "/add docker/server/gateway.py",
+  "requests": 0,
+  "computed": 0,
+  "cached": 0,
+  "hit": 0.0,
+  "first_s": null,
+  "total_s": 0.1
+ },
+ {
+  "turn": 10,
+  "message": "How does gateway.py enforce the per-device rate limit?",
+  "requests": 31,
+  "computed": 52222,
+  "cached": 198400,
+  "hit": 0.792,
+  "first_s": 0.2,
+  "total_s": 62.0
+ }
+]

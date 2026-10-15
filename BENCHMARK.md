@@ -6,9 +6,8 @@ Openphalanx is a local coding setup: an agent on your laptop, the model on your 
 2. **What can I run on the card I have?** Which models fit a 24 GB or 16 GB card, and with how much context.
 3. **What does splitting a model across two machines buy, and what does it cost?**
 4. **Does the agent actually get work done?** Real coding tasks, checked by compiling and running tests rather than by reading the reply.
-5. **How does it compare** with llama.cpp / Ollama on the same card.
 
-Sections 1, 2 and 5 are measured, and section 3 for one model; the rest is marked **not run yet**. Every number comes from the hardware below, the raw results are in [`benchmarks/results/`](benchmarks/results/), and **How to reproduce** at the end has the commands.
+Everything below is measured except a few split runs, which are marked **not run yet**. Every number comes from the hardware below, the raw results are in [`benchmarks/results/`](benchmarks/results/), and **How to reproduce** at the end has the commands.
 
 ## Test rig
 
@@ -89,9 +88,21 @@ From an earlier hand run (gigabit Ethernet, 3090 + 4090 Laptop): Qwen3-8B AWQ sp
 
 ### 4. Multi-turn sessions and the prefix cache
 
-**Not run yet** with this method (`scripts/bench_session.py`: 10 real turns, cache hit rate and time to first token per turn).
+A real `oppx` chat on this repository, driven through a terminal by `scripts/bench_session.py`: 10 turns of questions and edits (2 add files to the chat), on Qwen3.6-27B split across both machines at 64k. Counts are from SGLang's own log; "reply starts" is when the answer begins on screen. The agent's two requests to run a check after an edit were declined, so the turns didn't wait on a question.
 
-An earlier measurement on the 3090 with the default model: a 7.2k-token request took 3.7 s to the first token cold and **0.2 s** when its prefix was already cached. Agent sessions resend the same prefix every turn, so most turns get the cached time.
+| Turn | Message | Prompt tokens | From cache | Reply starts | Turn took |
+|---|---|---|---|---|---|
+| 1 | Explain what this repository does | 19,434 | 68% | 3.7 s | 12.8 s |
+| 2 | How does device pairing work, and which files implement it? | 230,755 | 91% | 3.3 s | 71.5 s |
+| 4 | What does the banner function in ui.rs do? | 59,743 | 89% | 1.1 s | 16.6 s |
+| 5 | Extend a doc comment in ui.rs (edit) | 237,686 | 98% | 0.3 s | 14.0 s |
+| 6 | What does tls.rs do? | 123,119 | 93% | 0.2 s | 24.1 s |
+| 7 | Add a unit test in ui.rs (edit) | 421,741 | 98% | 0.3 s | 26.5 s |
+| 8 | Summarize the changes so far | 104,525 | 94% | 1.0 s | 9.8 s |
+| 10 | How does gateway.py enforce the rate limit? (after adding the file) | 250,622 | 79% | 0.2 s | 62.0 s |
+| **All** | | **1,447,625** | **92%** | | |
+
+A turn is several requests (the agent reads files, then answers), and each resends the conversation so far. 92% of those prompt tokens came from the prefix cache. Without it, at this model's ~1,100 tokens/s, turn 7 alone would have spent over six minutes reading its prompts; it took 26.5 s. On the 3090 with the default model, an earlier single-request measurement: a 7.2k-token request took 3.7 s to the first token cold and 0.2 s when its prefix was cached.
 
 ### 5. Several users on one server
 
@@ -115,11 +126,18 @@ Eight people sharing the 3090 with the default model each still get 42 tok/s, ab
 
 ### 6. Does the agent get work done?
 
-**Not run yet** for this page. From the developer notes, on split Qwen3.8-27B (3090 + 4090 Laptop, 64k context): `scripts/eval_edits.py` 9 of 9 edit tasks (three of which name no file), `scripts/eval_nav.py` 10 of 10 questions about the repository.
+`scripts/eval_edits.py`: 9 edit tasks on this repository, each in a fresh clone, given to `oppx -p` (one request, nobody helping) and passed only when its check succeeds (compiling, the tests, or the changed value). Three of them name no file, so the agent has to find the place first.
 
-### 7. Compared with llama.cpp / Ollama
+| Model | Setup | Edit tasks | Time per task |
+|---|---|---|---|
+| Qwen3.6-27B AWQ | split, 64k | **7 of 9** | 14–41 s |
+| Qwen3.8-27B W4A16 | split, 64k (earlier run) | 9 of 9 | 17–41 s, two at ~90 s |
 
-**Not run yet.** Planned: the same model on the same 3090 (AWQ against GGUF Q4_K_M, roughly the same size), one user and four.
+Both Qwen3.6-27B failures ended the same way: the agent said what it would do next ("I'll change the pairing code TTL… in gateway.py:101") and the run ended without the edit. That is the agent stopping early, not the model failing the task; it's in the developer notes to fix. The earlier Qwen3.8-27B run also answered 10 of 10 questions about the repository that name no file (`scripts/eval_nav.py`).
+
+## Future work
+
+* **Compared with llama.cpp / Ollama:** the same model on the same 3090 (AWQ against GGUF Q4_K_M, roughly the same size), one user and four.
 
 ## How to reproduce
 
