@@ -8,7 +8,7 @@ Openphalanx is a local coding setup: an agent on your laptop, the model on your 
 4. **Does the agent actually get work done?** Real coding tasks, checked by compiling and running tests rather than by reading the reply.
 5. **How does it compare** with llama.cpp / Ollama on the same card.
 
-Sections 1, 2 (single cards) and 5 are measured; the rest is marked **not run yet**. Every number comes from the hardware below, the raw results are in [`benchmarks/results/`](benchmarks/results/), and **How to reproduce** at the end has the commands.
+Sections 1, 2 and 5 are measured, and section 3 for one model; the rest is marked **not run yet**. Every number comes from the hardware below, the raw results are in [`benchmarks/results/`](benchmarks/results/), and **How to reproduce** at the end has the commands.
 
 ## Test rig
 
@@ -44,7 +44,7 @@ One user, prompt not cached.
 | gpt-oss-20b | 3090 | 32k | **107 tok/s** | 0.86 s | 3.27 s | 14.5 s | 2,510 tok/s |
 | Devstral-Small-2-24B AWQ | 3090 | — | fails to load (runs out of memory while loading the weights) | | | | |
 | Qwen2.5-Coder-32B AWQ | 3090 | — | doesn't fit 24 GB by the app's estimate | | | | |
-| Qwen3.6-27B AWQ | 3090 | — | doesn't fit 24 GB by the app's estimate (runs split; section 3) | | | | |
+| Qwen3.6-27B AWQ | 3090 | — | doesn't fit 24 GB by the app's estimate (runs split: section 3) | | | | |
 | Qwen2.5-Coder-7B AWQ | 4090 Laptop | 32k | **108 tok/s** | 0.41 s | 1.75 s | 9.0 s | 4,670 tok/s |
 | Qwen2.5-Coder-14B AWQ (default) | 4090 Laptop | 16k | **57 tok/s** | 0.80 s | 3.53 s | 7.7 s (15.8k prompt) | 2,320 tok/s |
 | gpt-oss-20b | 4090 Laptop | — | doesn't fit 16 GB by the app's estimate | | | | |
@@ -67,13 +67,23 @@ The longest context each model starts with (32k was the most asked for).
 | gpt-oss-20b | 12.8 GB | doesn't fit | 32k | — |
 | Devstral-Small-2-24B AWQ | 15.0 GB | doesn't fit | fails to load | — |
 | Qwen2.5-Coder-32B AWQ | 18.0 GB | doesn't fit | doesn't fit | not run yet |
-| Qwen3.6-27B AWQ | 19.0 GB | doesn't fit | doesn't fit | not run yet (64k planned) |
+| Qwen3.6-27B AWQ | 19.0 GB | doesn't fit | doesn't fit | **64k** |
 | Qwen3.8-27B W4A16 | 18.1 GB | doesn't fit | doesn't fit | 64k (earlier run) |
 | Qwen3.6-35B-A3B AWQ | 23.7 GB | doesn't fit | doesn't fit | not run yet |
 
 ### 3. Splitting across machines
 
-**Not run yet.** Planned: the 14B on one card and split (what crossing the network costs), then Qwen3.8-27B and Qwen3.6-27B at 64k and Qwen3.6-35B-A3B (models that only run split).
+The app on the 3090 as the cluster host, the laptop as a member, over gigabit Ethernet; the model's layers are split between the two (pipeline parallel), started from the app's Start button.
+
+**What it unlocks:** Qwen3.6-27B AWQ fits neither card alone and runs split at a 64k context (18.8 GiB used on the 3090, 12.3 GiB on the laptop).
+
+| Model | Context | Generation | First token, 2k prompt | 8k | 32k | 60k | Prompt processing |
+|---|---|---|---|---|---|---|---|
+| Qwen3.6-27B AWQ (split) | 64k | **35 tok/s** | 1.9 s | 6.7 s | 28.0 s | 56.4 s | ~1,100–1,200 tok/s |
+
+Generation holds up as the context fills (35 tok/s after a 2k prompt, 29 after 60k). A cold long prompt is a long wait (nearly a minute at 60k), which is where the prefix cache earns its keep: an agent session pays it once, and later turns reuse the cached part.
+
+**Not run yet:** the 14B on one card against split (what crossing the network costs), Qwen3.8-27B, and Qwen3.6-35B-A3B.
 
 From an earlier hand run (gigabit Ethernet, 3090 + 4090 Laptop): Qwen3-8B AWQ split 20/16 layers wrote about 100 tok/s, and Qwen3.6-27B AWQ at 32k answered a 16.8k-token prompt in 13.7 s.
 
@@ -97,8 +107,11 @@ An earlier measurement on the 3090 with the default model: a 7.2k-token request 
 | | | 8 | 142 tok/s | 37 tok/s | 4.31 s |
 | Qwen2.5-Coder-7B AWQ | 3090 | 8 | 369 tok/s | 77 tok/s | 2.22 s |
 | gpt-oss-20b | 3090 | 8 | 171 tok/s | 33 tok/s | 4.08 s |
+| Qwen3.6-27B AWQ | split | 1 | 27 tok/s | 34 tok/s | 1.99 s |
+| | | 4 | 65 tok/s | 22 tok/s | 4.33 s |
+| | | 8 | 65 tok/s | 22 tok/s | 19.4 s |
 
-Eight people sharing the 3090 with the default model each still get 42 tok/s, about the speed of a hosted model. Every level for every model is in the raw results.
+Eight people sharing the 3090 with the default model each still get 42 tok/s, about the speed of a hosted model. The split Qwen3.6-27B serves about four requests at a time: with eight, the total stays at 65 tok/s and the rest wait their turn (19 s to the first token). Every level for every model is in the raw results.
 
 ### 6. Does the agent get work done?
 

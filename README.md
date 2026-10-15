@@ -36,6 +36,7 @@ Measured on our own hardware with OpenPhalanx 0.7.4, one user, nothing cached:
 | gpt-oss-20b | 107 tok/s · 32k context | doesn't fit |
 
 * **First token on an 8k-token prompt:** 4.0 s with the default model on the 3090 (2.0 s with the 7B). When the prompt starts with text the server has already seen, as in every turn of an agent session, that part is served from the prefix cache: a 7.2k-token request dropped from 3.7 s to 0.2 s.
+* **Bigger than one card:** Qwen3.6-27B fits neither GPU alone; split across both machines over gigabit Ethernet it runs at a 64k context and writes 35 tok/s.
 * **Shared by a team:** eight people at once on the 3090 with the default model get 179 tok/s in total, 42 tok/s each.
 
 Method, the full tables and what fits where: [BENCHMARK.md](BENCHMARK.md).
