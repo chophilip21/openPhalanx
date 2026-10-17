@@ -1,6 +1,62 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    "group:allNonMajor"
+  ],
+  "baseBranchPatterns": [
+    "dev"
+  ],
+  "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
+  "prConcurrentLimit": 5,
+  "commitMessagePrefix": "[chore]",
+  "labels": [
+    "dependencies"
+  ],
+  "automerge": false,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 6am on monday"
+    ]
+  },
+  "packageRules": [
+    {
+      "description": "The SGLang base image is a 16 GB pull and changes every backend image tag: its own PR, checked with the GPU lifecycle example before merging.",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "matchPackageNames": [
+        "lmsysorg/sglang"
+      ],
+      "groupName": null,
+      "addLabels": [
+        "backend",
+        "needs-gpu-test"
+      ]
+    },
+    {
+      "description": "CI runs the versions the project supports at the bottom of its range: Python 3.12 (the private Aider engine), Node.js 20 (the stated minimum), and Ubuntu 22.04 for the .deb and AppImage builds (older glibc). Don't move them.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepNames": [
+        "python",
+        "node",
+        "ubuntu"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "recheck and TypeScript are pinned for the regex check; a new version can change what it proves, so each gets its own PR.",
+      "matchFileNames": [
+        "scripts/regexcheck/package.json"
+      ],
+      "groupName": null,
+      "addLabels": [
+        "regex-check"
+      ]
+    }
   ]
 }
