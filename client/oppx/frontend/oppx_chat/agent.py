@@ -1043,11 +1043,11 @@ def _image_tokens(m: dict) -> int:
 def apply_edit(ws: Workspace, path: str, reply: str) -> tuple[str, str, str]:
     """Applies the SEARCH/REPLACE blocks in `reply` to `path` with Aider's
     matcher (exact, then whitespace-tolerant). Returns (rel, before, after)."""
-    from aider.coders.editblock_coder import DEFAULT_FENCE, do_replace, find_original_update_blocks
-
     p = ws.path(path)
     rel = ws.rel(p)
-    before = ws.read_text(p)
+    before = ws.read_text(p)  # refuses a document or picture before Aider is even loaded
+    from aider.coders.editblock_coder import DEFAULT_FENCE, do_replace, find_original_update_blocks
+
     content = before
     blocks = 0
     try:
