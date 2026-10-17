@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.8.1 (2026-10-17)
+
+### Fixes
+
+- Configure Renovate (#19)
+
 ## v0.8.0 (2026-10-17)
 
 ### Features
