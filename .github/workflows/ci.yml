@@ -24,7 +24,7 @@ jobs:
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check the PR title prefix ([bug], [feature], [major], or a no-release prefix)
         env:
           TITLE: ${{ github.event.pull_request.title }}
@@ -41,7 +41,7 @@ jobs:
   rust:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: System libraries for the Tauri app
         run: |
           sudo apt-get update
@@ -68,7 +68,7 @@ jobs:
   python-and-shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
