@@ -169,8 +169,10 @@ async fn build_snapshot(app: &AppHandle) -> Snapshot {
     let st = app.state::<AppState>();
     let settings = st.settings();
     let epoch = st.inner.lock().unwrap().stop_epoch;
-    let gpus = gpu::query().await.unwrap_or_default();
-    let container = docker::inspect().await.ok().flatten();
+    // Independent (nvidia-smi, docker): asked together on every 2 s tick.
+    let (gpus, container) = tokio::join!(gpu::query(), docker::inspect());
+    let gpus = gpus.unwrap_or_default();
+    let container = container.ok().flatten();
     let running = container.as_ref().is_some_and(|c| c.state.running);
     let managed = container.as_ref().is_some_and(|c| c.managed);
     let client = container

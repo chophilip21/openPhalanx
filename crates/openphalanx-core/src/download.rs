@@ -194,109 +194,25 @@ pub async fn download(
         );
     }
 
-    let mut done_bytes = 0u64;
+    // Several files at once: one HTTPS stream from Hugging Face ran at about
+    // 83 MB/s on the 3090 node, and a model is several multi-GB shards.
+    let shared = Shared::default();
     let started = Instant::now();
-    let mut transferred = 0u64;
-    let mut last_emit = Instant::now() - Duration::from_secs(1);
-    // Checking files already on disk re-hashes them, which takes a while for
-    // big shards: say so, or the download looks stuck before it starts.
-    let phase = |done: u64, what: String| Progress {
-        repo: repo.to_string(),
-        total_bytes: total,
-        done_bytes: done,
-        current_file: what,
-        bytes_per_sec: 0.0,
-    };
-
-    for file in files {
-        let final_path = dest.join(&file.path);
-        if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
-            on_progress(phase(done_bytes, format!("Checking {} (already downloaded)…", file.path)));
+    // Built into a Vec first: with the closure inside the stream's type, the
+    // future of a spawned download wasn't Send ("FnOnce is not general enough").
+    let pending: Vec<_> = files.iter().map(|file| fetch_file(client, repo, revision, file, dest, &cancel, &shared)).collect();
+    let mut fetches = futures_util::stream::iter(pending).buffer_unordered(PARALLEL_FILES);
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            next = fetches.next() => match next {
+                Some(result) => result?, // the first failure stops the rest; their .part files resume next time
+                None => break,
+            },
+            _ = tick.tick() => on_progress(shared.progress(repo, total, started)),
         }
-        if verified_complete(&final_path, file).await? {
-            done_bytes += file.size;
-            continue;
-        }
-        let part = part_path(dest, &file.path);
-        let mut hasher = Sha256::new();
-        let mut have = 0u64;
-        if let Ok(mut existing) = tokio::fs::File::open(&part).await {
-            on_progress(phase(done_bytes, format!("Resuming {}: checking the part already downloaded…", file.path)));
-            // Re-hash what we already have so resumed files still verify.
-            let mut buf = vec![0u8; 1 << 20];
-            loop {
-                let n = existing.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                have += n as u64;
-            }
-        }
-        if have > file.size {
-            tokio::fs::remove_file(&part).await?;
-            hasher = Sha256::new();
-            have = 0;
-        }
-
-        let url = format!("{HF}/{repo}/resolve/{revision}/{}", file.path);
-        let mut req = client.get(&url);
-        if have > 0 {
-            req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
-        }
-        let resp = req.send().await?.error_for_status()?;
-        if have > 0 && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-            // Server ignored the range; start this file over.
-            hasher = Sha256::new();
-            have = 0;
-        }
-        let mut out = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(have > 0)
-            .truncate(have == 0)
-            .open(&part)
-            .await?;
-        done_bytes += have;
-
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            if cancel.load(Ordering::Relaxed) {
-                out.flush().await?;
-                bail!("Download cancelled.");
-            }
-            let chunk = chunk.context("download interrupted")?;
-            hasher.update(&chunk);
-            out.write_all(&chunk).await?;
-            done_bytes += chunk.len() as u64;
-            transferred += chunk.len() as u64;
-            if last_emit.elapsed() >= Duration::from_millis(250) {
-                last_emit = Instant::now();
-                on_progress(Progress {
-                    repo: repo.to_string(),
-                    total_bytes: total,
-                    done_bytes,
-                    current_file: file.path.clone(),
-                    bytes_per_sec: transferred as f64 / started.elapsed().as_secs_f64().max(0.001),
-                });
-            }
-        }
-        out.flush().await?;
-        drop(out);
-
-        let size = tokio::fs::metadata(&part).await?.len();
-        if size != file.size {
-            bail!("{}: expected {} bytes, got {size}.", file.path, file.size);
-        }
-        if let Some(expected) = &file.sha256 {
-            let actual = hex::encode(hasher.finalize());
-            if &actual != expected {
-                tokio::fs::remove_file(&part).await?;
-                bail!("{} failed its SHA-256 check and was deleted; try again.", file.path);
-            }
-        }
-        tokio::fs::rename(&part, &final_path).await?;
     }
+    drop(fetches);
 
     let marker = serde_json::json!({
         "repo": repo,
@@ -316,6 +232,153 @@ pub async fn download(
         bytes_per_sec: 0.0,
     });
     Ok(dest.to_path_buf())
+}
+
+/// Files downloaded at the same time.
+const PARALLEL_FILES: usize = 4;
+
+/// What the files being fetched report, for the one progress line.
+#[derive(Default)]
+struct Shared {
+    done: std::sync::atomic::AtomicU64,
+    transferred: std::sync::atomic::AtomicU64,
+    /// File -> what it is doing ("" while it downloads, else a note such as "Checking …").
+    active: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl Shared {
+    fn set(&self, file: &str, note: String) {
+        let mut active = self.active.lock().unwrap();
+        match active.iter_mut().find(|(f, _)| f == file) {
+            Some(entry) => entry.1 = note,
+            None => active.push((file.to_string(), note)),
+        }
+    }
+
+    fn finish(&self, file: &str) {
+        self.active.lock().unwrap().retain(|(f, _)| f != file);
+    }
+
+    fn add(&self, bytes: u64, transferred: bool) {
+        self.done.fetch_add(bytes, Ordering::Relaxed);
+        if transferred {
+            self.transferred.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    fn progress(&self, repo: &str, total: u64, started: Instant) -> Progress {
+        let active = self.active.lock().unwrap();
+        // A check that takes a while is said; otherwise the files coming in.
+        let notes: Vec<&str> = active.iter().filter(|(_, n)| !n.is_empty()).map(|(_, n)| n.as_str()).collect();
+        let current_file = if notes.is_empty() {
+            active.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>().join(", ")
+        } else {
+            notes.join(" · ")
+        };
+        Progress {
+            repo: repo.to_string(),
+            total_bytes: total,
+            done_bytes: self.done.load(Ordering::Relaxed).min(total),
+            current_file,
+            bytes_per_sec: self.transferred.load(Ordering::Relaxed) as f64 / started.elapsed().as_secs_f64().max(0.001),
+        }
+    }
+}
+
+/// One file: skipped when it is complete, resumed from its .part (re-hashed,
+/// so it still verifies), checked against its size and SHA-256, then renamed
+/// into place.
+async fn fetch_file(
+    client: &reqwest::Client,
+    repo: &str,
+    revision: &str,
+    file: &RemoteFile,
+    dest: &Path,
+    cancel: &Cancel,
+    shared: &Shared,
+) -> Result<()> {
+    let final_path = dest.join(&file.path);
+    if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
+        // Checking files already on disk re-hashes them, which takes a while
+        // for big shards: say so, or the download looks stuck before it starts.
+        shared.set(&file.path, format!("Checking {} (already downloaded)…", file.path));
+    }
+    if verified_complete(&final_path, file).await? {
+        shared.add(file.size, false);
+        shared.finish(&file.path);
+        return Ok(());
+    }
+    let part = part_path(dest, &file.path);
+    let mut hasher = Sha256::new();
+    let mut have = 0u64;
+    if let Ok(mut existing) = tokio::fs::File::open(&part).await {
+        shared.set(&file.path, format!("Resuming {}: checking the part already downloaded…", file.path));
+        // Re-hash what we already have so resumed files still verify.
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = existing.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            have += n as u64;
+        }
+    }
+    if have > file.size {
+        tokio::fs::remove_file(&part).await?;
+        hasher = Sha256::new();
+        have = 0;
+    }
+
+    let url = format!("{HF}/{repo}/resolve/{revision}/{}", file.path);
+    let mut req = client.get(&url);
+    if have > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
+    }
+    let resp = req.send().await?.error_for_status()?;
+    if have > 0 && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        // Server ignored the range; start this file over.
+        hasher = Sha256::new();
+        have = 0;
+    }
+    let mut out = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(have > 0)
+        .truncate(have == 0)
+        .open(&part)
+        .await?;
+    shared.add(have, false);
+    shared.set(&file.path, String::new());
+
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        if cancel.load(Ordering::Relaxed) {
+            out.flush().await?;
+            bail!("Download cancelled.");
+        }
+        let chunk = chunk.context("download interrupted")?;
+        hasher.update(&chunk);
+        out.write_all(&chunk).await?;
+        shared.add(chunk.len() as u64, true);
+    }
+    out.flush().await?;
+    drop(out);
+
+    let size = tokio::fs::metadata(&part).await?.len();
+    if size != file.size {
+        bail!("{}: expected {} bytes, got {size}.", file.path, file.size);
+    }
+    if let Some(expected) = &file.sha256 {
+        let actual = hex::encode(hasher.finalize());
+        if &actual != expected {
+            tokio::fs::remove_file(&part).await?;
+            bail!("{} failed its SHA-256 check and was deleted; try again.", file.path);
+        }
+    }
+    tokio::fs::rename(&part, &final_path).await?;
+    shared.finish(&file.path);
+    Ok(())
 }
 
 fn part_path(dest: &Path, file: &str) -> PathBuf {

@@ -94,7 +94,8 @@ def measure(name: str, extra: str, args) -> dict:
             return {"config": name, "failed": " | ".join(tail)[:300] or "did not start"}
         time.sleep(3)
     startup = time.time() - t0
-    weights = re.search(r"Load weight end.*?mem usage=([\d.]+) GB", log)
+    line = next((ln for ln in log.splitlines() if "Load weight end" in ln), "")
+    weights = re.search(r"mem usage=([\d.]+) GB", line[line.find("Load weight end"):])
     kv = re.search(r"max_total_num_tokens=(\d+)", log)
     idle = free_mib()
 

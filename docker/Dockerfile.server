@@ -20,6 +20,7 @@ COPY server/supervisord.conf /etc/supervisor/conf.d/openphalanx.conf
 COPY server/start-sglang.sh /opt/openphalanx/start-sglang.sh
 COPY server/gateway.py /opt/openphalanx/gateway.py
 COPY server/reqtrace.py /opt/openphalanx/reqtrace.py
+COPY server/inputs.py /opt/openphalanx/inputs.py
 COPY server/searchguard.py /opt/openphalanx/searchguard.py
 RUN chmod +x /opt/openphalanx/start-sglang.sh && mkdir -p /state
 

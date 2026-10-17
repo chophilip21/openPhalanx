@@ -24,6 +24,7 @@ import datetime
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,7 +35,7 @@ PREFIXES = {
 }
 NO_RELEASE = {"docs", "doc", "ci", "chore", "test", "refactor"}
 # The prefix in any case, with or without spaces inside the brackets: [Bug], [FEATURE], [ feature ].
-TITLE = re.compile(r"^\s*\[\s*(?P<kind>[A-Za-z]+)\s*\]\s*(?P<rest>.+)$")
+TITLE = re.compile(r"^\s*\[\s*(?P<kind>[A-Za-z]+)\s*\]\s*(?P<rest>\S.*)$")  # rest starts at a non-space: one split
 
 
 def parse_title(title: str):
@@ -64,10 +65,10 @@ def bump(version: str, part: str) -> str:
 
 def current() -> str:
     text = (ROOT / "Cargo.toml").read_text()
-    m = re.search(r'(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"', text)
-    if not m:
+    version = tomllib.loads(text).get("workspace", {}).get("package", {}).get("version")
+    if not version:
         sys.exit("no [workspace.package] version in Cargo.toml")
-    return m.group(1)
+    return version
 
 
 def workspace_crates() -> list[str]:
@@ -75,23 +76,37 @@ def workspace_crates() -> list[str]:
     version (`version.workspace = true`). Read from the manifests, so a new
     crate can't be left behind in Cargo.lock (v0.4.0's first build failed
     on exactly that: `--locked` refused the stale lock file)."""
-    text = (ROOT / "Cargo.toml").read_text()
-    m = re.search(r"(?ms)^\[workspace\].*?^members\s*=\s*\[(.*?)\]", text)
-    if not m:
+    members = tomllib.loads((ROOT / "Cargo.toml").read_text()).get("workspace", {}).get("members")
+    if not members:
         sys.exit("no [workspace] members in Cargo.toml")
     names = []
-    for member in re.findall(r'"([^"]+)"', m.group(1)):
-        manifest = (ROOT / member / "Cargo.toml").read_text()
-        name = re.search(r'(?ms)^\[package\].*?^name\s*=\s*"([^"]+)"', manifest)
-        if name and re.search(r"(?m)^version\.workspace\s*=\s*true", manifest):
-            names.append(name.group(1))
+    for member in members:
+        package = tomllib.loads((ROOT / member / "Cargo.toml").read_text()).get("package", {})
+        if package.get("name") and isinstance(package.get("version"), dict) and package["version"].get("workspace"):
+            names.append(package["name"])
     return names
+
+
+def set_section_version(text: str, section: str, version: str) -> str:
+    """`text` with the `version = "…"` line of [section] set to `version`,
+    everything else as it was (line by line; TOML is read with tomllib)."""
+    lines = text.split("\n")
+    inside = False
+    for i, line in enumerate(lines):
+        bare = line.strip()
+        if bare.startswith("["):
+            inside = bare == f"[{section}]"
+        elif inside and bare.split("=", 1)[0].strip() == "version" and "=" in bare:
+            key = line[:line.index("=")]
+            lines[i] = f'{key}= "{version}"' if key.endswith(" ") else f'{key}="{version}"'
+            return "\n".join(lines)
+    sys.exit(f"no version in [{section}] of Cargo.toml")
 
 
 def write(old: str, new: str):
     cargo = ROOT / "Cargo.toml"
     text = cargo.read_text()
-    cargo.write_text(re.sub(r'(?ms)(^\[workspace\.package\].*?^version\s*=\s*")[^"]+(")', rf"\g<1>{new}\g<2>", text, count=1))
+    cargo.write_text(set_section_version(text, "workspace.package", new))
 
     lock = ROOT / "Cargo.lock"
     if lock.exists():

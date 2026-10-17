@@ -154,7 +154,7 @@ def _expand(value, name: str):
             return default
         raise McpError(f"it needs the environment variable {var}, which isn't set")
 
-    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}", sub, value)
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^{}]*))?\}", sub, value)
 
 
 # ---------------------------------------------------------------------------
@@ -645,8 +645,11 @@ class Hub:
         threads = [threading.Thread(target=c.connect, args=(self.root,), daemon=True) for c in todo]
         for t in threads:
             t.start()
+        # One deadline for all: joined one by one, each with the full timeout,
+        # several stuck connectors added up their waits.
+        deadline = time.monotonic() + CONNECT_TIMEOUT + 5
         for t in threads:
-            t.join(CONNECT_TIMEOUT + 5)
+            t.join(max(0.0, deadline - time.monotonic()))
         for c in todo:
             if c.state == "new":
                 c.state, c.error = "failed", f"it didn't start within {CONNECT_TIMEOUT} s"

@@ -56,6 +56,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
+import inputs
 import reqtrace
 import searchguard
 
@@ -76,8 +77,12 @@ CONTEXT_LENGTH = int(os.environ.get("CONTEXT_LENGTH") or 32768)
 # What clients are told about the model (set by the GUI from its catalog).
 def _model_id(path: str) -> str:
     """A Hugging Face cache snapshot path reads better as its repo id."""
-    m = re.search(r"models--([^/]+?)--([^/]+)/snapshots/", path)
-    return f"{m.group(1)}/{m.group(2)}" if m else path
+    parts = path.split("/")
+    for i, part in enumerate(parts[:-1]):  # .../models--org--name/snapshots/...
+        org, _, name = part.removeprefix("models--").partition("--")
+        if part.startswith("models--") and org and name and parts[i + 1] == "snapshots":
+            return f"{org}/{name}"
+    return path
 
 
 MODEL_ID = os.environ.get("MODEL_ID") or _model_id(os.environ.get("MODEL_PATH", ""))
@@ -371,6 +376,34 @@ async def sglang_ready() -> bool:
         return False
 
 
+_accepts: frozenset[str] | None = None  # what the model takes besides text; None until SGLang is up
+
+
+async def model_accepts() -> frozenset[str] | None:
+    """The kinds of input the loaded model takes ("text", "image", "audio"),
+    from SGLang's /model_info: it loads a vision or audio encoder by itself
+    when the model has one, and says so. One local call, made once (by
+    watch_inputs as soon as SGLang is ready); None while it is still loading."""
+    global _accepts
+    if _accepts is None:
+        try:
+            r = await upstream().get("/model_info", timeout=5)
+            r.raise_for_status()
+            _accepts = inputs.accepted(r.json())
+            print(f"[gateway] the model takes: {', '.join(sorted(_accepts))}", flush=True)
+        except (httpx.HTTPError, ValueError):
+            return None
+    return _accepts
+
+
+async def watch_inputs():
+    """Reads what the model takes as soon as it is loaded, so the first
+    request with a picture is already checked. Costs one request after
+    SGLang is ready; it doesn't touch loading."""
+    while await model_accepts() is None:
+        await asyncio.sleep(2)
+
+
 _kv_tokens: int | None = None
 
 
@@ -491,17 +524,22 @@ async def whoami(device: dict = Depends(require_device)) -> dict:
 async def info(device: dict = Depends(require_device)) -> dict:
     """Which model this server runs and how clients should drive it, so the
     client adapts to any model instead of assuming one."""
+    # Independent local calls (after the first, the first two are cached): together.
+    context, accepts, ready = await asyncio.gather(effective_context(), model_accepts(), sglang_ready())
     return {
         "served_name": MODEL_NAME,
         "model_id": MODEL_ID,
-        "context_length": await effective_context(),
+        "context_length": context,
         "edit_format": EDIT_FORMAT,
         "reasoning": REASONING,
         # This server reads `oppx_trace` labels (and strips them); clients
         # send them only when it says so, since an older one would pass them on.
         "trace": True,
         "web_search": bool(SEARXNG_URL),
-        "ready": await sglang_ready(),
+        # Pictures: the client shows and sends them only when this is true.
+        "vision": "image" in (accepts or ()),
+        "inputs": sorted(accepts or {"text"}),
+        "ready": ready,
     }
 
 
@@ -597,8 +635,8 @@ async def classify(ask, system: str, choices: tuple[str, ...]) -> str | None:
     if not REASONING:
         return await ask(system, {"regex": "(" + "|".join(choices) + ")", "max_tokens": 2})
     out = (await ask(system, {"max_tokens": 400, **LOW_EFFORT})).lower()
-    m = re.search(r"\b(" + "|".join(choices) + r")\b", out)
-    return m.group(1) if m else None
+    # The first word that is one of the choices (no pattern built from them).
+    return next((w for w in re.findall(r"\w+", out) if w in choices), None)
 
 
 class SearchUnavailable(Exception):
@@ -988,6 +1026,11 @@ async def chat_completions(request: Request, device: dict = Depends(require_devi
     problem = _sanitize(body)
     if problem:
         return openai_error(413, problem)
+    # Pictures, audio or video the model can't take: refused here, at once,
+    # with the reason, instead of an error from deep inside SGLang.
+    problem = inputs.refusal(body["messages"], await model_accepts(), MODEL_ID or MODEL_NAME)
+    if problem:
+        return openai_error(400, problem, "unsupported_input")
     # One served model: whatever name the client sends, it gets this one.
     body["model"] = MODEL_NAME
     # Clients mark their own one-word utility calls (the ask/edit check); on
@@ -1175,15 +1218,18 @@ async def watch_app() -> None:
 
 @admin.get("/admin/status", dependencies=[Depends(require_admin)])
 async def admin_status() -> dict:
-    """Backend, SGLang and gateway state for the server app."""
-    ready = await sglang_ready()
+    """Backend, SGLang and gateway state for the server app (asked every 2 s)."""
+    # Readiness, metrics and inputs are separate local calls: asked together.
+    # Metrics while SGLang loads simply come back empty.
+    ready, inference, accepts = await asyncio.gather(sglang_ready(), sglang_metrics(), model_accepts())
     return {
         "sglang": "ready" if ready else "unavailable",
         "model": MODEL_NAME,
         "gateway": metrics.snapshot(),
         "web_search": bool(SEARXNG_URL),
+        "inputs": sorted(accepts or ()) if ready else [],
         "search": search_guard.status(),
-        "inference": await sglang_metrics() if ready else {},
+        "inference": inference if ready else {},
         "pairing": pairing.describe(),
         "devices": len(devices.devices),
         "tls_fingerprint": tls_fingerprint(),
@@ -1294,11 +1340,13 @@ async def main() -> None:
     )
     flusher = asyncio.create_task(flush_devices())
     watchdog = asyncio.create_task(watch_app())
+    capabilities = asyncio.create_task(watch_inputs())
     try:
         await asyncio.gather(public_server.serve(), admin_server.serve())
     finally:
         flusher.cancel()
         watchdog.cancel()
+        capabilities.cancel()
         if devices.dirty:
             devices.save()
 

@@ -18,6 +18,7 @@ from .oppx_io import show_shortcuts
 from .routing import wants_edit
 from .cache import ASK_NOTE
 from .agent import ANSWER_RESERVE as AGENT_RESERVE
+from . import agent as agent_module, documents
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +590,8 @@ def undo_edits() -> None:
         try:
             if content is None:
                 p.unlink(missing_ok=True)
+            elif isinstance(content, bytes):  # a document or picture
+                p.write_bytes(content)
             else:
                 p.write_text(content, encoding="utf-8")
         except OSError as e:
@@ -614,11 +617,20 @@ def translate(coder, text: str):
             remember(coder, note)
         return None
     if not text.startswith("/"):
-        # @file mentions put the file in the chat.
-        for path in re.findall(r"(?<!\S)@(\S+)", text):
-            p = Path(coder.root) / path
-            if p.is_file():
-                coder.commands.cmd_add(path)
+        # @file mentions put the file in the chat. One the model can't take
+        # (a picture for a text-only model, a video, slides) stops the message
+        # here, with the reason: nothing is sent.
+        # "@shot.png?" is shot.png: punctuation after a mention isn't part of it.
+        mentioned = [path for path in (m.rstrip(".,;:!?)'\"") for m in re.findall(r"(?<!\S)@(\S+)", text))
+                     if (Path(coder.root) / path).is_file()]
+        refused = [why for path in mentioned if (why := cannot_take(Path(coder.root) / path))]
+        if refused:
+            for why in refused:
+                step(escape(why), YELLOW)
+            step("Nothing was sent.", MUTED)
+            return None
+        for path in mentioned:
+            coder.commands.cmd_add(path)
         text = re.sub(r"(?<!\S)@(\S+)", r"\1", text)
         if ENGINE == "agent":
             return text  # the agent turn decides ask or edit (app.agent_turn)
@@ -687,6 +699,25 @@ def translate(coder, text: str):
         step("OpenPhalanx never commits. Use git yourself: git diff, git commit.", YELLOW)
     elif name in NOT_AVAILABLE:
         step(f"{name} isn't available in OpenPhalanx. /help lists what is.", YELLOW)
+    elif name == "/add" and arg:
+        # As for @file: what the model can't take isn't added.
+        try:
+            paths = shlex.split(arg)
+        except ValueError:
+            paths = arg.split()
+        keep = []
+        for path in paths:
+            why = cannot_take(Path(coder.root) / path)
+            if why:
+                step(escape(why), YELLOW)
+            else:
+                keep.append(shlex.quote(path))
+        return f"/add {' '.join(keep)}" if keep else None
     else:
         return text  # Aider's own commands: /add, /drop, /ask, /code, /run, /test, /lint, /web, /tokens …
     return None
+
+
+def cannot_take(p: Path) -> str | None:
+    """Why the loaded model can't take this file the user hands over, or None."""
+    return documents.blocked(p, agent_module.VISION, MODEL_NAME)

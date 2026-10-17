@@ -92,6 +92,7 @@ class Pty:
                     self.answered = len(self.buf)
                     self.declined += 1
                     os.write(self.fd, b"n\r")
+            # regex: runtime (the waits in this script pass their own fixed prompts)
             if re.search(pattern, clean(self.buf[since:])):
                 return time.time() - start
         return None

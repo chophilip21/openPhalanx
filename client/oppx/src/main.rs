@@ -845,13 +845,20 @@ struct ModelInfo {
     reasoning: bool,
     /// The server reads trace labels (its Trace page).
     trace: bool,
+    /// The model takes pictures.
+    vision: bool,
 }
 
 async fn preflight(name: &str, s: &Server) -> Result<ModelInfo> {
     let sp = ui::spinner(format!("Checking {name}"));
     let result = preflight_inner(name, s).await;
     match &result {
-        Ok(m) => sp.done(format!("{name} ready · {} · {}k context", m.model_id, m.ctx / 1024)),
+        Ok(m) => sp.done(format!(
+            "{name} ready · {} · {}k context · {}",
+            m.model_id,
+            m.ctx / 1024,
+            if m.vision { "sees pictures" } else { "text only" }
+        )),
         Err(_) => sp.clear(),
     }
     result
@@ -859,31 +866,40 @@ async fn preflight(name: &str, s: &Server) -> Result<ModelInfo> {
 
 async fn preflight_inner(name: &str, s: &Server) -> Result<ModelInfo> {
     let client = tls::pinned_client(&s.fingerprint)?;
-    let health = match api::health(&client, &s.url).await {
+    // Three independent calls, sent together (one round trip of waiting, not
+    // three); their results are checked in the order that gives the clearest
+    // error: an unreachable server or a changed certificate first.
+    let (health, whoami, info) = tokio::join!(
+        api::health(&client, &s.url),
+        api::whoami(&client, &s.url, &s.token),
+        api::info(&client, &s.url, &s.token)
+    );
+    let health = match health {
         Ok(h) => h,
         Err(e) if tls::is_pin_mismatch(e.as_ref()) => bail!(
             "the server's TLS certificate has changed; nothing was sent. Run `oppx status {name}` for details."
         ),
         Err(e) => return Err(e.context(format!("cannot reach {} (\"{name}\")", s.url))),
     };
-    if let Err(why) = api::whoami(&client, &s.url, &s.token).await? {
+    if let Err(why) = whoami? {
         bail!("{} on \"{name}\". Pair again: oppx pair {} <code> --as {name} --force", why.what(), s.url);
     }
     if health.sglang != "ready" {
         bail!("the model on \"{name}\" is still loading; try again in a minute (`oppx status` shows progress)");
     }
-    if let Some(i) = api::info(&client, &s.url, &s.token).await? {
+    if let Some(i) = info? {
         return Ok(ModelInfo {
             ctx: i.context_length,
             model_id: i.model_id,
             edit_format: i.edit_format,
             reasoning: i.reasoning,
             trace: i.trace,
+            vision: i.vision,
         });
     }
     // Older server without /v1/info.
     let ctx = api::context_len(&client, &s.url, &s.token).await?.unwrap_or(32_768);
-    Ok(ModelInfo { ctx, model_id: agent::AIDER_MODEL.trim_start_matches("openai/").into(), edit_format: "diff".into(), reasoning: false, trace: false })
+    Ok(ModelInfo { ctx, model_id: agent::AIDER_MODEL.trim_start_matches("openai/").into(), edit_format: "diff".into(), reasoning: false, trace: false, vision: false })
 }
 
 async fn run_search(cfg: &Config, name: Option<&str>, query: &str, max: u8) -> Result<()> {
@@ -1053,6 +1069,7 @@ async fn run_aider(cfg: &Config, name: Option<&str>, launch: &Launch, user_args:
             .env("OPPX_MODEL_ID", &info.model_id)
             .env("OPPX_REASONING", if info.reasoning { "1" } else { "0" })
             .env("OPPX_TRACE", if info.trace { "1" } else { "0" })
+            .env("OPPX_VISION", if info.vision { "1" } else { "0" })
             .env("OPPX_WEB", if web { "1" } else { "0" })
             .env("OPPX_ENGINE", &launch.engine)
             .env("OPPX_MCP_CONFIG", &launch.connectors)

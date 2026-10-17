@@ -13,6 +13,7 @@ Working notes for developing this repo. This file holds the conventions, the arc
 * **Branching and releases:** work happens on `dev`. A PR from `dev` into `main` is a release: its title prefix sets the version bump, in any letter case (`[bug]`/`[fix]` patch, `[feature]` minor, `[major]` major; `[docs]`, `[ci]`, `[chore]`, `[test]`, `[refactor]` don't release). See "Releasing" below.
 * **Toolchain on the server node:** `cargo` is in `~/.cargo/bin` (not on the non-interactive `PATH`), so use `export PATH=$HOME/.cargo/bin:$PATH`. `uv`/`uvx` are in `~/.local/bin`.
 * **Versioning:** the backend image tag equals the workspace version in `Cargo.toml`. The release workflow bumps `Cargo.toml`, `Cargo.lock`, `app/package.json`, `app/package-lock.json` and `app/src-tauri/tauri.conf.json` together (`scripts/bump_version.py`); don't bump by hand.
+* **Regular expressions:** every pattern in the repository must pass `scripts/check_regexes.py` (CI runs it). It finds the patterns by itself (Python's syntax tree, the TypeScript parser), compiles each, and proves with recheck that none backtracks exponentially or polynomially. Python's `re` and JavaScript backtrack, so a harmless-looking `\s+$` searched over a long run of spaces is quadratic. When it flags one, pin where a match may start (`(?<![ \t])[ \t]+\n`), keep a repeat from crossing its own delimiter (`[^{}]*`, `_([^_]+?)_`), or use string methods. A pattern only known at run time gets a `# regex: runtime (why it is safe)` comment; a pattern the model writes runs through `grep -E`, never Python's `re`.
 * **Verify before claiming:** run `cargo test -p openphalanx-core`, `cargo clippy --workspace --all-targets`, `(cd app && npm run check)`, and for backend changes the lifecycle example (about 4 min, needs the GPU).
 
 ## Architecture
@@ -97,6 +98,7 @@ Read the topic's file before working on that part; add what you measure or verif
 | oppx-client | [`.claude/skills/oppx-client/SKILL.md`](.claude/skills/oppx-client/SKILL.md) | The `oppx` command line: commands, `pair self`, config, terminal UI, the private coding engine, `--update` |
 | oppx-chat-frontend | [`.claude/skills/oppx-chat-frontend/SKILL.md`](.claude/skills/oppx-chat-frontend/SKILL.md) | The chat frontend: modules, the two engines, Aider hooks, routing, the Aider-engine context manager, sessions, prefix cache, pty testing |
 | oppx-agent | [`.claude/skills/oppx-agent/SKILL.md`](.claude/skills/oppx-agent/SKILL.md) | The agent engine: actions, repeat and stuck handling, speed, truthful replies, guards for small models, context |
+| documents | [`.claude/skills/documents/SKILL.md`](.claude/skills/documents/SKILL.md) | Documents and pictures: the formats the agent reads and makes, vision, the engine's extra packages, what was measured |
 | oppx-permissions | [`.claude/skills/oppx-permissions/SKILL.md`](.claude/skills/oppx-permissions/SKILL.md) | What the agent runs without asking, saved and session rules, the question's layout, audit findings |
 | agent-app-eval | [`.claude/skills/agent-app-eval/SKILL.md`](.claude/skills/agent-app-eval/SKILL.md) | Building an app end to end (CHO-8): what broke, the fixes, `scripts/eval_app.py` and its numbers |
 | connectors-and-browser | [`.claude/skills/connectors-and-browser/SKILL.md`](.claude/skills/connectors-and-browser/SKILL.md) | MCP connectors and the headless browser (Playwright) |
@@ -130,6 +132,8 @@ OPENAI_API_BASE=… OPENAI_API_KEY=… scripts/probe_routing.py     # via `oppx 
 OPENAI_API_BASE=… OPENAI_API_KEY=… scripts/probe_kv.py          # long-context recall + coding tasks run against tests (e.g. KV dtype checks)
 scripts/eval_app.py --oppx target/debug/oppx [--task build,improve] [--runs 5]   # build and improve a small web app, scored per requirement in a browser; --agent claude for the baseline
 python3 scripts/test_searchguard.py                             # the gateway's search guard (cache, pacing, pause when the engines refuse)
+npm ci --prefix scripts/regexcheck && python3 scripts/check_regexes.py   # every regex compiled and checked for catastrophic backtracking (--list shows them)
+python3 scripts/test_inputs.py                                  # the gateway's check of what the loaded model takes (pictures, audio, video)
 scripts/eval_edits.py --oppx target/debug/oppx --engine agent   # 9 edit tasks in fresh clones (3 name no file), checked by compiling/testing; compare engines
 ~/.local/share/oppx/engine/tools/aider-chat/bin/python scripts/eval_nav.py --repo <scratch clone>     # 10 questions that name no file (via `oppx proxy`): answered, steps, stuck
 ~/.local/share/oppx/engine/tools/aider-chat/bin/python scripts/test_agent.py                          # agent loop unit tests, scripted model, no server
@@ -175,15 +179,18 @@ crates/pinned-tls/       TLS pinned to a certificate fingerprint (shared by oppx
 docker/                  backend image: SGLang + gateway under supervisord (no agent code)
   server/gateway.py      TLS gateway: pairing, device tokens, admin API
   server/reqtrace.py     the request trace behind the app's Trace page (in memory, no dependencies)
+  server/inputs.py       what the loaded model takes (from SGLang at load), and the refusal for anything else
   server/searchguard.py  cache, pacing and pause for web search, so the public engines don't block the server
 client/oppx/             client CLI: config.rs (paired servers, 0600 file), tls.rs (fingerprint pinning),
                          api.rs (gateway calls), engine.rs (private Aider), mcp.rs (connector files), update.rs, main.rs (clap commands)
   frontend/              chat frontend: oppx_chat/ package + run.py (embedded in the binary)
+                         (oppx_chat/documents.py reads PDF, Office, EPUB and pictures; writers.py makes them)
 .github/workflows/       ci.yml (every PR/push), release.yml (merged PR into main -> release)
 scripts/test_connectors.py connectors (MCP): the client against a stdio server, and the agent calling a tool (scripted model)
 scripts/eval_app.py      the CHO-8 app task end to end, scored per requirement (eval_app_check.mjs: the browser checks)
 scripts/probe_browser.py does the loaded model ask for the browser when a message needs a running page, and only then
 scripts/probe_routing.py score the search router and ask/edit check against the loaded model
+scripts/check_regexes.py every regex in the repository, compiled and proven free of catastrophic backtracking (regexcheck/: recheck, pinned)
 scripts/catalog_entry.py catalog entries from Hugging Face (pinned commit, weight size, attention shape); --check re-verifies
 scripts/bench_session.py 10-turn prefix-cache benchmark through a real oppx session
 scripts/bench_speed.py   speed per model through oppxs (one user per prompt length, several users), for BENCHMARK.md

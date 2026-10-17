@@ -7,6 +7,8 @@ description: "Servers forming a cluster (cluster.rs, split.rs): discovery, namin
 
 Part of the developer notes; the index is in `CLAUDE.md`.
 
+* **Concurrency (2026-10-16):** a member's report (every 5 s) asks its four probes together (the backend's and the worker's new log lines, `collect_inventory`, `collect_serving`, `check_worker`), so it takes as long as the slowest. The log lines are still queued backend first. `take_over` and the host's invitations register every invite, then send them all at once, so one unreachable peer no longer holds up the others for its timeout. Model sync uses the parallel download (4 files at once).
+
 ## Cluster
 
 Servers on one network form a cluster: one **host** and its **members**. With the split strategy they serve one model together (see **Split serving** below). The service is `cluster::Cluster` in core. It runs inside the app, or headless as `oppxs run` (`crates/openphalanx-server`); both use `~/.local/share/openphalanx/cluster/`, so run one per machine.

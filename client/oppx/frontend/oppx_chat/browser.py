@@ -98,8 +98,10 @@ def definition(session: str) -> ServerDef:
         "env": env})
 
 
-_SNAPSHOT_LINK = re.compile(r"^- \[Snapshot\]\((?P<path>[^)]+)\)\s*$", re.M)
-_CONSOLE_LINK = re.compile(r"(?P<path>/\S+?\.log)#L(?P<line>\d+)(?:-L(?P<last>\d+))?")
+_SNAPSHOT = "- [Snapshot]("
+# A path starts after a space, "(" or "[" (how the server writes it), and holds
+# none of those: `/\S+?\.log` was tried from every "/" of a long path (quadratic).
+_CONSOLE_LINK = re.compile(r"(?<![^\s(\[])(?P<path>/[^\s#()\[\]]+\.log)#L(?P<line>\d+)(?:-L(?P<last>\d+))?")
 
 
 def _read(path: str, limit: int, first_line: int = 1, last_line: int | None = None) -> str | None:
@@ -114,15 +116,20 @@ def _read(path: str, limit: int, first_line: int = 1, last_line: int | None = No
 def inline_files(text: str) -> str:
     """Puts the page snapshot and new console entries, which the server writes
     to files, into the result."""
-    def snapshot(m: re.Match) -> str:
-        body = _read(m["path"], SNAPSHOT_CHARS)
-        return m[0] if body is None else f"```yaml\n{body}\n```"
+    def snapshot(line: str) -> str:
+        # "- [Snapshot](path)" on a line of its own; by line, not by regex.
+        bare = line.rstrip()
+        path = bare[len(_SNAPSHOT):-1]
+        if not (bare.startswith(_SNAPSHOT) and bare.endswith(")") and path and ")" not in path):
+            return line
+        body = _read(path, SNAPSHOT_CHARS)
+        return line if body is None else f"```yaml\n{body}\n```"
 
     def console(m: re.Match) -> str:
         body = _read(m["path"], CONSOLE_CHARS, int(m["line"]), int(m["last"]) if m["last"] else None)
         return m[0] if body is None else f"\n```\n{body}\n```"
 
-    return _CONSOLE_LINK.sub(console, _SNAPSHOT_LINK.sub(snapshot, text))
+    return _CONSOLE_LINK.sub(console, "\n".join(snapshot(line) for line in text.split("\n")))
 
 
 def hint(text: str) -> str:

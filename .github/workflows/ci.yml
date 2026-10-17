@@ -81,9 +81,22 @@ jobs:
           pip install httpx
           python3 scripts/test_connectors.py
       - name: Agent loop tests (scripted model; no server needed)
-        run: python3 scripts/test_agent.py
+        run: |
+          # Documents and pictures: the engine's extras (engine.rs EXTRAS) and Pillow (comes with Aider).
+          pip install pillow pypdf==6.19.0 fpdf2==2.8.9 resvg_py==0.5.0
+          python3 scripts/test_agent.py
       - name: Request trace tests (the gateway's trace module; no dependencies)
         run: python3 scripts/test_reqtrace.py
+      - name: Input checks (what the loaded model takes; the gateway's inputs module; no dependencies)
+        run: python3 scripts/test_inputs.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Regular expressions (every pattern compiled and checked for catastrophic backtracking)
+        run: |
+          npm ci --prefix scripts/regexcheck
+          python3 scripts/test_check_regexes.py
+          python3 scripts/check_regexes.py
       - name: Search guard tests (the gateway's pacing and pause for web search; no dependencies)
         run: python3 scripts/test_searchguard.py
       - name: Command allowlist tests (what the agent may run without asking; no dependencies)

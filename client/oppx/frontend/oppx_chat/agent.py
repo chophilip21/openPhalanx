@@ -23,14 +23,17 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 import httpx
 
+from . import documents, writers
 from .browser import hint as browser_hint
 from .mcp import ConnectorDown, McpError, constraint, missing_required
 
@@ -48,6 +51,11 @@ WHOLE_FILE = 300  # files up to this many lines are always read whole
 GREP_HITS = 40  # matching lines one grep shows
 GREP_PER_FILE = 6  # ... and at most this many from one file
 GREP_FILES = 40  # further files are only counted
+GREP_DOCS = 30  # documents (PDF, Word…) one grep searches; their text is extracted once per session
+# The loaded model takes pictures (the server's /v1/info, from SGLang).
+VISION = os.environ.get("OPPX_VISION") == "1"
+SCAN_PAGES = 3  # pages of a PDF without text one read shows as pictures
+IMAGE_BYTES = 2_500_000  # pictures one request carries (the gateway takes 4 MiB in all); the newest first
 FIND_HITS = 40
 LIST_FILES = 200
 RESULT_CHARS = 12_000  # a tool result is cut beyond this
@@ -90,10 +98,10 @@ Reply with exactly one JSON action per step:
 - {"tool": "grep", "pattern": "regex", "path": "dir or file"}: matching lines, grouped by file with line numbers (path optional)
 - {"tool": "list", "path": "dir"}: files under a directory ("" for the whole repository)
 - {"tool": "outline", "path": "file"}: the functions, classes and other definitions in a file, with line numbers
-- {"tool": "read", "path": "file", "start": 1, "end": 120}: those lines of a file (at most 250 at a time)
+- {"tool": "read", "path": "file", "start": 1, "end": 120}: those lines of a file (at most 250 at a time). Documents work too: PDF, Word, OpenDocument, RTF, EPUB and Excel come as text, part by part (pages, sheets, chapters), and grep and outline search and list them; a picture (PNG, JPEG, GIF, WebP) or a scanned PDF comes as pictures you can see
 - {"tool": "plan"}: think before a change that touches several places, or when a search isn't getting anywhere; you then write a short plan
 - {"tool": "edit", "path": "file"}: change an existing file; you then write SEARCH/REPLACE blocks
-- {"tool": "create", "path": "file"}: create a new file, or rewrite a whole file you have read when most of it changes (a generated starter file, say); you then write its whole content
+- {"tool": "create", "path": "file"}: create a new file, or rewrite a whole file you have read when most of it changes (a generated starter file, say); you then write its whole content. It also makes documents and pictures: a .docx, .odt, .rtf, .epub or .pdf from Markdown you write, an .xlsx from CSV, a .png, .jpg, .webp or .gif from SVG. Videos and presentations (PowerPoint) can't be read or made
 - {"tool": "run", "command": "shell command"}: run a command in the repository (the user confirms it first); use it for tests, builds and installs. It has no terminal: a command that asks a question gets no answer, so pass the answers as flags (--yes, --template …). Commands that only read (ls, cat, grep, git log, jq …) and those the user allowed run at once; an interpreter one-liner (python -c, node -e) or a shell running text is asked about every time, so read JSON with jq or python3 -m json.tool, not with python -c
 - {"tool": "start", "command": "shell command"}: start a command that keeps running (a dev or preview server, a watcher) and leave it running; you get its first output, and its new output when you call it again with the same command. Never use run for these: it waits for the command to finish
 - {"tool": "web_search", "query": "…"}: search the web, for things outside the repository
@@ -304,7 +312,32 @@ def clean_arguments(args: dict, schema: dict) -> dict:
     return {k: v for k, v in args.items() if k in props or k not in ACTION_KEYS}
 
 
-_ACTION_TAIL = re.compile(r'\n\s*(?:```(?:json)?\s*)?\{\s*"(?:enough|missing|tool)"[\s\S]*$')
+# Starts at a line break followed by spaces only: with `\n\s*`, a run of blank
+# lines was tried from each of its line breaks (quadratic; scripts/check_regexes.py).
+_ACTION_TAIL = re.compile(r'\n[ \t]*(?:```(?:json)?\s*)?\{\s*"(?:enough|missing|tool)"[\s\S]*$')
+
+
+def cut_action_tail(text: str) -> str:
+    """Text without a JSON action at its end, nor the blank lines before it."""
+    m = _ACTION_TAIL.search(text)
+    return text[:m.start()].rstrip() if m else text
+
+
+def _outer_braces(text: str) -> str | None:
+    """From the first "{" to the last "}": where a JSON object is in a reply.
+    String search, not the regex `{.*}` (quadratic on a reply of many "{")."""
+    i, j = text.find("{"), text.rfind("}")
+    return text[i:j + 1] if 0 <= i < j else None
+
+
+def _fenced(reply: str) -> str | None:
+    """The body of the first fenced block (```lang ... ```), or None."""
+    start = reply.find("```")
+    if start < 0:
+        return None
+    body = reply.find("\n", start)
+    end = reply.find("```", body + 1) if body >= 0 else -1
+    return reply[body + 1:end] if end >= 0 else None
 
 
 def _query_words(query: str) -> frozenset:
@@ -408,6 +441,9 @@ class Hooks:
     confirm_tool: Callable[[str, str, bool], bool] = lambda name, arguments, read_only: False
     waiting: Callable[[str | None], None] = lambda label: None  # the model is busy (None: stop)
     edited: Callable[[str, str | None, str], None] = lambda path, before, after: None
+    # A document or picture about to be replaced, as bytes: what /undo restores
+    # (`edited` then gets its text, for the diff).
+    original: Callable[[str, bytes], None] = lambda path, data: None
     interrupted: Callable[[], bool] = lambda: False
     notice: Callable[[str], None] = lambda text: None  # a warning from the harness (stuck, gave up)
     # The model asked for the browser: True once it runs, or a sentence for
@@ -431,7 +467,7 @@ class ContextOverflow(RuntimeError):
 
 
 # SGLang's refusals; the first number is the request's real input size.
-OVERFLOW = re.compile(r"(\d+) tokens from the input messages|The input \((\d+) tokens\) is longer"
+OVERFLOW = re.compile(r"(?<!\d)(\d+) tokens from the input messages|The input \((\d+) tokens\) is longer"
                       r"|Input length \((\d+) tokens\) exceeds")
 
 
@@ -518,10 +554,59 @@ class Workspace:
         return [str(p.relative_to(self.root)) for p in self.root.rglob("*") if p.is_file() and ".git" not in p.parts]
 
     def read_text(self, p: Path) -> str:
+        """A file's text as it is on disk: what edits work on."""
+        if documents.kind(p) or documents.unsupported(p):
+            again = " To change it, create it again in full" if writers.writable(p) else ""
+            raise ToolError(f"{self.rel(p)} is a {documents.kind(p) or documents.unsupported(p)}: it can't be edited as text.{again}")
         try:
             return p.read_text(encoding=self.encoding)
         except UnicodeDecodeError as e:
             raise ToolError(f"{self.rel(p)} isn't a text file") from e
+
+    def text_of(self, p: Path) -> str:
+        """What read, outline and grep see: a file's text, or a document's
+        (PDF, Word, Excel…) turned into text. Kept until the file changes."""
+        if what := documents.unsupported(p):
+            raise ToolError(f"{self.rel(p)} is a {what}, and {what}s can't be read (pictures, PDFs and documents can). "
+                            "Nothing tells what it holds: say so, and don't guess from other files")
+        if documents.is_image(p):
+            raise ToolError(f"{self.rel(p)} is a picture: read it to see it")
+        if not documents.kind(p):
+            return self.read_text(p)
+        st = p.stat()
+        key = (str(p), st.st_mtime_ns, st.st_size)
+        cache = self.__dict__.setdefault("_docs", {})
+        if key not in cache:
+            try:
+                cache[key] = documents.text(p)
+            except documents.DocumentError as e:
+                raise ToolError(f"{self.rel(p)}: {e}") from e
+        return cache[key]
+
+    def view(self, p: Path) -> str:
+        """A file as a person reviewing a change sees it (a document's text)."""
+        try:
+            return self.text_of(p) if documents.kind(p) and not documents.is_image(p) else (
+                "(a picture)" if documents.is_image(p) else p.read_text(encoding=self.encoding, errors="replace"))
+        except (ToolError, OSError):
+            return ""
+
+    def take_images(self) -> list[dict]:
+        """Pictures the last tools opened, for the result message to carry."""
+        images, self.images = getattr(self, "images", []), []
+        return images
+
+    def see(self, rel: str, source, what: str) -> str:
+        """Attaches a picture to the result, or says why the model can't see it."""
+        if not VISION:
+            raise ToolError(f"{rel} is {what}, and the loaded model can't see pictures. Tell the user; "
+                            "a model that can (Qwen3.5 or later, Gemma 4) would")
+        try:
+            url, w, h, tokens = documents.picture(source)
+        except documents.DocumentError as e:
+            raise ToolError(f"{rel}: {e}") from e
+        self.__dict__.setdefault("images", []).append({"url": url, "tokens": tokens, "name": rel})
+        return f"{w}x{h} pixels, attached to this message as a picture"
 
     # ---- tools ------------------------------------------------------------
     def list(self, path: str) -> str:
@@ -562,6 +647,7 @@ class Workspace:
             f, _, rest = ln.partition(":")
             no, _, text = rest.partition(":")
             by_file.setdefault(f, []).append((no, text))
+        by_file.update(self.grep_documents(pattern, base))
         elsewhere = ""
         if base != self.root:
             # Models guess a folder and keep looking there: say where else the
@@ -603,13 +689,51 @@ class Workspace:
             out_lines.append("(not everything is shown: make the pattern more specific rather than going file by file)")
         return head + ":\n" + "\n".join(out_lines) + elsewhere
 
+    def grep_documents(self, pattern: str, base: Path) -> dict[str, list[tuple[str, str]]]:
+        """git grep skips binary files, so PDFs, Word files and the like are
+        searched in their text (line numbers as read shows them)."""
+        prefix = "" if base == self.root else self.rel(base)
+        docs = [f for f in self.files() if documents.kind(Path(f)) and not documents.is_image(Path(f))
+                and (not prefix or f == prefix or f.startswith(prefix.rstrip("/") + "/"))][:GREP_DOCS]
+        if not docs:
+            return {}
+        found = {}
+        for f in docs:
+            try:
+                text = self.text_of(self.root / f)
+            except (ToolError, OSError):
+                continue
+            # The model's pattern goes to grep -E, as for code (git grep -E):
+            # the same regex flavour, and no backtracking pattern run by
+            # Python's re on a whole document (scripts/check_regexes.py).
+            try:
+                out = subprocess.run(["grep", "-n", "-E", "-e", pattern], input=text, capture_output=True,
+                                     text=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            hits = [(no, line) for no, _, line in (ln.partition(":") for ln in out.stdout.splitlines())]
+            if hits:
+                found[f] = hits
+        return found
+
     # ---- definitions ------------------------------------------------------
     def symbols(self) -> list[tuple[str, str, int, str]]:
         """Every definition in the repository: (name, file, line, source line).
         Built once per session, from Aider's tree-sitter tags where it knows
-        the language and a regex elsewhere."""
-        if getattr(self, "_symbols", None) is not None:
+        the language and a regex elsewhere; `warm` starts that at session
+        start, and a caller meanwhile waits for it rather than building twice."""
+        with self.__dict__.setdefault("_symbols_lock", threading.Lock()):
+            if getattr(self, "_symbols", None) is None:
+                self._symbols = self._build_symbols()
             return self._symbols
+
+    def warm(self):
+        """Builds the definitions index in the background (0.8 s for this
+        repository with a cold tag cache, more for a big one), so the first
+        message doesn't wait for it."""
+        threading.Thread(target=self.symbols, name="oppx-symbols", daemon=True).start()
+
+    def _build_symbols(self) -> list[tuple[str, str, int, str]]:
         found: list[tuple[str, str, int, str]] = []
         for rel in self.files():
             if rel.lower().endswith(LOW_RANK) or rel.lower().endswith((".png", ".ico", ".icns", ".jpg", ".woff2")):
@@ -634,7 +758,6 @@ class Workspace:
                 if m and (not ln[:1].isspace() or m.group(0).lstrip().startswith(("pub", "fn", "def", "async", "export", "function", "class"))):
                     defs[i] = m.group(1)
             found += [(name, rel, no, lines[no - 1].strip()[:150]) for no, name in sorted(defs.items()) if no <= len(lines)]
-        self._symbols = found
         return found
 
     def related(self, text: str, limit: int = 10) -> str:
@@ -705,8 +828,19 @@ class Workspace:
 
     def outline(self, path: str) -> str:
         p = self.path(path)
-        text = self.read_text(p)
+        if documents.is_image(p):
+            return self.read(path, None, None)
+        text = self.text_of(p)
         lines = text.splitlines()
+        if documents.kind(p):
+            # A document's outline is its parts (pages, sheets, chapters) and
+            # headings, each part with its first line of text.
+            heads = [i for i, ln in enumerate(lines) if re.match(r"--- \w+ \d+ of \d+", ln) or re.match(r"#{1,6} \S", ln)]
+            marks = [lines[i] for i in heads if lines[i].startswith("--- ")]
+            body = "\n".join(f"{i + 1:>5}| {lines[i]}" + (f" {lines[i + 1].strip()[:140]}" if lines[i].startswith("--- ") and i + 1 < len(lines) else "")
+                              for i in heads[:300])
+            size = f"{len(marks)} {marks[0].split()[1]}s, " if marks else ""  # "3 pages", "2 sheets"
+            return f"{self.rel(p)}: {documents.kind(p)}, {size}{len(lines)} lines of text\n{body or '(no headings: read it in parts)'}"
         defs = []
         if self.repo_map is not None:
             try:
@@ -728,7 +862,15 @@ class Workspace:
         p = self.path(path)
         if p.is_dir():
             raise ToolError(f"{path} is a folder; use list")
-        lines = self.read_text(p).splitlines()
+        if documents.is_image(p):
+            self.mark(p)
+            return f"{self.rel(p)}: {documents.kind(p)} picture, " + self.see(self.rel(p), p, "a picture")
+        try:
+            lines = self.text_of(p).splitlines()
+        except ToolError as e:
+            if not isinstance(e.__cause__, documents.NoText):
+                raise
+            return self.read_scan(p, e.__cause__.pages, start)
         self.mark(p)
         n = len(lines)
         start = max(1, start or 1)
@@ -747,6 +889,23 @@ class Workspace:
         body = "\n".join(f"{i:>5}| {lines[i - 1]}" for i in range(start, end + 1))
         rest = f"\n(lines {end + 1}-{n} not shown)" if end < n else ""
         return f"{self.rel(p)} lines {start}-{end} of {n}:\n{body}{rest}"
+
+    def read_scan(self, p: Path, pages: int, start: int | None) -> str:
+        """A PDF without text (a scan): its pages as pictures, a few per read."""
+        rel = self.rel(p)
+        first = min(max(1, start or 1), pages)
+        last = min(pages, first + SCAN_PAGES - 1)
+        shown = []
+        for page in range(first, last + 1):
+            try:
+                image = documents.pdf_page_image(p, page)
+            except documents.DocumentError as e:
+                raise ToolError(f"{rel}: {e}") from e
+            shown.append(f"page {page}: " + self.see(rel, image, f"a PDF of {pages} scanned pages"))
+        self.mark(p)
+        more = (f"\n(pages {last + 1}-{pages} not shown: read with \"start\": {last + 1} for the next ones)"
+                if last < pages else "")
+        return f"{rel}: PDF of {pages} pages without text (a scan); pages {first}-{last} as pictures:\n" + "\n".join(shown) + more
 
     def run(self, command: str) -> str:
         # No terminal input: a command that asks a question (npm create, an
@@ -876,14 +1035,19 @@ def with_filename(reply: str, rel: str) -> str:
     return "".join(out)
 
 
+def _image_tokens(m: dict) -> int:
+    """What a message's pictures cost in the prompt (none once it was cut)."""
+    return 0 if m.get("_cut") else sum(img["tokens"] for img in m.get("_images") or [])
+
+
 def apply_edit(ws: Workspace, path: str, reply: str) -> tuple[str, str, str]:
     """Applies the SEARCH/REPLACE blocks in `reply` to `path` with Aider's
     matcher (exact, then whitespace-tolerant). Returns (rel, before, after)."""
-    from aider.coders.editblock_coder import DEFAULT_FENCE, do_replace, find_original_update_blocks
-
     p = ws.path(path)
     rel = ws.rel(p)
-    before = ws.read_text(p)
+    before = ws.read_text(p)  # refuses a document or picture before Aider is even loaded
+    from aider.coders.editblock_coder import DEFAULT_FENCE, do_replace, find_original_update_blocks
+
     content = before
     blocks = 0
     try:
@@ -1145,9 +1309,9 @@ class Agent:
             msg = data["choices"][0]["message"]
             # Reasoning models may think first, or put the action in their reasoning.
             text = msg.get("content") or msg.get("reasoning_content") or ""
-            m = re.search(r"\{.*\}", text, re.S)
+            braces = _outer_braces(text)
             try:
-                act = json.loads(m.group(0) if m else text)
+                act = json.loads(braces or text)
             except json.JSONDecodeError:
                 return None
             return act if isinstance(act, dict) and act.get("tool") else None
@@ -1199,7 +1363,7 @@ class Agent:
             if shown:
                 # A reply may end with the next action ("Let me start." and
                 # then {"enough": false, …}): not part of what the user reads.
-                show(_ACTION_TAIL.sub("", text), final)
+                show(cut_action_tail(text), final)
 
         self.hooks.stream = gate
         try:
@@ -1231,7 +1395,7 @@ class Agent:
                 # and leave the content empty: use what follows a fence or
                 # SEARCH marker there.
                 thought = msg.get("reasoning_content") or ""
-                m = re.search(r"(?s)(\S*\n?```.*|<<<<<<< SEARCH.*)", thought)
+                m = re.search(r"(?s)((?<!\S)\S*\n?```.*|<<<<<<< SEARCH.*)", thought)
                 content = m.group(1) if m else ""
             return content
         body["stream_options"] = {"include_usage": True}
@@ -1275,7 +1439,7 @@ class Agent:
         results = [i for i, m in enumerate(self.messages) if m.get("_result") and not m.get("_cut")]
         for i in results[:-KEEP_RECENT]:
             m = self.messages[i]
-            saved = int(len(m["content"]) // 3 * self.ratio)
+            saved = int(len(m["content"]) // 3 * self.ratio) + _image_tokens(m)
             m["content"] = m["content"].split("\n", 1)[0] + "\n[output removed to save space; run the tool again if you need it]"
             m["_cut"] = True
             self._event("cut")
@@ -1287,7 +1451,7 @@ class Agent:
             drop = 1
             while drop < len(self.messages) and not self.messages[drop].get("_user"):
                 drop += 1
-            est -= int(sum(len(m["content"]) for m in self.messages[:drop]) // 3 * self.ratio)
+            est -= int(sum(len(m["content"]) for m in self.messages[:drop]) // 3 * self.ratio) + sum(map(_image_tokens, self.messages[:drop]))
             del self.messages[:drop]
             self._event("dropped")
 
@@ -1296,36 +1460,61 @@ class Agent:
         return (len(self._system()) + sum(len(m["content"]) + 8 for m in self.messages)) // 3
 
     def _estimate(self) -> int:
-        """Prompt tokens of the next request, corrected by what the server counted."""
-        return int(self._raw_estimate() * self.ratio)
+        """Prompt tokens of the next request, corrected by what the server
+        counted (pictures are counted apart: their size is known)."""
+        return int(self._raw_estimate() * self.ratio) + sum(map(_image_tokens, self.messages))
 
     def context_parts(self) -> list[tuple[str, int]]:
         """What the next request holds, estimated like `_fit` does (/context)."""
         tool = sum(len(m["content"]) + 8 for m in self.messages if m.get("_result"))
         talk = sum(len(m["content"]) + 8 for m in self.messages if not m.get("_result"))
+        pictures = sum(map(_image_tokens, self.messages))
         system = len(self._system())
         # As sent: connectors added since the prompt was built aren't in it yet.
         conn = len(self._connector_text()) if self._connector_text() in self._system() else 0
         parts = [("Instructions", system - conn), ("Connectors", conn), ("Conversation", talk), ("Tool output", tool)]
-        return [(name, int(n // 3 * self.ratio)) for name, n in parts if n or name != "Connectors"]
+        out = [(name, int(n // 3 * self.ratio)) for name, n in parts if n or name != "Connectors"]
+        return out + [("Pictures", pictures)] if pictures else out
 
     def _clean(self) -> list:
-        return [{"role": m["role"], "content": m["content"]} for m in self.messages]
+        # Pictures go as image parts, the newest first up to IMAGE_BYTES: the
+        # whole conversation is sent each time, and the gateway takes 4 MiB.
+        room, sent = IMAGE_BYTES, {}
+        for i in range(len(self.messages) - 1, -1, -1):
+            for img in reversed(self.messages[i].get("_images") or [] if not self.messages[i].get("_cut") else []):
+                if len(img["url"]) <= room:
+                    room -= len(img["url"])
+                    sent.setdefault(i, []).insert(0, img)
+        out = []
+        for i, m in enumerate(self.messages):
+            images = m.get("_images") if not m.get("_cut") else None
+            if not images:
+                out.append({"role": m["role"], "content": m["content"]})
+                continue
+            parts = [{"type": "text", "text": m["content"]}]
+            parts += [{"type": "image_url", "image_url": {"url": img["url"]}} for img in sent.get(i, [])]
+            if len(sent.get(i, [])) < len(images):
+                parts.append({"type": "text", "text": "[some pictures above are no longer attached, to save space; read them again to see them]"})
+            out.append({"role": m["role"], "content": parts})
+        return out
 
     # ---- the turn ---------------------------------------------------------
-    def turn(self, text: str, can_edit: bool = True, wants_change: bool | None = None) -> str:
+    def turn(self, text: str, can_edit: bool = True, wants_change: "bool | None | Future" = None) -> str:
         """One user message. `can_edit` is False only when the user switched
         edits off (plan mode). `wants_change` is a hint, not a gate: whether
         the message reads as a request for a change (None: assume it does when
-        edits are on). The model decides what the message needs."""
+        edits are on). The model decides what the message needs. It may be a
+        Future (the router still deciding): it is waited for only when the
+        turn's own setup is done, so the two overlap."""
         self._trail, self.stuck, self._called = [], "", {}
         self.turns += 1
         self._step, self._prev = 0, {}
-        wanted = can_edit if wants_change is None else (wants_change and can_edit)
+        if not isinstance(wants_change, Future):
+            wants_change = can_edit if wants_change is None else (wants_change and can_edit)
         # Until the turn says otherwise: a change request that fails or is interrupted is still owed.
-        self._wanted, self._did = wanted, False
+        self._wanted, self._did = can_edit if isinstance(wants_change, Future) else wants_change, False
         try:
-            return self._turn(text, can_edit, wanted)
+            return self._turn(text, can_edit, wants_change)
         except Exception as e:
             # Leave a trace, so a later turn doesn't assume this one worked.
             self.messages.append({"role": "assistant", "content": f"(This request failed: {str(e)[:200]}. Nothing more was done.)"})
@@ -1350,34 +1539,85 @@ class Agent:
                      if m["role"] == "assistant" and not m["content"].lstrip().startswith("{")), "")
 
     def _named_files(self, text: str) -> list[str]:
-        """Repository files the message names by path (at most 3)."""
-        files = set(self.ws.files())
+        """Repository files the message names by path, or by a file name only
+        one file has (at most 3)."""
+        files = self.ws.files()
+        paths, by_name = set(files), {}
+        for f in files:
+            by_name.setdefault(f.rsplit("/", 1)[-1], []).append(f)
         found = []
-        for word in re.findall(r"[\w./-]+\.\w+", text):
+        for word in re.findall(r"(?<![\w./-])[\w./-]+\.\w+", text):
             w = word.strip("./`'\"")
-            if w in files and w not in found:
+            if w not in paths and len(by_name.get(w, [])) == 1:
+                w = by_name[w][0]
+            if w in paths and w not in found:
                 found.append(w)
         return found[:3]
 
-    def _turn(self, text: str, can_edit: bool, wants_change: bool) -> str:
+    def _documents_to_make(self, text: str) -> str:
+        """A document or picture the request names to make: how. Asked for a
+        PDF or a PNG, a 9B model wrote a Python script that makes it (and a
+        command to run), or put the content in its reply, not in the file."""
+        notes = []
+        for word in dict.fromkeys(re.findall(r"(?<![\w./-])[\w./-]+\.\w+", text)):
+            p = Path(word.strip("./`'\""))
+            if not writers.writable(p):
+                continue
+            kind = documents.kind(p)
+            exists = (self.ws.root / p).exists()
+            notes.append(f"{p}: use create on {p} itself; you write {writers.SOURCE[p.suffix.lower()]} and it becomes the "
+                         f"{kind}{' picture' if documents.is_image(p) else ''}"
+                         + (" (it exists: read it first)" if exists else "") + ". No script is needed to make it")
+        return ("Files the request asks for:\n" + "\n".join(f"  {n}" for n in notes[:3])) if notes else ""
+
+    def _documents_for(self, text: str) -> list[str]:
+        """Documents and pictures a request is about though it names no file:
+        named like its words ("the travel policy" for docs/travel-policy.pdf),
+        or of a kind it mentions ("the PDF", "the screenshot"), when few are."""
+        words = {w for w in re.findall(r"[a-z0-9]{3,}", text.lower()) if w not in STOPWORDS}
+        files = [f for f in self.ws.files() if documents.kind(Path(f)) or documents.unsupported(Path(f))]
+        kinds = {"pdf": (".pdf",), "word": (".docx", ".odt", ".rtf"), "docx": (".docx",), "document": tuple(documents.DOCUMENTS),
+                 "excel": (".xlsx", ".xlsm"), "spreadsheet": (".xlsx", ".xlsm", ".csv"), "workbook": (".xlsx", ".xlsm"),
+                 "epub": (".epub",), "book": (".epub",), "image": tuple(documents.IMAGES), "picture": tuple(documents.IMAGES),
+                 "photo": tuple(documents.IMAGES), "screenshot": tuple(documents.IMAGES), "video": documents.VIDEOS,
+                 "presentation": documents.PRESENTATIONS, "slides": documents.PRESENTATIONS, "powerpoint": documents.PRESENTATIONS,
+                 "deck": documents.PRESENTATIONS}
+        named = [f for f in files if words & set(re.findall(r"[a-z0-9]{3,}", f.lower().rsplit(".", 1)[0]))]
+        wanted = tuple(ext for w, exts in kinds.items() if w in words or w + "s" in words for ext in exts)
+        of_kind = [f for f in files if wanted and f.lower().endswith(wanted)]
+        return list(dict.fromkeys(named + (of_kind if len(of_kind) <= 10 else [])))[:10]
+
+    def _turn(self, text: str, can_edit: bool, wants_change: "bool | Future") -> str:
         self.messages.append({"role": "user", "content": text, "_user": True})
         # Files the message names are opened up front (as an @-mention would):
         # small ones whole, big ones as an outline to grep or read from.
         named = self._named_files(text)
         for path in named:
             try:
-                lines = len(self.ws.read_text(self.ws.path(path)).splitlines())
-            except ToolError:
-                continue
+                lines = len(self.ws.text_of(self.ws.path(path)).splitlines())
+            except ToolError as e:
+                p = self.ws.path(path)
+                if not (documents.is_image(p) or documents.unsupported(p) or isinstance(e.__cause__, documents.NoText)):
+                    continue
+                lines = 0  # a picture, a scan, a video or slides: read shows it, or says why it can't
             act = ({"enough": False, "missing": "the file the user named", "tool": "read", "path": path} if lines <= WHOLE_FILE
                    else {"enough": False, "missing": "the file the user named (outline; it is long)", "tool": "outline", "path": path})
             self.messages.append({"role": "assistant", "content": json.dumps(act)})
             self.messages.append({"role": "user", "_result": True, "content":
                                   f"Result of step 0 ({act['tool']}):\n{self._do(act)}"})
+            if images := self.ws.take_images():
+                self.messages[-1]["_images"] = images
+        if made := self._documents_to_make(text):
+            self.messages.append({"role": "user", "_result": True, "content": made})
         if not named:
             # Where to start: definitions named like the words of the message.
             # Without it a "pairing codes" request cost ten greps in the wrong
             # folders before the file that holds PAIRING_TTL_S was found.
+            docs = self._documents_for(text)
+            if docs:
+                self.messages.append({"role": "user", "_result": True, "content":
+                                      "Documents and pictures in the repository that the request may be about "
+                                      "(read one to see what it holds):\n" + "\n".join(f"  {d}" for d in docs)})
             related = self.ws.related(text)
             if related:
                 self.messages.append({"role": "user", "_result": True, "content":
@@ -1385,6 +1625,12 @@ class Agent:
                                       f"relying on one):\n{related}"})
         # Connector tools sit before "answer". With edits off, only those
         # their connector marks as read-only are offered.
+        if isinstance(wants_change, Future):
+            # The router ran while the setup above did; its answer is needed now.
+            routed = wants_change.result()
+            wants_change = can_edit if routed is None else (bool(routed) and can_edit)
+            self._wanted = wants_change
+
         def searching() -> bool:
             # Not while the server says its search engines are refusing: asking
             # again only keeps them blocked.
@@ -1436,6 +1682,8 @@ class Agent:
 
         def note(content: str):
             self.messages.append({"role": "user", "_result": True, "content": content})
+            if images := self.ws.take_images():
+                self.messages[-1]["_images"] = images
 
         limit = MAX_STEPS
         for n in range(1, MAX_STEPS_CHANGING + 1):
@@ -1762,8 +2010,8 @@ class Agent:
         out, size = [], 0
         for rel, before in self._before.items():
             try:
-                after = self.ws.path(rel, must_exist=False).read_text(encoding=self.ws.encoding, errors="replace")
-            except OSError:
+                after = self.ws.view(self.ws.path(rel, must_exist=False))
+            except (OSError, ToolError):
                 after = ""
             if size > REVIEW_DIFF:
                 out.append(f"(also changed: {rel}; not shown)")
@@ -1946,7 +2194,7 @@ class Agent:
             for m, content in hidden:
                 m["content"] = content
             self.messages.pop()  # the instruction isn't part of the conversation
-        reply = _ACTION_TAIL.sub("", reply) or reply  # kept (and saved) as it was shown
+        reply = cut_action_tail(reply) or reply  # kept (and saved) as it was shown
         self._replies = (self._replies + [(user_text, reply)])[-RECENT_REPLIES:]
         if chose and self.messages and self.messages[-1] is chose:
             self.messages[-1] = {"role": "assistant", "content": reply}
@@ -2130,9 +2378,9 @@ class Agent:
                 last["content"] = saved
         msg = data["choices"][0]["message"]
         text = msg.get("content") or msg.get("reasoning_content") or ""
-        m = re.search(r"\{.*\}", text, re.S)
+        braces = _outer_braces(text)
         try:
-            args = json.loads(m.group(0) if m else text)
+            args = json.loads(braces or text)
         except json.JSONDecodeError as e:
             raise ToolError(f"the arguments for {name} weren't valid JSON ({str(e)[:80]}); choose it again") from e
         if not isinstance(args, dict):
@@ -2213,12 +2461,20 @@ class Agent:
             if not self._has_read(self.ws.rel(p)):
                 raise ToolError(f"{path} already exists. Read it first; then edit it, or create it again to replace all of it")
             self.ws.check_current(p)
-            before = p.read_text(encoding=self.ws.encoding, errors="replace")
+            before = self.ws.view(p)
+            if writers.writable(p):
+                self.hooks.original(self.ws.rel(p), p.read_bytes())  # /undo puts the file back as it was
+        elif what := documents.unsupported(p):
+            raise ToolError(f"{path} is a {what}, and {what}s can't be made (pictures, PDFs and documents can: "
+                            "for slides, offer a PDF or a Word document instead)")
         self.hooks.waiting("Writing")
-        reply = self._written((CREATE_PROMPT if before is None else REWRITE_PROMPT).format(path=path), 8192, path)
+        prompt = (CREATE_PROMPT if before is None else REWRITE_PROMPT).format(path=path)
+        if writers.writable(p):
+            prompt += writers.hint(p)
+        reply = self._written(prompt, 8192, path)
         self.messages[-1] = {"role": "assistant", "content": self.messages[-1]["content"] + "\n" + reply}
-        m = re.search(r"```[^\n]*\n(.*?)```", reply, re.S)
-        if m is None or as_action(m.group(1)) is not None:
+        body = _fenced(reply)
+        if body is None or as_action(body) is not None:
             # Not the file: a sentence and an action ("Let me check the folder
             # first." and a list as JSON) would have been written into it.
             look = misplaced_lookup(reply)
@@ -2228,8 +2484,19 @@ class Agent:
             if strip_action(reply) != reply.strip():
                 raise ToolError("your reply was not the file's content: it ended in a JSON action. Write the whole "
                                 "file, in one code block")
-        content = m.group(1) if m else reply
+        content = body if body is not None else reply
         p.parent.mkdir(parents=True, exist_ok=True)
+        if writers.writable(p):
+            try:
+                made = writers.write(p, content)
+            except writers.WriteError as e:
+                raise ToolError(f"{path} wasn't written: {e}") from e
+            self.ws.mark(p)
+            rel = self.ws.rel(p)
+            self._before.setdefault(rel, before)
+            self.hooks.edited(rel, before, self.ws.view(p))
+            check = "" if documents.is_image(p) else " Read it to check what it holds."
+            return f"{'Replaced' if before is not None else 'Created'} {rel} ({made}), from your {writers.SOURCE[p.suffix.lower()]}.{check}"
         p.write_text(content, encoding=self.ws.encoding)
         self.ws.mark(p)
         rel = self.ws.rel(p)

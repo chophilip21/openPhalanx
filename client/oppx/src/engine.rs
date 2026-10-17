@@ -2,7 +2,8 @@
 //!
 //! oppx keeps a private copy in its data directory (`~/.local/share/oppx/engine`
 //! on Linux): uv, a uv-managed Python 3.12, and `aider-chat` pinned to
-//! [`agent::AIDER_VERSION`]. Nothing touches the user's own Python or PATH, so a
+//! [`agent::AIDER_VERSION`], with [`EXTRAS`] next to it so the agent can read
+//! and write PDFs and draw pictures. Nothing touches the user's own Python or PATH, so a
 //! system Python 3.13 (which breaks Aider) doesn't matter.
 //!
 //! An `aider` on PATH is still used when it is exactly the pinned version
@@ -17,6 +18,21 @@ use anyhow::{bail, Context, Result};
 use crate::{agent, ui};
 
 const UV_INSTALLER: &str = "https://astral.sh/uv/install.sh";
+
+/// Packages installed next to Aider, as (distribution name, version): pypdf
+/// reads PDFs, fpdf2 writes them (with fontTools and defusedxml), resvg-py
+/// draws pictures from SVG (one wheel with no dependencies). Word, Excel,
+/// OpenDocument, RTF and EPUB need only Python's standard library.
+pub const EXTRAS: &[(&str, &str)] = &[("pypdf", "6.19.0"), ("fpdf2", "2.8.9"), ("resvg_py", "0.5.0")];
+
+/// The extras an engine at `aider` is missing (or has at another version).
+fn missing_extras(aider: &Path) -> Vec<String> {
+    EXTRAS
+        .iter()
+        .filter(|(name, version)| package_version(aider, name).as_deref() != Some(version))
+        .map(|(name, version)| format!("{name}=={version}"))
+        .collect()
+}
 
 /// `~/.local/share/oppx/engine` (or the platform's data directory).
 pub fn dir() -> PathBuf {
@@ -37,14 +53,20 @@ pub fn private_aider() -> PathBuf {
 /// Aider's version, read from the `aider_chat-X.Y.Z.dist-info` folder next to
 /// its interpreter. Much faster than importing aider (about 2 s).
 pub fn version_of(aider: &Path) -> Option<String> {
+    package_version(aider, "aider_chat")
+}
+
+/// The version of a package installed next to `aider`, from its dist-info folder.
+fn package_version(aider: &Path, package: &str) -> Option<String> {
     let python = agent::aider_python(aider).ok()?;
     let venv = python.parent()?.parent()?;
     let lib = std::fs::read_dir(venv.join("lib")).ok()?;
+    let prefix = format!("{package}-");
     for py in lib.flatten() {
         let Ok(entries) = std::fs::read_dir(py.path().join("site-packages")) else { continue };
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if let Some(v) = name.strip_prefix("aider_chat-").and_then(|r| r.strip_suffix(".dist-info")) {
+            if let Some(v) = name.strip_prefix(&prefix).and_then(|r| r.strip_suffix(".dist-info")) {
                 return Some(v.to_string());
             }
         }
@@ -53,10 +75,14 @@ pub fn version_of(aider: &Path) -> Option<String> {
 }
 
 /// An installed engine at the pinned version, if there is one: the private
-/// copy first, then an `aider` on PATH.
+/// copy first (with its pinned extras; one without is installed again), then
+/// an `aider` on PATH (documents then work as far as its own packages allow).
 pub fn find() -> Option<PathBuf> {
     let private = private_aider();
-    if private.is_file() && version_of(&private).as_deref() == Some(agent::AIDER_VERSION) {
+    if private.is_file()
+        && version_of(&private).as_deref() == Some(agent::AIDER_VERSION)
+        && missing_extras(&private).is_empty()
+    {
         return Some(private);
     }
     agent::find_aider().ok().filter(|a| version_of(a).as_deref() == Some(agent::AIDER_VERSION))
@@ -136,8 +162,13 @@ async fn install_inner() -> Result<()> {
     let uv = uv().await?;
     let d = dir();
     let spec = format!("aider-chat=={}", agent::AIDER_VERSION);
+    let mut args = vec!["tool".to_string(), "install".into(), "--force".into(), "--python".into(), "3.12".into()];
+    for (name, version) in EXTRAS {
+        args.extend(["--with".into(), format!("{name}=={version}")]);
+    }
+    args.push(spec.clone());
     let out = Command::new(&uv)
-        .args(["tool", "install", "--force", "--python", "3.12", &spec])
+        .args(&args)
         .env("UV_TOOL_DIR", d.join("tools"))
         .env("UV_TOOL_BIN_DIR", bin_dir())
         .env("UV_PYTHON_INSTALL_DIR", d.join("python"))
@@ -151,6 +182,10 @@ async fn install_inner() -> Result<()> {
     }
     if version_of(&private_aider()).as_deref() != Some(agent::AIDER_VERSION) {
         bail!("installed {spec}, but {} doesn't report it", private_aider().display());
+    }
+    let missing = missing_extras(&private_aider());
+    if !missing.is_empty() {
+        bail!("installed {spec}, but not {} next to it", missing.join(", "));
     }
     Ok(())
 }
@@ -172,8 +207,16 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        for (name, version) in EXTRAS {
+            std::fs::create_dir_all(venv.join(format!("lib/python3.12/site-packages/{name}-{version}.dist-info"))).unwrap();
+        }
         let aider = venv.join("bin/aider");
         std::fs::write(&aider, format!("#!{}\nimport aider\n", python.display())).unwrap();
         assert_eq!(version_of(&aider).as_deref(), Some("0.86.2"));
+        assert_eq!(package_version(&aider, "pypdf").as_deref(), Some("6.19.0"));
+        assert_eq!(package_version(&aider, "pdfplumber"), None);
+        assert!(missing_extras(&aider).is_empty());
+        std::fs::remove_dir(venv.join("lib/python3.12/site-packages/fpdf2-2.8.9.dist-info")).unwrap();
+        assert_eq!(missing_extras(&aider), ["fpdf2==2.8.9"]);
     }
 }

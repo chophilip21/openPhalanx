@@ -73,6 +73,14 @@ INTENT_CASES = [
     ("Write a short essay about the history of computing", "ask"),
     ("Tell me a joke about programmers", "ask"),
     ("The spinner flickers, please fix it", "edit"),
+    # Documents and pictures (different wording from the prompt's examples).
+    ("What does the travel policy PDF say about hotels?", "ask"),
+    ("Summarize the quarterly report for me", "ask"),
+    ("Write the action items from the kickoff notes into actions.docx", "edit"),
+    ("Turn budget.csv into an Excel workbook with a totals row", "edit"),
+    ("Export the README as a PDF, readme.pdf", "edit"),
+    ("Make a 200x200 icon.png with a blue circle", "edit"),
+    ("Describe what's in screenshot.png", "ask"),
 ]
 
 
@@ -166,8 +174,8 @@ def ask(base: str, key: str, model: str, system: str, text: str, regex: str, rea
     )
     with urllib.request.urlopen(req, timeout=60) as r:
         answer = (json.load(r)["choices"][0]["message"]["content"] or "").lower()
-    m = re.search(r"\b(" + regex.strip("()") + r")\b", answer)
-    return m.group(1) if m else answer.strip()[:12]
+    choices = regex.strip("()").split("|")
+    return next((w for w in re.findall(r"\w+", answer) if w in choices), answer.strip()[:12])
 
 
 def run_set(title, system, regex, cases, args) -> float:

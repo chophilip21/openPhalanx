@@ -37,7 +37,8 @@ class BulletStream(MarkdownStream):
 # Closing: the ANSWER marker, a raw closing tag, or nothing yet (streaming).
 _TAG = r"(?:think(?:ing)?|thinking-content-[0-9a-f]+)"
 _REASONING = re.compile(
-    rf"(?s)(?:-+\n► \*\*THINKING\*\*|<{_TAG}>).*?(?:-+\n► \*\*ANSWER\*\*\s*|</{_TAG}>\s*|$)"
+    # (?<!-): a run of dashes is tried from its first dash only (quadratic otherwise).
+    rf"(?s)(?:(?<!-)-+\n► \*\*THINKING\*\*|<{_TAG}>).*?(?:(?<!-)-+\n► \*\*ANSWER\*\*\s*|</{_TAG}>\s*|$)"
 )
 
 
@@ -49,10 +50,13 @@ def hide_reasoning(text: str) -> str:
 
 # Aider picks ```, ````, <source>, <code>, <pre>, <codeblock> or <sourcecode>
 # fences depending on what the files in the chat contain.
-_OPEN = r"(?:`{3,}[^\n]*|<(?:source|code|pre|codeblock|sourcecode)>[^\n]*)"
+# A fence's info string has no backticks (CommonMark); allowing them split a
+# run of backticks two ways. The block body doesn't cross another SEARCH
+# marker, so an unclosed block isn't rescanned from every opener.
+_OPEN = r"(?:`{3,}[^\n`]*|<(?:source|code|pre|codeblock|sourcecode)>[^\n]*)"
 _CLOSE = r"(?:`{3,}|</(?:source|code|pre|codeblock|sourcecode)>)"
 _FENCE_BLOCK = re.compile(
-    rf"(?ms)^[^\n`<]*\n?{_OPEN}\n<<<<<<< SEARCH\n.*?^>>>>>>> REPLACE[^\n]*\n{_CLOSE}[^\n]*\n?"
+    rf"(?ms)^[^\n`<]*\n?{_OPEN}\n<<<<<<< SEARCH\n(?:(?!<<<<<<< SEARCH\n).)*?^>>>>>>> REPLACE[^\n]*\n{_CLOSE}[^\n]*\n?"
 )
 _OPEN_LINE = re.compile(rf"^{_OPEN}$")
 _MARKER = "<<<<<<< SEARCH"
