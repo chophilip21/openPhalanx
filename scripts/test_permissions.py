@@ -7,6 +7,7 @@
 import importlib.util
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -418,7 +419,7 @@ class Audit(Base):
     def test_d07_a_harmless_use_is_not_a_rule_for_the_dangerous_one(self):
         for cmd in ("sed -n 1,5p src/a.rs", "sed -n '/fn/,/}/p' src/a.rs", "sed 's/a/b/g' src/a.rs", "awk '{print $1}' src/a.rs",
                     "awk -F: 'NR>2 && $3 > 10 {print $1}' src/a.rs", "find . -name '*.py' -exec grep -l foo {} +",
-                    "find . -type f -exec wc -l {} \;", "curl -s localhost:5173", "curl -sI http://127.0.0.1:8080/api",
+                    "find . -type f -exec wc -l {} \\;", "curl -s localhost:5173", "curl -sI http://127.0.0.1:8080/api",
                     "curl -s -o /dev/null -w '%{http_code}' http://localhost:5173/"):
             self.runs(cmd)
         for cmd in ("find . -delete", "find . -exec rm {} +", "sed -i s/a/b/ src/a.rs", "sed '1e rm -rf src' src/a.rs",
@@ -721,6 +722,18 @@ class Audit(Base):
         for t in threads:
             t.join()
         self.assertEqual(len(P.Permissions(str(self.root), self.file).run), 61, "no session lost another's rule")
+
+
+class LinearChecks(unittest.TestCase):
+    """Checks rewritten from regexes that backtracked (scripts/check_regexes.py)."""
+
+    def test_awk_that_writes_a_file(self):
+        for prog, writes in (('{print $1 > out}', True), ("{print $1}", False), ("BEGIN{x=1; print x > file}", True),
+                             ("{n++} END{print n}", False)):
+            self.assertEqual(P._awk_writes(prog), writes, prog)
+        t = time.monotonic()
+        P._awk_writes("|print" * 50_000)
+        self.assertLess(time.monotonic() - t, 0.5)
 
 
 if __name__ == "__main__":

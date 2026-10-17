@@ -20,6 +20,7 @@ pub const IMAGE_NAME: &str = "openphalanx-backend";
 pub const BUILD_FILES: &[(&str, &str)] = &[
     ("Dockerfile.server", include_str!("../../../docker/Dockerfile.server")),
     ("server/gateway.py", include_str!("../../../docker/server/gateway.py")),
+    ("server/inputs.py", include_str!("../../../docker/server/inputs.py")),
     ("server/reqtrace.py", include_str!("../../../docker/server/reqtrace.py")),
     ("server/searchguard.py", include_str!("../../../docker/server/searchguard.py")),
     ("server/start-sglang.sh", include_str!("../../../docker/server/start-sglang.sh")),
@@ -182,10 +183,12 @@ pub async fn ensure_image(image: &str, on_line: impl FnMut(String)) -> Result<bo
 /// keeps `docker images` tidy. Images in use by a container are kept.
 async fn remove_old_images(current: &str) {
     let Ok(out) = docker(&["images", "--format", "{{.Repository}}:{{.Tag}}", IMAGE_NAME]).await else { return };
-    for tag in String::from_utf8_lossy(&out.stdout).lines() {
-        if tag != current && tag.starts_with(&format!("{IMAGE_NAME}:")) {
-            let _ = docker(&["image", "rm", tag]).await;
-        }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let old: Vec<&str> =
+        text.lines().filter(|tag| *tag != current && tag.starts_with(&format!("{IMAGE_NAME}:"))).collect();
+    if !old.is_empty() {
+        // One call for all: docker removes what it can and skips images in use.
+        let _ = docker(&[&["image", "rm"][..], &old].concat()).await;
     }
 }
 

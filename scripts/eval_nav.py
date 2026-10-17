@@ -94,6 +94,7 @@ def main():
         if dirty:
             subprocess.run(["git", "checkout", "-q", "."], cwd=args.repo)
             subprocess.run(["git", "clean", "-fdq"], cwd=args.repo)
+        # regex: runtime (the expected words of this file's own questions)
         missing = [w for w in wanted if not re.search(w, reply, re.I)]
         seen = shown[-1] if shown else ""
         flags = [f for f, on in (("STUCK", bool(agent.stuck)), ("EDITED", bool(dirty)),

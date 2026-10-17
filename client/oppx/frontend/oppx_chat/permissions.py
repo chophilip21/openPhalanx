@@ -193,7 +193,9 @@ _OPS = ("&&", "||", ";;", "|&", "&>>", "&>", ">>", ">&", ">|", "<<<", "<<", "<&"
         ";", "|", "&", "(", ")", "<", ">")
 _ASSIGNED = re.compile(r"(?:^|[\s;&|(])(?:(?:export|local|declare|readonly|typeset)\s+(?:-\w+\s+)*)?([A-Za-z_]\w*)\+?="
                        r"|\bfor\s+([A-Za-z_]\w*)|\bread\s+(?:-\w+\s+)*([A-Za-z_]\w*)")
-_BRACES = re.compile(r"\{[^{}\s]*(,|\.\.)[^{}\s]*\}")
+# Before the "," or "..": no comma and no "..", so the split is unambiguous
+# (`[^{}\s]*(,|\.\.)` was quadratic on "{,,,,"; scripts/check_regexes.py).
+_BRACES = re.compile(r"\{(?:[^{}\s,.]|\.(?!\.))*(,|\.\.)[^{}\s]*\}")
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +679,7 @@ def _dangerous(cmd: list[str], project: Path | None = None) -> bool:
 
 
 _SED_ADDR = r"(?:(?:\d+|\$|/[^/\n]*/)(?:,(?:\d+|\$|\+\d+|/[^/\n]*/))?)?"
-_SED_PRINT = re.compile(_SED_ADDR + r"\s*!?\s*[pdq=]?")
+_SED_PRINT = re.compile(_SED_ADDR + r"\s*(?:!\s*)?[pdq=]?")  # not `\s*!?\s*`: two ways to split spaces
 _SED_SUBST = re.compile(_SED_ADDR + r"\s*s([/|#,:@])(?:(?!\1)[^\n])*\1(?:(?!\1)[^\n])*\1[gpiI0-9]*")
 
 
@@ -702,7 +704,18 @@ def _sed_reads(args: list[str]) -> bool:
     return bool(scripts) and all(_SED_PRINT.fullmatch(p) or _SED_SUBST.fullmatch(p) for p in parts)
 
 
-_AWK_ACTS = re.compile(r"system\s*\(|getline|ENVIRON|>>|>\s*\"|\|\s*\"|\"\s*\||print[^;}\n]*>\s*[A-Za-z_(]")
+_AWK_ACTS = re.compile(r"system\s*\(|getline|ENVIRON|>>|>\s*\"|\|\s*\"|\"\s*\|")
+_AWK_REDIRECT = re.compile(r">\s*[A-Za-z_(]")
+
+
+def _awk_writes(program: str) -> bool:
+    """A statement that prints to a file (`print x > out`). Statement by
+    statement, not `print[^;}\n]*>`, which rescanned from every "print"."""
+    for statement in re.split(r"[;}\n]", program):
+        at = statement.find("print")
+        if at >= 0 and _AWK_REDIRECT.search(statement, at):
+            return True
+    return False
 
 
 def _awk_reads(args: list[str]) -> bool:
@@ -716,7 +729,7 @@ def _awk_reads(args: list[str]) -> bool:
             i += 1
         else:
             return False  # -f program file, -i, --
-    return i < len(args) and not _AWK_ACTS.search(str(args[i]))
+    return i < len(args) and not (_AWK_ACTS.search(str(args[i])) or _awk_writes(str(args[i])))
 
 
 _CURL_PLAIN = re.compile(r"-[sSiILfvk]+|--silent|--show-error|--include|--head|--location|--fail|--verbose|"
@@ -824,7 +837,7 @@ def _reads(cmd: list[str], project: Path | None = None) -> bool:
     if name == "xxd":
         return len([a for a in args if not a.startswith("-") and not a.isdigit()]) <= 1  # a second file is written
     if name == "tail":
-        return not any(a in ("--follow", "--retry") or a.startswith("--follow=") or re.fullmatch(r"-[a-zA-Z]*[fF][a-zA-Z]*", a)
+        return not any(a in ("--follow", "--retry") or a.startswith("--follow=") or (re.fullmatch(r"-[a-zA-Z]+", a) and "f" in a.lower())
                        for a in args)  # -f never ends
     if name == "jq":  # `env` and $ENV print the environment, secrets included
         return not any("env" in str(a).lower() or "input_filename" in a for a in args)

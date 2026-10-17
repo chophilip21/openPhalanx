@@ -29,6 +29,8 @@ pub const FRONTEND: &[(&str, &str)] = &[
     ("oppx_chat/mcp.py", include_str!("../frontend/oppx_chat/mcp.py")),
     ("oppx_chat/browser.py", include_str!("../frontend/oppx_chat/browser.py")),
     ("oppx_chat/permissions.py", include_str!("../frontend/oppx_chat/permissions.py")),
+    ("oppx_chat/documents.py", include_str!("../frontend/oppx_chat/documents.py")),
+    ("oppx_chat/writers.py", include_str!("../frontend/oppx_chat/writers.py")),
     ("oppx_chat/agent.py", include_str!("../frontend/oppx_chat/agent.py")),
     ("oppx_chat/oppx_io.py", include_str!("../frontend/oppx_chat/oppx_io.py")),
     ("oppx_chat/routing.py", include_str!("../frontend/oppx_chat/routing.py")),

@@ -10,7 +10,7 @@ from .config import MODEL_LABEL, REASONING, TRACE
 
 INTENT_PROMPT = """Classify the programmer's message to a coding assistant.
 
-Answer "edit" when the message asks to change the code or files in any way: add, write, create, implement, fix, refactor, rename, remove, delete, update, optimize, or "make it ..." — including polite questions such as "can you add tests?".
+Answer "edit" when the message asks to change the code or files in any way: add, write, create, implement, fix, refactor, rename, remove, delete, update, optimize, or "make it ..." — including polite questions such as "can you add tests?". Asking for a file to be made is "edit" whatever goes in it: a document (report.docx, notes.pdf, a spreadsheet), a picture (logo.png) or a summary saved as a file.
 Answer "ask" when the message only wants information or text in the reply: a question, an explanation, a review, an opinion, a plan, an essay, a joke, a translation, or a general-knowledge request, without asking for any file or code to be changed.
 
 Examples:
@@ -27,6 +27,10 @@ Message: Fix the failing test. -> edit
 Message: Why does this test fail? Please fix it. -> edit
 Message: Rename x to count. -> edit
 Message: Make the parser faster. -> edit
+Message: Summarize the meeting notes. -> ask
+Message: Create summary.docx: a one-page summary of the meeting notes. -> edit
+Message: Put the figures from report.pdf in a spreadsheet, costs.xlsx. -> edit
+Message: Draw a logo as logo.png. -> edit
 
 A message may be a reply to what the assistant just said. Then it comes with the end of the assistant's last reply, and with a change the user asked for earlier that has not been made yet, when there is one. Read the message in that light:
 - A go-ahead, a confirmation or "continue" (yes, ok, sure, go ahead, do it, please do, continue, in any language) is "edit" when the assistant offered, proposed, planned or announced a change, or when a requested change has not been made yet. Without either, it is "ask".
@@ -112,8 +116,8 @@ def ask_choice(system: str, text: str, choices: tuple[str, ...], trace: dict | N
         answer = (r.json()["choices"][0]["message"]["content"] or "").lower()
     except (httpx.HTTPError, ValueError, KeyError, IndexError):
         return None
-    m = re.search(r"\b(" + "|".join(choices) + r")\b", answer)
-    return m.group(1) if m else None
+    # The first word that is one of the choices (no pattern built from them).
+    return next((w for w in re.findall(r"\w+", answer) if w in choices), None)
 
 
 def intent_input(text: str, last_reply: str = "", pending: str = "") -> str:

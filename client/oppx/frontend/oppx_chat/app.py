@@ -3,6 +3,7 @@
 import contextlib
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import aider
@@ -22,6 +23,7 @@ from .render import BulletStream, _bullet, hide_reasoning, show_diff, show_edits
 from .mcp import Hub
 from . import browser
 from .agent import Agent, Hooks, Workspace
+from . import agent as agent_module, documents
 from .permissions import Permissions
 from .routing import announces_change, wants_edit
 from .context import CONTEXT_MGR, PRI_EDITED, _check_tokens, _fitted_format_messages
@@ -29,6 +31,8 @@ from .oppx_io import OppxIO
 from .cache import ASK_NOTE, _ask_file_mentions, _ask_init, _coder_init, _dump_requests, _stable_ranked_map
 from .commands import (ask_about_connector, connector_names, load_memory, memory_files, show_connector_problems, start_browser,
                        translate)
+
+ROUTER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="oppx-route")  # the ask/edit check, beside the turn's setup
 
 
 def _interrupted(self):
@@ -225,6 +229,10 @@ def make_agent(coder) -> Agent:
         if final:
             stream["md"] = None
 
+    def on_original(rel: str, data: bytes):
+        # A document replaced: /undo writes these bytes back, not its text.
+        UI.originals.setdefault(str((Path(coder.root) / rel).resolve()), data)
+
     def on_edited(rel: str, before, after: str):
         key = str((Path(coder.root) / rel).resolve())
         UI.before.setdefault(key, before or "")
@@ -302,7 +310,7 @@ def make_agent(coder) -> Agent:
         step(f"⚠ {escape(text)}", YELLOW)
         SPIN.start()
 
-    hooks = Hooks(step=on_step, stream=on_stream, edited=on_edited, confirm_run=on_confirm, notice=on_notice,
+    hooks = Hooks(step=on_step, stream=on_stream, edited=on_edited, original=on_original, confirm_run=on_confirm, notice=on_notice,
                   confirm_tool=on_confirm_tool, start_browser=lambda: start_browser(SESSION.coder or coder, ask=True),
                   waiting=lambda label: SPIN.start(label), interrupted=lambda: UI.interrupted,
                   announces=lambda reply: announces_change(reply, {"session": UI.agent.session, "turn": UI.agent.turns,
@@ -355,7 +363,9 @@ def agent_turn(coder, text: str):
     # The ask/edit check belongs to the turn that is about to start (for the server's Trace page).
     route = {"session": agent.session, "turn": agent.turns + 1, "step": 0, "kind": "route"}
     # Read with what it may be an answer to: alone, "yes, go ahead" is a question.
-    wants_change = can_edit and wants_edit(text, route, agent.last_reply(), agent.pending)
+    # Asked in a thread: the turn opens files and finds definitions meanwhile,
+    # and waits for the answer only before its first model call.
+    wants_change = ROUTER.submit(wants_edit, text, route, agent.last_reply(), agent.pending) if can_edit else False
     agent = UI.agent
     if agent.memory != _memory(coder):  # # notes and /init change it
         agent.memory = _memory(coder)
@@ -369,6 +379,12 @@ def agent_turn(coder, text: str):
     if not getattr(coder.io, "input_logged", False):
         coder.io.user_input(text, log_only=True)
     coder.io.input_logged = False
+    # A picture (or a video, slides) the message names but the model can't
+    # take: said now, before the turn. Not a stop: "rename logo.png" is fine.
+    for rel in agent._named_files(text):
+        why = documents.blocked(Path(coder.root) / rel, agent_module.VISION, MODEL_NAME)
+        if why:
+            step(escape(why), YELLOW)
     # Files the user pointed at (/add, @file): the agent reads them as needed.
     pointed = sorted(coder.get_rel_fname(f) for f in coder.abs_fnames)
     if pointed:
@@ -478,6 +494,7 @@ def run(argv) -> int:
     if ENGINE == "agent":
         UI.connectors = connect_connectors(coder)
         UI.agent = make_agent(coder)
+        UI.agent.ws.warm()  # the definitions index, while the user types
         if browser.AUTO:
             # `oppx browser on`: started with the session, before the first
             # request, so its tools are in the system prompt from the start.

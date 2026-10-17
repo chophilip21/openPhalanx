@@ -1,0 +1,10 @@
+{
+  "name": "openphalanx-regexcheck",
+  "private": true,
+  "description": "recheck and the TypeScript parser, pinned, for scripts/check_regexes.py (ReDoS analysis of every regex in the repository)",
+  "type": "module",
+  "dependencies": {
+    "recheck": "4.5.0",
+    "typescript": "5.9.3"
+  }
+}

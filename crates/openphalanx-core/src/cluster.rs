@@ -827,16 +827,23 @@ impl Cluster {
         *self.host_link.lock().unwrap() = HostLink::default();
         *self.host_serving.lock().unwrap() = false;
         self.log(format!("took over as host from {}", host.name));
-        for peer in peers.iter().filter(|p| p.id != me.id) {
-            let (invite_id, secret) = (random_hex(8), random_hex(32));
-            self.outgoing.lock().unwrap().push(OutgoingInvite {
-                invite_id: invite_id.clone(),
-                secret_sha256: sha256_hex(&secret),
-                for_id: peer.id.clone(),
-                expires_at: now() + INVITE_TTL_SECS,
-            });
-            let _ = send_invite(peer, InviteMsg { host: me.clone(), invite_id, secret }).await;
-        }
+        // Registered first, then sent to everyone at once: one unreachable
+        // peer no longer holds up the others for its timeout.
+        let sends: Vec<_> = peers
+            .iter()
+            .filter(|p| p.id != me.id)
+            .map(|peer| {
+                let (invite_id, secret) = (random_hex(8), random_hex(32));
+                self.outgoing.lock().unwrap().push(OutgoingInvite {
+                    invite_id: invite_id.clone(),
+                    secret_sha256: sha256_hex(&secret),
+                    for_id: peer.id.clone(),
+                    expires_at: now() + INVITE_TTL_SECS,
+                });
+                send_invite(peer, InviteMsg { host: me.clone(), invite_id, secret })
+            })
+            .collect();
+        futures_util::future::join_all(sends).await;
         Ok(())
     }
 
@@ -1216,19 +1223,27 @@ impl Cluster {
             self.set_role(Role::Host)?;
             *self.host_link.lock().unwrap() = HostLink::default();
         }
-        let mut problems = Vec::new();
-        for peer in req.members.iter().filter(|p| p.id != me.id) {
-            let (invite_id, secret) = (random_hex(8), random_hex(32));
-            self.outgoing.lock().unwrap().push(OutgoingInvite {
-                invite_id: invite_id.clone(),
-                secret_sha256: sha256_hex(&secret),
-                for_id: peer.id.clone(),
-                expires_at: now() + INVITE_TTL_SECS,
-            });
-            if let Err(e) = send_invite(peer, InviteMsg { host: me.clone(), invite_id, secret }).await {
-                problems.push(format!("{e:#}"));
-            }
-        }
+        // Registered first, then sent to everyone at once (as in take_over).
+        let sends: Vec<_> = req
+            .members
+            .iter()
+            .filter(|p| p.id != me.id)
+            .map(|peer| {
+                let (invite_id, secret) = (random_hex(8), random_hex(32));
+                self.outgoing.lock().unwrap().push(OutgoingInvite {
+                    invite_id: invite_id.clone(),
+                    secret_sha256: sha256_hex(&secret),
+                    for_id: peer.id.clone(),
+                    expires_at: now() + INVITE_TTL_SECS,
+                });
+                send_invite(peer, InviteMsg { host: me.clone(), invite_id, secret })
+            })
+            .collect();
+        let problems = futures_util::future::join_all(sends)
+            .await
+            .into_iter()
+            .filter_map(|r| r.err().map(|e| format!("{e:#}")))
+            .collect();
         Ok(problems)
     }
 
@@ -1552,16 +1567,16 @@ impl Cluster {
                 self.clone().follow_worker_order(None).await;
             }
             if let Role::Member { host, token } = self.role() {
-                self.collect_backend_logs().await;
+                // Independent probes (docker logs, nvidia-smi, the backend's
+                // admin API, the worker), asked together: a report takes as
+                // long as the slowest, not the sum. Awaited before the literal:
+                // a lock taken inside it would be held across these awaits.
+                let ((), inventory, serving, worker) =
+                    tokio::join!(self.collect_backend_logs(), collect_inventory(), collect_serving(), self.check_worker());
                 let logs: Vec<String> = {
                     let out = self.outbox.lock().unwrap();
                     out.iter().take(LOG_LINES_PER_REPORT).cloned().collect()
                 };
-                // Awaited before the literal: a lock taken inside it would be
-                // held across these awaits.
-                let inventory = collect_inventory().await;
-                let serving = collect_serving().await;
-                let worker = self.check_worker().await;
                 let model_sync = self.sync.lock().unwrap().clone();
                 let report = Report { inventory, serving, model_sync, logs: logs.clone(), worker };
                 let result = async {
@@ -1770,12 +1785,16 @@ impl Cluster {
         let since = *self.backend_log_since.lock().unwrap();
         let until = now();
         *self.backend_log_since.lock().unwrap() = until;
-        // Its own backend, and its share of the host's split model.
-        for (container, prefix) in [(crate::docker::CONTAINER_NAME, ""), (crate::docker::WORKER_CONTAINER, "[split worker] ")] {
-            let out = tokio::process::Command::new("docker")
+        // Its own backend, and its share of the host's split model: read
+        // together, queued in this order.
+        let read = |container: &'static str| {
+            tokio::process::Command::new("docker")
                 .args(["logs", "--since", &since.to_string(), "--until", &until.to_string(), container])
                 .output()
-                .await;
+        };
+        let (backend, worker) =
+            tokio::join!(read(crate::docker::CONTAINER_NAME), read(crate::docker::WORKER_CONTAINER));
+        for (out, prefix) in [(backend, ""), (worker, "[split worker] ")] {
             let Ok(out) = out else { continue };
             if !out.status.success() {
                 continue; // no such container on this machine

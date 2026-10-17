@@ -226,3 +226,6 @@ scripts/fixtures/
 
 # Claude Code: per-machine settings stay local; the topic notes in .claude/skills/ are committed
 .claude/settings.local.json
+
+# scripts/check_regexes.py: recheck (npm ci --prefix scripts/regexcheck)
+scripts/regexcheck/node_modules/

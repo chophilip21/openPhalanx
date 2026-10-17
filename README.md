@@ -23,6 +23,7 @@ https://github.com/user-attachments/assets/5d7663b2-fe50-4a05-8f86-5bbd8b08f9b3
 * ✅ **Private**: your repo, tests and git stay on your laptop. Prompts go only to your own server, over TLS pinned to its certificate, and the server keeps no code.
 * ✅ **Models that fit**: the app shows which models fit your GPU, counting the KV cache and runtime memory, not just the download size.
 * ✅ **Whole-repo agent**: the agent reads your files on demand and runs your own tests and commands (after asking). Add tools from any MCP server (GitHub, a database, a browser…) as connectors; you approve each call.
+* ✅ **Documents and pictures**: the agent reads and writes PDF, Word, OpenDocument, RTF, EPUB and Excel files, and sees pictures (PNG, JPEG, GIF, WebP) when the model can. It also draws pictures from SVG. Videos and presentations aren't supported.
 * ✅ **Managed context**: when a conversation grows, older content is trimmed or summarized automatically.
 * ✅ **Web search**: the server searches the web through its own private SearXNG when a request needs current information.
 * ✅ **Clusters**: servers on one network can form a cluster and split a model too big for one GPU across them.

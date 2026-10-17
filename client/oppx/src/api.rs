@@ -170,6 +170,9 @@ pub struct ServerInfo {
     #[serde(default)]
     pub trace: bool,
     pub web_search: bool,
+    /// The model takes pictures (older servers don't say: false).
+    #[serde(default)]
+    pub vision: bool,
     pub ready: bool,
 }
 
