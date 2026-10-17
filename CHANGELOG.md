@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.8.0 (2026-10-17)
+
+### Features
+
+- Documents and pictures, an input guard, a regex guard, and faster downloads (#18)
+
 ## v0.7.5 (2026-10-15)
 
 ### Fixes
