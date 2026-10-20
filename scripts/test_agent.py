@@ -3,83 +3,15 @@
 a scripted model: no server needed. Run with any Python that has httpx:
 
     ~/.local/share/oppx/engine/tools/aider-chat/bin/python scripts/test_agent.py
-"""
 
-import json
-import os
+The tools, edit text and commands are in test_agent_tools.py; documents and
+pictures in test_agent_documents.py."""
+
 import subprocess
-import sys
-import tempfile
-import time
 import unittest
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "client/oppx/frontend"))
-
-from oppx_chat import agent as A  # noqa: E402
-
-
-try:  # edits are applied with Aider's matcher; CI runs without it
-    import aider  # noqa: F401
-    HAVE_AIDER = True
-except ImportError:
-    HAVE_AIDER = False
-needs_aider = unittest.skipUnless(HAVE_AIDER, "needs aider-chat (run with the oppx engine's Python)")
-try:  # the terminal module draws with rich, which CI doesn't install either
-    import rich  # noqa: F401
-    HAVE_RICH = True
-except ImportError:
-    HAVE_RICH = False
-
-
-class Scripted:
-    """An Agent whose model calls are played from lists."""
-
-    def __init__(self, repo: str):
-        self.shown, self.steps, self.notices, self.prompts = [], [], [], []
-        self.actions, self.texts = [], []
-        hooks = A.Hooks(step=lambda t, d: self.steps.append((t, d)), notice=self.notices.append,
-                        stream=lambda text, final: self.shown.append(text) if final else None)
-        self.agent = ag = A.Agent(ws=A.Workspace(repo), hooks=hooks)
-        ag._fit = lambda: None
-
-        def action(tools):
-            act = dict(self.actions.pop(0)) if self.actions else {"tool": "answer"}
-            if act["tool"] not in tools:
-                act = {"tool": "answer"}
-            return act
-
-        def text_once(max_tokens, stream, temperature=None, regex=None):
-            self.prompts.append((ag.messages[-1]["content"], regex))
-            out = self.texts.pop(0) if self.texts else "Done."
-            if stream:
-                acc = ""
-                for word in out.split(" "):
-                    acc += word + " "
-                    ag.hooks.stream(acc.strip(), False)
-                ag.hooks.stream(out, True)
-            return out
-
-        ag._action, ag._text_once = action, text_once
-
-
-class Repo(unittest.TestCase):
-    """A small repository and an agent with a scripted model on it."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
-        (root / "src").mkdir()
-        (root / "src/calc.py").write_text("LIMIT = 3\n\n\ndef add(a, b):\n    return a + b\n\n\ndef start_server(port):\n    return port\n")
-        (root / "src/other.py").write_text("from calc import add\n\nprint(add(1, 2))\n")
-        (root / "README.md").write_text("add things with add()\n" * 30)
-        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-        subprocess.run(["git", "add", "."], cwd=root, check=True)
-        self.s = Scripted(str(root))
-        self.root = root
-
-    def tearDown(self):
-        self.tmp.cleanup()
+from agent_testkit import Repo, Scripted, needs_aider
+from oppx_chat import agent as A
 
 
 class AgentLoop(Repo):
@@ -194,6 +126,128 @@ class AgentLoop(Repo):
         s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
         self.assertIn("LIMIT = 4", (self.root / "src/calc.py").read_text())
         self.assertEqual([t for t, _ in s.steps].count("Update(src/calc.py)"), 1)  # one step, not a failed one and a retry
+
+    def test_a_new_file_written_as_a_sentence_and_an_action_is_asked_for_again(self):
+        s = self.s
+        create = {"tool": "create", "path": "src/new.py"}
+        s.actions = [create, create, {"tool": "answer"}, {"tool": "answer"}]  # the first one is answered with a plan
+        s.texts = ["Plan: create src/new.py.",
+                   'I\'ll create the files for this step.\n\n{"enough": true, "tool": "create", "path": "src/new.py"}',
+                   "```python\nLIMIT = 4\n```", "Created src/new.py."]
+        s.agent.turn("create src/new.py with LIMIT = 4", can_edit=True)
+        self.assertEqual((self.root / "src/new.py").read_text(), "LIMIT = 4\n")
+        self.assertEqual([t for t, _ in s.steps].count("Create(src/new.py)"), 1)  # one step, not a failed one and a retry
+
+    def test_a_code_block_holding_only_the_file_name_is_not_the_file(self):
+        self.assertEqual(A._fenced("```\nsrc/new.py\n```\n```python\nX = 1\n```", "src/new.py"), "X = 1\n")
+        self.assertIsNone(A._fenced("```\nnew.py\n```", "src/new.py"))
+        self.assertEqual(A._fenced("```\nsrc/new.py\n```"), "src/new.py\n")  # no path given: as before
+        s = self.s
+        create = {"tool": "create", "path": "src/new.py"}
+        s.actions = [create, create, {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = ["Plan: create src/new.py.", '{"enough": false, "tool": "create", "path": "src/new.py"}',
+                   '```\nsrc/new.py\n```\n\n{"enough": false, "tool": "create", "path": "src/new.py"}',
+                   "Created src/new.py."]
+        s.agent.turn("create src/new.py with X = 1", can_edit=True)
+        self.assertFalse((self.root / "src/new.py").exists(), "the name was never written as the file")
+        self.assertTrue(any("not its name" in p for p, _ in s.prompts))
+
+    @needs_aider
+    def test_a_file_it_wrote_whole_can_be_edited_without_reading_it_first(self):
+        s = self.s
+        create, edit = {"tool": "create", "path": "src/new.py"}, {"tool": "edit", "path": "src/new.py"}
+        s.actions = [create, create, edit, {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = ["Plan: create src/new.py.", "```python\nLIMIT = 3\n```",
+                   "src/new.py\n<<<<<<< SEARCH\nLIMIT = 3\n=======\nLIMIT = 4\n>>>>>>> REPLACE", "Done."]
+        s.agent.turn("create src/new.py with LIMIT = 3, then make it 4", can_edit=True)
+        self.assertEqual((self.root / "src/new.py").read_text(), "LIMIT = 4\n")
+        # Changed since it was written whole: its text in the conversation is old, so a read comes first again.
+        self.assertFalse(s.agent._has_read("src/new.py"))
+
+    @needs_aider
+    def test_an_edit_that_repeats_one_line_is_asked_for_again_and_not_kept(self):
+        s = self.s
+        edit = {"tool": "edit", "path": "src/calc.py"}
+        s.actions = [{"tool": "read", "path": "src/calc.py"}, edit, edit, {"tool": "answer"}, {"tool": "answer"}]
+        junk = "<tool_call>\n\n" * 300
+        s.texts = ["Plan: change LIMIT in src/calc.py.", junk,
+                   "src/calc.py\n```\n<<<<<<< SEARCH\nLIMIT = 3\n=======\nLIMIT = 4\n>>>>>>> REPLACE\n```", "LIMIT is now 4."]
+        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
+        self.assertIn("LIMIT = 4", (self.root / "src/calc.py").read_text())
+        regexes = [r for _, r in s.prompts if r]
+        self.assertTrue(regexes and regexes[-1].startswith("src/calc\\.py\\n```"), regexes)
+        self.assertFalse(any("<tool_call>" in m["content"] for m in s.agent.messages), "the junk was not kept")
+
+    def test_a_blockless_edit_reply_is_kept_short(self):
+        self.assertTrue(A.degenerate("<tool_call>\n\n" * 30))
+        self.assertFalse(A.degenerate("x = 1\n" * 5))
+        self.assertFalse(A.degenerate("\n".join(f"line {i}" for i in range(40))))
+
+    def test_lines_shown_only_because_the_file_was_small_can_be_read_once(self):
+        s = self.s
+        big = "\n".join(f"line {i}" for i in range(1, 201)) + "\n"
+        (self.root / "src/big.py").write_text(big)
+        part = {"tool": "read", "path": "src/big.py", "start": 150, "end": 200}
+        s.actions = [{"tool": "read", "path": "src/big.py", "start": 1, "end": 40}, part, part, {"tool": "answer"}]
+        s.texts = ["Done."]
+        s.agent.turn("what is on line 180 of the big module?", can_edit=False)
+        results = [m["content"] for m in s.agent.messages if m["content"].startswith("Result of step")]
+        self.assertIn("src/big.py lines 1-200", results[0])      # shown whole for a read of 40 lines
+        self.assertIn("line 180", results[1])                      # the lines it never asked for: read once
+        self.assertIn("already shown", results[2])                 # the same read again is a repeat
+
+    def test_a_file_read_long_ago_may_be_read_once_more(self):
+        s = self.s
+        read = {"tool": "read", "path": "src/calc.py"}
+        s.actions = ([read] + [{"tool": "grep", "pattern": f"x{i}"} for i in range(A.FAR_BACK)]
+                     + [dict(read), dict(read), {"tool": "answer"}])
+        s.texts = ["Nothing there.", "Done."]
+        s.agent.turn("what is LIMIT?", can_edit=False)
+        results = [m["content"] for m in s.agent.messages if m["content"].startswith("Result of step")]
+        reads = [r for r in results if "(read)" in r.split("\n", 1)[0]]
+        self.assertIn("LIMIT = 3", reads[1])           # far back: read again, once
+        self.assertIn("already did exactly this", reads[2])  # right after: a repeat
+
+    def test_a_small_file_too_long_to_show_whole_shows_the_lines_asked_for(self):
+        s = self.s
+        wide = "\n".join(f"value_{i} = {'x' * 70}" for i in range(1, 273)) + "\n"  # 272 lines, over a result's room
+        (self.root / "src/wide.py").write_text(wide)
+        tail = {"tool": "read", "path": "src/wide.py", "start": 205, "end": 272}
+        s.actions = [tail, {"tool": "read", "path": "src/wide.py", "start": 1, "end": 272}, tail, {"tool": "answer"}]
+        s.texts = ["Done."]
+        s.agent.turn("what is the last value?", can_edit=False)
+        results = [m["content"] for m in s.agent.messages if m["content"].startswith("Result of step")]
+        self.assertIn("src/wide.py lines 199-272 of 272", results[0])  # not the whole file, cut at line 209
+        self.assertIn("value_272 =", results[0])
+        self.assertNotIn("(cut; ask for less)", results[0])
+        head, = (r for r in results[1:2])
+        last = int(head.split(" lines 1-", 1)[1].split(" ", 1)[0])
+        self.assertLess(last, 272)  # as many whole lines as fit, and the header says where it stopped
+        self.assertIn(f"(lines {last + 1}-272 not shown)", head)
+        self.assertIn("already shown", results[2])  # 205-272 really was shown
+
+    def test_lines_a_read_could_not_fit_can_be_read_next(self):
+        s = self.s
+        wide = "\n".join(f"value_{i} = {'x' * 70}" for i in range(1, 273)) + "\n"
+        (self.root / "src/wide.py").write_text(wide)
+        s.actions = [{"tool": "read", "path": "src/wide.py", "start": 1, "end": 272},
+                     {"tool": "read", "path": "src/wide.py", "start": 200, "end": 272}, {"tool": "answer"}]
+        s.texts = ["Done."]
+        s.agent.turn("what is the last value?", can_edit=False)
+        results = [m["content"] for m in s.agent.messages if m["content"].startswith("Result of step")]
+        self.assertNotIn("already shown", results[1])
+        self.assertIn("value_272 =", results[1])
+
+    @needs_aider
+    def test_a_file_written_after_its_action_is_used(self):
+        s = self.s
+        create = {"tool": "create", "path": "src/new.py"}
+        s.actions = [create, create, {"tool": "answer"}, {"tool": "answer"}]
+        s.texts = ["Plan: create src/new.py.",
+                   '{"tool": "create", "path": "src/new.py"}\n```python\nX = 1\n```', "Created src/new.py."]
+        s.agent.turn("create src/new.py with X = 1", can_edit=True)
+        self.assertEqual((self.root / "src/new.py").read_text(), "X = 1\n")
+        self.assertFalse(any(r for _, r in s.prompts), "used as it came: no constrained second request")
 
     def test_a_change_request_never_opens_with_answer(self):
         s = self.s
@@ -357,6 +411,31 @@ class AgentLoop(Repo):
         self.assertEqual(asked, ["make deploy"])
         self.assertTrue(any("already" in m["content"] for m in s2.agent.messages))
 
+    def test_a_cd_into_a_folder_that_does_not_exist_is_not_asked_about(self):
+        s = self.s
+        asked = []
+        s.agent.hooks.confirm_run = lambda c: asked.append(c) or True
+        s.actions = [{"tool": "run", "command": "cd /testbed && python -m calc --help"},
+                     {"tool": "run", "command": "cd src && ls"}, {"tool": "answer"}]
+        s.texts = ["Done."]
+        s.agent.turn("check the cli", can_edit=False)
+        self.assertEqual(asked, ["cd src && ls"])  # the project's own folder is fine
+        self.assertTrue(any("there is no folder /testbed" in m["content"] and str(self.root) in m["content"]
+                            for m in s.agent.messages))
+
+    def test_a_command_cut_at_an_unescaped_quote_is_explained_not_run(self):
+        s = self.s
+        asked = []
+        s.agent.hooks.confirm_run = lambda c: asked.append(c) or True
+        cut = "python3 -c 'import re; p = re.compile(r"  # the model's bare " ended the JSON string here
+        s.actions = [{"tool": "run", "command": cut}, {"tool": "run", "command": "python3 -c 'print(\"ok\")'"},
+                     {"tool": "run", "command": "python3 - <<'EOF'\nprint(\"it's\")\nEOF"}, {"tool": "answer"}]
+        s.texts = ["Done."]
+        s.agent.turn("check the regex", can_edit=False)
+        self.assertEqual(len(asked), 2)  # the whole commands, and the heredoc with a lone apostrophe in it
+        self.assertNotIn(cut, asked)
+        self.assertTrue(any('as \\" (a backslash before it)' in m["content"] for m in s.agent.messages))
+
     def test_a_command_that_just_failed_is_not_run_again_unchanged(self):
         s = self.s
         ran = []
@@ -367,6 +446,30 @@ class AgentLoop(Repo):
         # Asked for twice in a row, it ran once; after another command worked, it may run again.
         self.assertEqual(ran, [bad["command"], "true", bad["command"]])
         self.assertTrue(any("already failed at step" in m["content"] for m in s.agent.messages))
+
+    def test_a_command_printing_the_same_thing_again_with_no_edit_is_a_repeat(self):
+        s = self.s
+        ran = []
+        s.agent.hooks.confirm_run = lambda c: ran.append(c) or True
+        grep = {"tool": "run", "command": "echo 'test_a FAILED'"}  # exits 0, like pytest piped into grep
+        s.actions = [dict(grep) for _ in range(12)] + [{"tool": "answer"}]
+        s.texts = ["Rethinking."] * 4 + ["Stuck."]
+        s.agent.turn("make the tests pass", can_edit=False)
+        self.assertLess(len(ran), 8)  # not until the steps run out
+        self.assertTrue(s.agent.stuck)
+        self.assertTrue(any("exactly what this command printed at step" in m["content"] for m in s.agent.messages))
+
+    def test_a_command_whose_output_changed_is_not_a_repeat(self):
+        s = self.s
+        out = self.root / "n"
+        out.write_text("0")
+        s.agent.hooks.confirm_run = lambda c: True
+        poll = {"tool": "run", "command": f"cat {out} && echo $(( $(cat {out}) + 1 )) > {out}"}
+        s.actions = [dict(poll) for _ in range(4)] + [{"tool": "answer"}]
+        s.texts = ["Done."]
+        s.agent.turn("wait for the counter", can_edit=False)
+        self.assertEqual(out.read_text().strip(), "4")
+        self.assertFalse(any("exactly what this command printed" in m["content"] for m in s.agent.messages))
 
     def test_nearly_the_same_web_search_is_answered_from_the_session(self):
         s = self.s
@@ -470,6 +573,26 @@ class AgentLoop(Repo):
         self.assertEqual([t for t, _ in s.steps].count("Taking stock"), 1)
         self.assertFalse(s.agent.stuck)
 
+    def test_runs_after_a_change_with_no_further_edit_take_stock(self):
+        s = self.s
+        s.agent.hooks.confirm_run = lambda c: True
+        create = {"tool": "create", "path": "src/new.py"}  # the first is where the plan comes in
+        s.actions = ([create, dict(create)] + [{"tool": "run", "command": f"echo {i}"} for i in range(12)]
+                     + [{"tool": "answer"}, {"tool": "answer"}])
+        s.texts = ["Plan: create src/new.py.", "```python\nLIMIT = 3\n```", "The tests fail at src/new.py:1.", "Done."]
+        s.agent.turn("create src/new.py with LIMIT = 3 and test it", can_edit=True)
+        titles, CHECK = [t for t, _ in s.steps], A.CHECK_EVERY - 1
+        self.assertEqual(titles.count("Taking stock"), 1)
+        self.assertGreater(titles.index("Taking stock"), titles.index("Create(src/new.py)") + CHECK)  # after a change
+
+    def test_a_plan_stands_for_the_stock_take_that_was_due(self):
+        s = self.s
+        s.actions = [{"tool": "grep", "pattern": f"x{i}"} for i in range(9)] + [{"tool": "plan"},
+                     {"tool": "grep", "pattern": "y"}, {"tool": "answer"}]
+        s.texts = ["Plan: look for y.", "Nothing found."]
+        s.agent.turn("where is it?", can_edit=True, wants_change=False)
+        self.assertNotIn("Taking stock", [t for t, _ in s.steps])
+
     def test_rethink_names_folders_not_looked_in(self):
         s = self.s
         (self.root / "docker").mkdir()
@@ -534,7 +657,25 @@ class AgentLoop(Repo):
         notes = [m["content"] for m in s.agent.messages if m["role"] == "user"]
         self.assertTrue(any("make the first change now" in n for n in notes))
         self.assertEqual(set(offered[3]), {"edit", "create", "run", "start"})  # the step after the second answer
-        self.assertIn("answer", offered[4])
+        # The edit was taken as the cue for a plan first: the step after the plan is still one of doing.
+        self.assertEqual([t for t, _ in s.steps][-1], "Plan")
+        self.assertEqual(set(offered[4]), {"edit", "create", "run", "start"})
+
+    def test_a_forced_change_that_plans_first_is_still_forced_after_the_plan(self):
+        s = self.s
+        offered = []
+        action = s.agent._action
+        s.agent._action = lambda tools: offered.append(tools) or action(tools)
+        create = {"tool": "create", "path": "src/digest.py"}
+        s.actions = [{"tool": "read", "path": "src/calc.py"}] + [{"tool": "grep", "pattern": f"x{i}"} for i in range(6)] + [
+            {"tool": "answer"}, {"tool": "answer"}, create, dict(create), {"tool": "answer"}]
+        s.texts = ["Plan: create src/digest.py.", "```python\nDIGEST = 10\n```", "Done."]
+        s.agent.turn("add a digest module", can_edit=True, wants_change=True)
+        titles = [t for t, _ in s.steps]
+        # Ten calls in at the plan: the stock-take was due, and the plan stood for it.
+        self.assertEqual(titles[-3:], ["Grep(x5)", "Plan", "Create(src/digest.py)"])
+        self.assertEqual(set(offered[10]), {"edit", "create", "run", "start"})  # the step after the plan
+        self.assertEqual((self.root / "src/digest.py").read_text(), "DIGEST = 10\n")
 
     def test_an_action_at_the_end_of_a_reply_is_not_shown(self):
         s = self.s
@@ -575,7 +716,6 @@ class FollowUps(Repo):
     """A message is read with what came before it: a confirmation, a reply that
     announced a change, a command that keeps failing the same way."""
 
-    BLOCK = "src/calc.py\n<<<<<<< SEARCH\nLIMIT = 3\n=======\nLIMIT = 4\n>>>>>>> REPLACE"
 
     @needs_aider
     def test_a_change_not_made_stays_owed_until_it_is_made(self):
@@ -747,711 +887,6 @@ class FollowUps(Repo):
         self.assertIn("Assistant's last reply: Want me to?", seen[0][1])
         self.assertFalse(R.announces_change("Let me fix that."), "no answer from the model: nothing is forced")
         self.assertEqual(seen[1][2], ("yes", "no"))
-
-
-class ConfirmedGaps(Repo):
-    """CHO-10: gaps that were checked against the code and closed."""
-
-    BLOCK = FollowUps.BLOCK
-
-    @needs_aider
-    def test_an_edit_to_a_file_that_changed_on_disk_is_refused_until_it_is_read_again(self):
-        s = self.s
-        calc = self.root / "src/calc.py"
-        read, edit = {"tool": "read", "path": "src/calc.py"}, {"tool": "edit", "path": "src/calc.py"}
-        texts = []
-
-        def someone_else_saves(tools):  # the user's editor, between the read and the edit
-            act = dict(actions.pop(0)) if actions else {"tool": "answer"}
-            if act["tool"] == "edit" and not texts:
-                calc.write_text(calc.read_text() + "\n# added by the user\n")
-                texts.append("saved")
-            return act if act["tool"] in tools else {"tool": "answer"}
-
-        actions = [dict(read), dict(edit), dict(read), dict(edit), {"tool": "answer"}, {"tool": "answer"}]
-        s.agent._action = someone_else_saves
-        s.texts = [self.BLOCK, "LIMIT is now 4 (not verified)."]
-        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
-        refused = [m["content"] for m in s.agent.messages if "has changed on disk since you read it" in m["content"]]
-        self.assertEqual(len(refused), 1)
-        self.assertIn("Nothing was changed", refused[0])
-        text = calc.read_text()
-        self.assertIn("LIMIT = 4", text, "after the read it asked for, the edit went in")
-        self.assertIn("# added by the user", text, "and the user's line is still there")
-        # Its own edit doesn't count as a change by someone else: a second edit needs no new read.
-        s.agent._action = Scripted(str(self.root)).agent._action  # (unused; the next turn scripts its own)
-        s2 = Scripted(str(self.root))
-        s2.actions = [dict(read), dict(edit), dict(edit), {"tool": "answer"}, {"tool": "answer"}]
-        s2.texts = [self.BLOCK.replace("LIMIT = 3", "LIMIT = 4").replace("=======\nLIMIT = 4", "=======\nLIMIT = 5"),
-                    self.BLOCK.replace("LIMIT = 3", "LIMIT = 5").replace("=======\nLIMIT = 4", "=======\nLIMIT = 6"), "Done."]
-        s2.agent.turn("make the limit 6 in src/calc.py", can_edit=True)
-        self.assertIn("LIMIT = 6", calc.read_text())
-        self.assertFalse(any("changed on disk" in m["content"] for m in s2.agent.messages))
-
-    def test_replacing_a_whole_file_that_changed_on_disk_is_refused_too(self):
-        s = self.s
-        calc = self.root / "src/calc.py"
-        s.agent.ws.read("src/calc.py", None, None)
-        calc.write_text("LIMIT = 99\n")
-        with self.assertRaises(A.ToolError) as e:
-            s.agent.ws.check_current(calc)
-        self.assertIn("Read it again", str(e.exception))
-        s.agent.ws.read("src/calc.py", None, None)
-        s.agent.ws.check_current(calc)  # read again: fine
-        s.agent.ws.check_current(self.root / "src/other.py")  # never read: nothing to compare with
-
-    def test_the_question_knows_a_command_will_be_left_running(self):
-        s = self.s
-        asked = []
-        s.agent.hooks.confirm_run = lambda c: asked.append((s.agent.asking, c)) or False
-        s.actions = [{"tool": "start", "command": "npm run dev"}, {"tool": "run", "command": "npm test"}]
-        s.agent.turn("start the dev server and run the tests", can_edit=False)
-        self.assertEqual(asked, [("start", "npm run dev"), ("run", "npm test")])
-
-    def test_a_plan_right_after_a_plan_is_refused(self):
-        s = self.s
-        s.actions = [{"tool": "plan"}, {"tool": "plan"}, {"tool": "read", "path": "src/calc.py"}, {"tool": "plan"}]
-        s.texts = ["Plan A.", "Plan B.", "It is 3."]
-        s.agent.turn("what is the limit, and why?", can_edit=False)
-        self.assertEqual([t for t, _ in s.steps if t == "Plan"], ["Plan", "Plan"], "the second in a row wrote nothing")
-        self.assertEqual([d for t, d in s.steps if t == "Plan"], ["Plan A.", "Plan B."], "one after a lookup is fine")
-        self.assertTrue(any("You just wrote a plan" in m["content"] for m in s.agent.messages))
-
-    def test_a_plan_cut_at_its_limit_ends_on_a_whole_sentence(self):
-        cut = "1. Add the state to App.jsx.\n2. Add the dropdown next to the search box.\n3. Sort the stories before rende"
-        self.assertEqual(A.whole_sentences(cut, 30), "1. Add the state to App.jsx.\n2. Add the dropdown next to the search box. …")
-        self.assertEqual(A.whole_sentences(cut, 350), cut, "nowhere near the limit: it ended by itself")
-        whole = "1. Add the state.\n2. Add the dropdown."
-        self.assertEqual(A.whole_sentences(whole, 5), whole)
-        self.assertEqual(A.whole_sentences("x" * 200, 30), "x" * 200, "nothing sensible to cut back to")
-        # A request with several parts gets a longer plan.
-        s = self.s
-        asked = []
-        text = s.agent._text_once
-        s.agent._text_once = lambda max_tokens, stream, temperature=None, regex=None: asked.append(max_tokens) or text(max_tokens, stream, temperature, regex)
-        s.actions = [{"tool": "plan"}]
-        s.agent.turn("1. add a sort dropdown 2. add a footer 3. make the banner blue", can_edit=False)
-        self.assertEqual(asked[0], A.PLAN_TOKENS_LONG)
-
-    def test_a_search_step_says_how_many_results_came_back(self):
-        res = ("Web results (untrusted reference text):\n- HN Search API: fields include created_at (https://hn.algolia.com/api)\n"
-               "- Algolia docs: search parameters (https://www.algolia.com/doc)")
-        self.assertEqual(A._summary("web_search", res), "2 results: HN Search API …")
-        self.assertEqual(A._summary("web_search", "Web results (untrusted reference text):\n- Only one: x (https://a)"), "1 result: Only one")
-        self.assertEqual(A._summary("web_search", "No results."), "No results.")
-        again = '(Not searched again: this is nearly your earlier search "x", and the same pages would come back. Its results:)\n' + res
-        self.assertIn("2 results (from your earlier search, not searched again)", A._summary("web_search", again))
-        self.assertTrue(A._summary("web_search", "Error: the search engines are refusing requests").startswith("Error:"))
-
-
-class EditText(Repo):
-    """What comes back when the text of an edit is asked for, and isn't one."""
-
-    BLOCK = FollowUps.BLOCK
-    LOOK = ('Now I need to change the limit. Let me read the current state of the file first.\n\n'
-            '{"enough": false, "missing": "the current lines", "tool": "read", "path": "src/calc.py", "start": 1, "end": 5}')
-
-    @needs_aider
-    def test_let_me_read_first_is_the_read_not_a_failed_edit(self):
-        s = self.s
-        edit = {"tool": "edit", "path": "src/calc.py"}
-        s.actions = [{"tool": "read", "path": "src/calc.py"}, edit, edit, {"tool": "answer"}, {"tool": "answer"}]
-        s.texts = [self.LOOK, self.BLOCK, "LIMIT is now 4 (not verified)."]
-        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
-        results = [m["content"] for m in s.agent.messages if m["content"].startswith("Result of step") and "(edit)" in m["content"][:30]]
-        self.assertIn("Not edited yet", results[0])
-        self.assertIn("src/calc.py lines 1-", results[0], "the lines it asked for came back in the same step")
-        self.assertNotIn("Error", results[0])
-        self.assertFalse(any("no SEARCH/REPLACE block" in m["content"] for m in s.agent.messages))
-        self.assertIn(("Update(src/calc.py)", "Not edited yet: it looked at that first"), s.steps)
-        self.assertIn("LIMIT = 4", (self.root / "src/calc.py").read_text(), "and the next edit went in")
-        self.assertNotIn("An edit you tried was refused", s.prompts[-1][0])
-        self.assertEqual(s.agent.changed_session, ["src/calc.py"])
-
-    @needs_aider
-    def test_looking_first_is_not_a_change(self):
-        s = self.s
-        s.actions = [{"tool": "read", "path": "src/calc.py"}, {"tool": "edit", "path": "src/calc.py"}, {"tool": "answer"},
-                     {"tool": "answer"}, {"tool": "answer"}]
-        s.texts = [self.LOOK, "Nothing was changed."]
-        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
-        self.assertEqual(s.agent.changed_session, [])
-        self.assertIn("Files you changed in this request: none", s.prompts[-1][0])
-        self.assertTrue(s.agent.pending, "the change is still owed")
-
-    @needs_aider
-    def test_other_text_without_a_block_is_still_an_error(self):
-        s = self.s
-        s.actions = [{"tool": "read", "path": "src/calc.py"}, {"tool": "edit", "path": "src/calc.py"}]
-        s.texts = ['I will change it.\n{"enough": true, "tool": "answer"}']  # not a lookup: nothing to run instead
-        s.agent.turn("make the limit 4 in src/calc.py", can_edit=True)
-        self.assertTrue(any("no SEARCH/REPLACE block" in m["content"] for m in s.agent.messages))
-
-    def test_a_new_file_is_never_a_sentence_and_an_action(self):
-        s = self.s
-        look = 'Let me check the folder first.\n{"enough": false, "missing": "what is there", "tool": "list", "path": "src"}'
-        s.actions = [{"tool": "create", "path": "src/new.py"}] * 4  # the first one is answered with a plan
-        s.texts = ["Plan: create src/new.py.", look, 'I am done.\n{"enough": true, "tool": "answer"}', "```python\nX = 1\n```"]
-        s.agent.turn("create src/new.py with X = 1", can_edit=True)
-        results = [m["content"] for m in s.agent.messages if m["content"].startswith("Result of step") and "(create)" in m["content"][:32]]
-        self.assertIn("Not edited yet", results[0])
-        self.assertIn("calc.py", results[0], "the listing it asked for")
-        self.assertIn("not the file's content", results[1])
-        self.assertEqual((self.root / "src/new.py").read_text(), "X = 1\n", "only the real content was written")
-        self.assertIsNone(A.misplaced_lookup("src/calc.py\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE"))
-        self.assertIsNone(A.misplaced_lookup('{"x": 1}'))
-
-
-@unittest.skipUnless(HAVE_RICH, "needs rich (run with the oppx engine's Python)")
-class TypeAhead(unittest.TestCase):
-    """What is typed while a turn runs: kept, queued on Enter, and shown on the spinner's line."""
-
-    def setUp(self):
-        from oppx_chat import term
-        self.T = term
-        term.UI.queued, term.UI.prefill, term.UI.unannounced = [], "", []
-
-    tearDown = setUp
-
-    def test_typing_is_kept_and_enter_queues_it(self):
-        T = self.T
-        w = T.EscWatcher()
-        w._typed("fix the tpyo")
-        self.assertEqual(T.UI.prefill, "fix the tpyo")
-        w._typed("\x17typo\x7f\x7fpo too\r")  # Ctrl-W, two backspaces, Enter
-        self.assertEqual((T.UI.queued, T.UI.prefill), (["fix the typo too"], ""))
-        self.assertEqual(T.UI.unannounced, ["fix the typo too"], "to be shown as queued")
-        w._typed("\r  \r")  # an empty line queues nothing
-        self.assertEqual(len(T.UI.queued), 1)
-        w._typed("half a tho\x15and then")  # Ctrl-U
-        self.assertEqual(T.UI.prefill, "and then", "left for the next prompt")
-        # A character cut in two by the read is not lost.
-        euro = "€".encode()
-        self.assertEqual(w._decode(euro[:1]) + w._decode(euro[1:]), "€")
-
-    def test_the_spinner_line_shows_it_and_never_wraps(self):
-        T = self.T
-        base = "(12s · esc to interrupt"
-        self.assertEqual(T.ahead(base, "", 0, 100), (base + " · type to queue a message)", ""))
-        self.assertEqual(T.ahead(base, "also add a footer", 0, 100), (base + ")", "also add a footer"))
-        self.assertEqual(T.ahead(base, "", 2, 100), (base + " · 2 queued)", ""))
-        for width in (120, 80, 60, 40, 20, 8):
-            for typed in ("", "x" * 300, "宽字符" * 40):
-                status, shown = T.ahead(base, typed, 3, width)
-                used = T.cell_len(status) + (T.cell_len(shown) + 5 if shown else 0)
-                self.assertLessEqual(used, max(width - 2, 1), (width, typed[:5]))
-        status, shown = T.ahead(base, "the end is what matters", 0, 50)
-        self.assertTrue(shown.startswith("…") and shown.endswith("matters"), "the end of the line is what is being typed")
-
-
-class Tools(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
-        (root / "src").mkdir()
-        (root / "docs").mkdir()
-        (root / "src/server.rs").write_text("pub const LIMIT: u32 = 3;\n\npub fn start_server(port: u16) -> u16 {\n    port\n}\n\nstruct Preflight;\n")
-        (root / "src/main.py").write_text("def startServer():\n    pass\n\nclass Thing:\n    def limit(self):\n        return 3\n")
-        (root / "docs/guide.md").write_text("start_server starts the server\n" * 50)
-        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-        subprocess.run(["git", "add", "."], cwd=root, check=True)
-        self.ws = A.Workspace(str(root))
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_grep_shows_code_before_docs_and_stays_small(self):
-        out = self.ws.grep("start_server")
-        self.assertTrue(out.startswith("51 matches in 2 files"))
-        self.assertLess(out.index("src/server.rs"), out.index("docs/guide.md"))
-        self.assertLess(len(out), 1200)
-        self.assertIn("more in this file", out)
-
-    def test_find_matches_any_spelling(self):
-        for query in ("start server", "startServer", "start_server", "START_SERVER"):
-            out = self.ws.find(query)
-            self.assertIn("src/server.rs:3", out, query)
-            self.assertIn("src/main.py:1", out, query)
-        self.assertIn("src/server.rs:7", self.ws.find("preflight"))
-        self.assertIn("No definition or file", self.ws.find("frobnicate widget"))
-        self.assertIn("src/server.rs", self.ws.find("server"))  # file names too
-
-    def test_a_wrong_path_names_the_right_one(self):
-        with self.assertRaises(A.ToolError) as e:
-            self.ws.read("server.rs", 1, 5)
-        self.assertIn("did you mean: src/server.rs", str(e.exception))
-
-    def test_related_definitions_and_matches_elsewhere(self):
-        root = Path(self.tmp.name)
-        (root / "docker").mkdir()
-        (root / "docker/gateway.py").write_text("PAIRING_TTL_S = 600\n\n\ndef validate_name(n):\n    return n\n")
-        subprocess.run(["git", "add", "."], cwd=root, check=True)
-        ws = A.Workspace(str(root))
-        related = ws.related("Pairing codes should stay valid for 15 minutes")
-        self.assertIn("docker/gateway.py:1: PAIRING_TTL_S = 600", related)
-        self.assertNotIn("validate_name", related)  # "valid" is not a part of that name
-        self.assertEqual(ws.related("what is this?"), "")
-        out = ws.grep("PAIRING_TTL", "src")
-        self.assertIn("No matches", out)
-        self.assertIn("Outside src: docker/gateway.py (1)", out)
-
-    def test_dot_folders_can_be_opened(self):
-        root = Path(self.tmp.name)
-        (root / ".github").mkdir()
-        (root / ".github/ci.yml").write_text("name: ci\n")
-        for path in (".github/ci.yml", "./.github/ci.yml", "/.github/ci.yml"):
-            self.assertIn("name: ci", self.ws.read(path, 1, 5), path)
-        self.assertIn("src/server.rs", self.ws.list("./src"))
-        self.assertIn("src/server.rs", self.ws.list("."))
-        with self.assertRaises(A.ToolError):
-            self.ws.read(".git/config", 1, 5)
-
-    def test_each_tool_has_its_own_schema(self):
-        schema = A.action_schema(("grep", "read", "answer"))
-        by_tool = {b["properties"]["tool"]["enum"][0]: b for b in schema["anyOf"]}
-        self.assertNotIn("end", by_tool["grep"]["properties"])
-        self.assertIn("pattern", by_tool["grep"]["required"])
-        self.assertEqual(set(A.TOOLS), set(A.TOOL_FIELDS))
-        json.dumps(schema)
-
-    def test_reply_checks(self):
-        self.assertIsNotNone(A.as_action('{"tool": "answer", "why": "x"}'))
-        self.assertIsNotNone(A.as_action('```json\n{"why": "x", "tool": "grep", "pattern": "a"}\n```'))
-        self.assertIsNotNone(A.as_action("{}"))
-        self.assertIsNotNone(A.as_action('{"enough": false, "missing": "cut off mid'))
-        self.assertIsNone(A.as_action('{"name": "demo"}'))
-        self.assertIsNone(A.as_action("The answer is {x}."))
-        self.assertTrue(A.maybe_json("  {"))
-        self.assertTrue(A.maybe_json("```json"))
-        self.assertFalse(A.maybe_json("```rust\nfn main() {}"))
-        self.assertFalse(A.maybe_json("It is"))
-
-
-def make_pdf(pages: list[str]) -> bytes:
-    """A small PDF, one line of text per page ("" for a page without text)."""
-    objs = ["<< /Type /Catalog /Pages 2 0 R >>", None,
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
-    kids = []
-    for text in pages:
-        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET" if text else ""
-        objs.append(f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream")
-        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {len(objs)} 0 R "
-                    "/Resources << /Font << /F1 3 0 R >> >> >>")
-        kids.append(f"{len(objs)} 0 R")
-    objs[1] = f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {len(kids)} >>"
-    out, offsets = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n", []
-    for i, o in enumerate(objs, 1):
-        offsets.append(len(out))
-        out += f"{i} 0 obj\n{o}\nendobj\n".encode()
-    xref = len(out)
-    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
-    out += "".join(f"{o:010d} 00000 n \n" for o in offsets).encode()
-    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
-    return out
-
-
-class Pdfs(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
-        (root / "docs").mkdir()
-        (root / "docs/spec.pdf").write_bytes(make_pdf(["Pairing codes expire after ten minutes", "", "Tokens last ninety days"]))
-        (root / "scan.pdf").write_bytes(make_pdf(["", ""]))
-        (root / "notes.md").write_text("tokens are revoked on unpair\n")
-        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-        subprocess.run(["git", "add", "."], cwd=root, check=True)
-        self.ws = A.Workspace(str(root))
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_read_gives_the_text_page_by_page(self):
-        out = self.ws.read("docs/spec.pdf", None, None)
-        self.assertIn("--- page 1 of 3 ---", out)
-        self.assertIn("Pairing codes expire after ten minutes", out)
-        self.assertIn("(no text on this page)", out)
-        self.assertIn("Tokens last ninety days", out)
-
-    def test_outline_lists_the_pages(self):
-        out = self.ws.outline("docs/spec.pdf")
-        self.assertIn("PDF, 3 pages", out)
-        self.assertIn("--- page 3 of 3 --- Tokens last ninety days", out)
-
-    def test_grep_searches_pdfs_with_text_files(self):
-        out = self.ws.grep("[Tt]okens")
-        self.assertIn("docs/spec.pdf (1)", out)
-        self.assertIn("notes.md (1)", out)
-        self.assertIn("No matches", self.ws.grep("ninety", "notes.md"))
-
-    def test_a_pdf_is_not_edited_as_text(self):
-        with self.assertRaises(A.ToolError) as e:
-            A.apply_edit(self.ws, "docs/spec.pdf", "x")
-        self.assertIn("can't be edited as text. To change it, create it again in full", str(e.exception))
-
-    def test_a_scan_is_seen_as_pictures_or_says_why_not(self):
-        try:
-            import pypdf  # noqa: F401 - installed with the engine
-        except ImportError:
-            self.skipTest("pypdf isn't installed")
-        from PIL import Image
-        root = Path(self.tmp.name)
-        scan = root / "scanned.pdf"
-        Image.new("RGB", (400, 500), "white").save(scan, "PDF")  # a page that is one picture
-        old = A.VISION
-        try:
-            A.VISION = False
-            with self.assertRaises(A.ToolError) as e:
-                self.ws.read("scanned.pdf", None, None)
-            self.assertIn("can't see pictures", str(e.exception))
-            A.VISION = True
-            out = self.ws.read("scanned.pdf", None, None)
-            self.assertIn("PDF of 1 pages without text", out)
-            self.assertEqual(len(self.ws.take_images()), 1)
-        finally:
-            A.VISION = old
-
-
-MARKDOWN = """# Quarterly report
-
-Revenue grew **12%** to *$4.2M* in Q3, see `report.py`.
-
-## Highlights
-
-- New customers: 41
-- Churn fell
-  - mostly in retail
-1. First step
-2. Second step
-
-| Region | Revenue | Growth |
-|---|---|---|
-| North | 1.9 | 14% |
-| South | 2.3 | 10% |
-
-```
-total = north + south
-```
-
-Café prices in € rose — slightly.
-"""
-
-
-class Documents(unittest.TestCase):
-    """Every format the agent makes is read back by what it reads with."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def made(self, name: str, source: str) -> str:
-        p = self.root / name
-        from oppx_chat import documents, writers
-        writers.write(p, source)
-        return documents.text(p)
-
-    def test_text_documents_round_trip(self):
-        formats = [".docx", ".odt", ".rtf", ".epub"]
-        try:
-            import fpdf  # noqa: F401 - installed with the engine
-            formats.append(".pdf")
-        except ImportError:
-            pass
-        for ext in formats:
-            with self.subTest(ext):
-                text = self.made("report" + ext, MARKDOWN)
-                for want in ("Quarterly report", "Revenue grew 12%", "New customers: 41", "mostly in retail",
-                             "Second step", "North", "2.3", "total = north + south", "Café prices in € rose — slightly"):
-                    self.assertIn(want, text, f"{ext}: {want!r} in {text!r}")
-
-    def test_headings_and_tables_keep_their_shape(self):
-        for ext in (".docx", ".odt"):
-            text = self.made("r" + ext, MARKDOWN)
-            self.assertIn("# Quarterly report", text, ext)
-            self.assertIn("## Highlights", text, ext)
-            self.assertIn("| North | 1.9 | 14% |", text, ext)
-
-    def test_a_workbook_round_trips_with_sheets_numbers_and_formulas(self):
-        from oppx_chat import documents
-        source = "--- sheet Sales ---\nRegion,Q1,Q2\nNorth,10,12.5\nSouth,\"7,5\",3\nTotal,=SUM(B2:B3),=SUM(C2:C3)\n--- sheet Notes ---\nok,TRUE\n"
-        text = self.made("book.xlsx", source)
-        self.assertIn("--- sheet 1 of 2: Sales (4 rows, 3 columns) ---", text)
-        self.assertIn('South,"7,5",3', text)
-        self.assertIn("Total,=SUM(B2:B3),=SUM(C2:C3)", text)  # never calculated: the formula shows
-        self.assertIn("--- sheet 2 of 2: Notes (1 rows, 2 columns) ---", text)
-        self.assertIn("ok,TRUE", text)
-        import zipfile
-        sheet = zipfile.ZipFile(self.root / "book.xlsx").read("xl/worksheets/sheet1.xml").decode()
-        self.assertIn('<c r="B2"><v>10</v></c>', sheet)  # a number, not text
-        self.assertIn("<f>SUM(B2:B3)</f>", sheet)
-        # What read showed can be written back as it is.
-        again = self.made("again.xlsx", documents.text(self.root / "book.xlsx"))
-        self.assertIn("--- sheet 1 of 2: Sales (4 rows, 3 columns) ---", again)
-
-    def test_pictures_are_drawn_from_svg_and_seen(self):
-        try:
-            import resvg_py  # noqa: F401 - installed with the engine
-        except ImportError:
-            self.skipTest("resvg-py isn't installed")
-        from PIL import Image
-        from oppx_chat import writers, documents
-        svg = '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80"><rect width="120" height="80" fill="#3366cc"/></svg>'
-        for ext, fmt in ((".png", "PNG"), (".jpg", "JPEG"), (".webp", "WEBP"), (".gif", "GIF")):
-            p = self.root / ("chart" + ext)
-            writers.write(p, svg)
-            with Image.open(p) as im:
-                self.assertEqual((im.format, im.size), (fmt, (120, 80)), ext)
-            url, w, h, tokens = documents.picture(p)
-            self.assertTrue(url.startswith("data:image/jpeg;base64,") and (w, h) == (120, 80))
-        with self.assertRaises(writers.WriteError):
-            writers.write(self.root / "x.png", "not svg")
-
-    def test_a_gif_shows_its_first_frame(self):
-        from PIL import Image
-        from oppx_chat import documents
-        frames = [Image.new("RGB", (50, 50), c) for c in ("red", "blue")]
-        frames[0].save(self.root / "anim.gif", save_all=True, append_images=frames[1:])
-        url, *_ = documents.picture(self.root / "anim.gif")
-        import base64, io
-        im = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
-        r, g, b = im.getpixel((25, 25))
-        self.assertGreater(r, 200)
-        self.assertLess(b, 60)
-
-    def test_a_picture_is_attached_only_for_a_model_that_sees(self):
-        from PIL import Image
-        Image.new("RGB", (2000, 1000), "white").save(self.root / "shot.png")
-        ws = A.Workspace(str(self.root))
-        old = A.VISION
-        try:
-            A.VISION = False
-            with self.assertRaises(A.ToolError) as e:
-                ws.read("shot.png", None, None)
-            self.assertIn("can't see pictures", str(e.exception))
-            A.VISION = True
-            self.assertIn("1280x640 pixels, attached", ws.read("shot.png", None, None))
-            images = ws.take_images()
-            self.assertEqual(len(images), 1)
-            self.assertEqual(ws.take_images(), [])
-            # The request carries it as an image part, while the message isn't cut.
-            ag = A.Agent(ws=ws, hooks=A.Hooks())
-            ag.messages = [{"role": "user", "_result": True, "content": "Result of step 1 (read)", "_images": images}]
-            parts = ag._clean()[0]["content"]
-            self.assertEqual([p["type"] for p in parts], ["text", "image_url"])
-            self.assertGreater(ag._estimate(), images[0]["tokens"])
-            ag.messages[0]["_cut"] = True
-            self.assertIsInstance(ag._clean()[0]["content"], str)
-        finally:
-            A.VISION = old
-
-    def test_only_the_newest_pictures_fit_one_request(self):
-        ws = A.Workspace(str(self.root))
-        ag = A.Agent(ws=ws, hooks=A.Hooks())
-        big = "data:image/jpeg;base64," + "A" * (A.IMAGE_BYTES // 2 + 10)
-        ag.messages = [{"role": "user", "_result": True, "content": f"r{i}", "_images": [{"url": big, "tokens": 100}]} for i in range(3)]
-        sent = ag._clean()
-        self.assertIn("no longer attached", json.dumps(sent[0]))
-        self.assertEqual(sum(1 for m in sent for p in (m["content"] if isinstance(m["content"], list) else [])
-                             if p.get("type") == "image_url"), 1)
-        self.assertNotIn("no longer attached", json.dumps(sent[2]))
-
-    def test_videos_are_refused_both_ways(self):
-        (self.root / "demo.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
-        ws = A.Workspace(str(self.root))
-        with self.assertRaises(A.ToolError) as e:
-            ws.read("demo.mp4", None, None)
-        self.assertIn("is a video, and videos can't be read", str(e.exception))
-        ag = A.Agent(ws=ws, hooks=A.Hooks())
-        with self.assertRaises(A.ToolError) as e:
-            ag._create("clip.mov")
-        self.assertIn("videos can't be made", str(e.exception))
-
-    def test_presentations_are_refused_both_ways(self):
-        (self.root / "pitch.pptx").write_bytes(b"PK\x03\x04")
-        ws = A.Workspace(str(self.root))
-        with self.assertRaises(A.ToolError) as e:
-            ws.read("pitch.pptx", None, None)
-        self.assertIn("is a presentation, and presentations can't be read", str(e.exception))
-        with self.assertRaises(A.ToolError) as e:
-            A.apply_edit(ws, "pitch.pptx", "x")
-        self.assertIn("is a presentation: it can't be edited as text", str(e.exception))
-        ag = A.Agent(ws=ws, hooks=A.Hooks())
-        for name in ("deck.ppt", "deck.key", "slides.odp"):
-            with self.assertRaises(A.ToolError) as e:
-                ag._create(name)
-            self.assertIn("presentations can't be made", str(e.exception))
-
-    def test_a_turn_starts_from_the_documents_it_is_about(self):
-        from oppx_chat import writers
-        (self.root / "docs").mkdir()
-        writers.write(self.root / "docs/travel-policy.docx", "# Travel\n\nHotels: $210.")
-        (self.root / "shots").mkdir()
-        (self.root / "shots/home.png").write_bytes(b"")
-        (self.root / "app.py").write_text("x = 1\n")
-        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True)
-        ag = A.Agent(ws=A.Workspace(str(self.root)), hooks=A.Hooks())
-        self.assertEqual(ag._documents_for("What does the travel policy say about hotels?"), ["docs/travel-policy.docx"])
-        self.assertEqual(ag._documents_for("What is wrong in the screenshot?"), ["shots/home.png"])
-        self.assertEqual(ag._documents_for("Rename x to count"), [])
-        # A file named without its folder is opened when only one file has that name.
-        self.assertEqual(ag._named_files("what is in travel-policy.docx?"), ["docs/travel-policy.docx"])
-        made = ag._documents_to_make("Create summary.docx and a chart.png, then update app.py")
-        self.assertIn("summary.docx: use create on summary.docx itself; you write Markdown and it becomes the Word document", made)
-        self.assertIn("chart.png: use create on chart.png itself; you write SVG and it becomes the PNG picture", made)
-        self.assertNotIn("app.py", made)
-        self.assertEqual(ag._documents_to_make("Fix the bug in app.py"), "")
-
-    def test_what_the_model_cant_take_is_stopped_before_sending(self):
-        from oppx_chat import documents
-        pic, clip, deck, doc = (self.root / n for n in ("shot.png", "demo.mp4", "pitch.pptx", "notes.docx"))
-        self.assertIn("can't see pictures", documents.blocked(pic, False, "Qwen2.5-Coder-14B"))
-        self.assertIsNone(documents.blocked(pic, True, "m"))
-        self.assertIn("videos aren't supported", documents.blocked(clip, True, "m"))
-        self.assertIn("presentations aren't supported", documents.blocked(deck, True, "m"))
-        self.assertIsNone(documents.blocked(doc, False, "m"))
-        try:
-            from oppx_chat import commands
-        except ImportError:
-            self.skipTest("the chat's commands need Aider")
-        from oppx_chat import term
-        for n in ("shot.png", "notes.md"):
-            (self.root / n).write_bytes(b"x")
-        added, said = [], []
-
-        class Coder:
-            root = str(self.root)
-
-            class commands:  # noqa: N801 - stands in for Aider's
-                cmd_add = staticmethod(added.append)
-        old_step, old_vision = commands.step, A.VISION
-        commands.step = lambda text, *a: said.append(text)
-        try:
-            A.VISION = False
-            self.assertIsNone(commands.translate(Coder, "what is in @shot.png and @notes.md?"))
-            self.assertEqual(added, [])  # nothing added, nothing sent
-            self.assertTrue(any("can't see pictures" in t for t in said))
-            self.assertEqual(commands.translate(Coder, "/add shot.png notes.md"), "/add notes.md")
-            self.assertIsNone(commands.translate(Coder, "/add shot.png"))
-            A.VISION = True
-            self.assertEqual(commands.translate(Coder, "what is in @shot.png?"), "what is in shot.png?")
-            self.assertEqual(added, ["shot.png"])
-        finally:
-            commands.step, A.VISION = old_step, old_vision
-        del term
-
-    def test_sheet_lines(self):
-        from oppx_chat import writers
-        for line, name in (("--- sheet Sales ---", "Sales"), ("--- sheet 1 of 2: Sales (4 rows, 3 columns) ---", "Sales"),
-                           ("--- SHEET   Notes ---", "Notes"), ("--- sheet ---", ""), ("---sheet x---", "x"),
-                           ("a,b", None), ("--- other ---", None), ("--- sheets ---", None)):
-            self.assertEqual(writers.sheet_name(line), name, line)
-
-    def test_rtf_reader_handles_unicode_and_skips_tables_of_fonts(self):
-        from oppx_chat import documents
-        rtf = rb"{\rtf1\ansi\ansicpg1252{\fonttbl{\f0 Arial;}}{\*\generator Word;}Caf\'e9 \u8364? 5\par Second\tab line}"
-        self.assertEqual(documents.rtf_text(rtf), "Café € 5\nSecond\tline")
-
-
-class SymbolIndex(Repo):
-    def test_built_once_while_warming(self):
-        import threading
-        ws = A.Workspace(str(self.root))
-        builds = []
-        real = ws._build_symbols
-
-        def slow():
-            builds.append(1)
-            time.sleep(0.2)
-            return real()
-        ws._build_symbols = slow
-        ws.warm()
-        time.sleep(0.05)  # the warm-up is building
-        results = []
-        callers = [threading.Thread(target=lambda: results.append(ws.symbols())) for _ in range(3)]
-        for t in callers:
-            t.start()
-        for t in callers:
-            t.join()
-        self.assertEqual(len(builds), 1)  # the callers waited for it instead of building again
-        self.assertTrue(all(r is results[0] for r in results))
-        self.assertIn("add", {name for name, *_ in results[0]})
-
-
-class LinearHelpers(unittest.TestCase):
-    """String code that replaced regexes which backtracked (scripts/check_regexes.py)."""
-
-    def test_action_tail(self):
-        for text, kept in (('Plan:\n1. do x\n\n{"tool": "read", "path": "a"}', "Plan:\n1. do x"),
-                           ('Plan\n```json\n{"enough": true}\n```', "Plan"), ("no action here", "no action here"),
-                           ('Text\n\n\n  {"missing": "x"}', "Text")):
-            self.assertEqual(A.cut_action_tail(text), kept)
-
-    def test_outer_braces_and_fences(self):
-        self.assertEqual(A._outer_braces('x {"a": {"b": 1}} y'), '{"a": {"b": 1}}')
-        self.assertIsNone(A._outer_braces("} {"))
-        self.assertEqual(A._fenced("a\n```py\nx\ny\n```\nb"), "x\ny\n")
-        self.assertIsNone(A._fenced("```py\nunclosed"))
-        self.assertIsNone(A._fenced("no fence"))
-        long = "{" * 200_000  # quadratic before: seconds; now one pass
-        t = time.monotonic()
-        self.assertIsNone(A._outer_braces(long))
-        self.assertIsNone(A._fenced("```" * 100_000))
-        self.assertLess(time.monotonic() - t, 0.5)
-
-
-class Commands(unittest.TestCase):
-    """run and start: no terminal input, nothing left behind."""
-
-    def setUp(self):
-        self.ws = A.Workspace(tempfile.mkdtemp())
-        self.addCleanup(self.ws.stop_jobs)
-
-    def test_run_has_no_terminal_input(self):
-        # `read` returns at once on an empty stdin instead of waiting for a key.
-        out = self.ws.run("read x; echo got=$x; echo err >&2")
-        self.assertTrue(out.startswith("exit code 0"), out)
-        self.assertIn("got=", out)
-        self.assertIn("err", out)
-
-    def test_timeout_keeps_output_and_stops_children(self):
-        old, A.RUN_TIMEOUT = A.RUN_TIMEOUT, 1
-        self.addCleanup(setattr, A, "RUN_TIMEOUT", old)
-        out = self.ws.run("echo asking; sleep 31 & echo $! > child.pid; wait")
-        self.assertIn("Timed out", out)
-        self.assertIn("asking", out)
-        self.assertIn("start tool", out)
-        pid = int((self.ws.root / "child.pid").read_text())
-        time.sleep(0.2)
-        self.assertFalse(os.path.exists(f"/proc/{pid}"), "the command's child outlived the timeout")
-
-    def test_start_leaves_it_running_and_shows_output(self):
-        cmd = "echo ready on 5173; sleep 30"
-        out = self.ws.start(cmd)
-        self.assertIn("left running", out)
-        self.assertIn("ready on 5173", out)
-        pid = self.ws.jobs[cmd]["proc"].pid
-        again = self.ws.start(cmd)
-        self.assertIn("Still running", again)
-        self.assertNotIn("ready on 5173", again)  # only what is new
-        self.assertEqual(self.ws.jobs[cmd]["proc"].pid, pid)
-        self.ws.stop_jobs()
-        self.assertFalse(self.ws.jobs)
-        time.sleep(0.2)
-        self.assertFalse(os.path.exists(f"/proc/{pid}"))
-
-    def test_start_reports_a_command_that_ends(self):
-        out = self.ws.start("echo no such script; exit 3")
-        self.assertIn("exit code 3", out)
-        self.assertIn("no such script", out)
-        self.assertFalse(self.ws.jobs)
-
-    def test_start_is_an_action(self):
-        schema = json.dumps(A.action_schema(A.TOOLS))
-        self.assertIn('"start"', schema)
-        self.assertEqual(A._title({"tool": "start", "command": "npm run dev"}), "Start(npm run dev)")
 
 
 if __name__ == "__main__":

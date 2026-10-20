@@ -23,7 +23,7 @@ from .render import BulletStream, _bullet, hide_reasoning, show_diff, show_edits
 from .mcp import Hub
 from . import browser
 from .agent import Agent, Hooks, Workspace
-from . import agent as agent_module, documents
+from . import documents, workspace
 from .permissions import Permissions
 from .routing import announces_change, wants_edit
 from .context import CONTEXT_MGR, PRI_EDITED, _check_tokens, _fitted_format_messages
@@ -254,6 +254,11 @@ def make_agent(coder) -> Agent:
         if verdict == "refuse":
             step("Not run: " + ("a deny rule forbids it" if "deny rule" in why else "edits are off, and it doesn't only read"), MUTED)
             return why
+        if PRINT_MODE:
+            # Nobody can be asked: "the user declined" would be untrue, and
+            # the reply passed it on as if the user had said no.
+            return ("Not run: this is a one-shot run (oppx -p), which can't ask the user, and this command needs "
+                    "their permission. Don't say the user declined; in the reply, give the command for them to run.")
         rules, session = perms.offer(command), perms.offer_session(command)
         covered = session or rules  # what one yes allows until the chat ends
         # One yes is enough for a session. What is asked every time (rm, sudo, git push) has no such yes.
@@ -382,7 +387,7 @@ def agent_turn(coder, text: str):
     # A picture (or a video, slides) the message names but the model can't
     # take: said now, before the turn. Not a stop: "rename logo.png" is fine.
     for rel in agent._named_files(text):
-        why = documents.blocked(Path(coder.root) / rel, agent_module.VISION, MODEL_NAME)
+        why = documents.blocked(Path(coder.root) / rel, workspace.VISION, MODEL_NAME)
         if why:
             step(escape(why), YELLOW)
     # Files the user pointed at (/add, @file): the agent reads them as needed.

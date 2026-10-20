@@ -14,6 +14,7 @@ Working notes for developing this repo. This file holds the conventions, the arc
 * **Toolchain on the server node:** `cargo` is in `~/.cargo/bin` (not on the non-interactive `PATH`), so use `export PATH=$HOME/.cargo/bin:$PATH`. `uv`/`uvx` are in `~/.local/bin`.
 * **Versioning:** the backend image tag equals the workspace version in `Cargo.toml`. The release workflow bumps `Cargo.toml`, `Cargo.lock`, `app/package.json`, `app/package-lock.json` and `app/src-tauri/tauri.conf.json` together (`scripts/bump_version.py`); don't bump by hand.
 * **Regular expressions:** every pattern in the repository must pass `scripts/check_regexes.py` (CI runs it). It finds the patterns by itself (Python's syntax tree, the TypeScript parser), compiles each, and proves with recheck that none backtracks exponentially or polynomially. Python's `re` and JavaScript backtrack, so a harmless-looking `\s+$` searched over a long run of spaces is quadratic. When it flags one, pin where a match may start (`(?<![ \t])[ \t]+\n`), keep a repeat from crossing its own delimiter (`[^{}]*`, `_([^_]+?)_`), or use string methods. A pattern only known at run time gets a `# regex: runtime (why it is safe)` comment; a pattern the model writes runs through `grep -E`, never Python's `re`.
+* **File size:** no source file (code or tests) over 1,000 lines. When a change would push a file past that, split it first into modules by responsibility (e.g. the agent loop, its guards, its prompts, the edit/create text), keeping the public names importable from where they were. A file already over the limit is split before it grows further.
 * **Verify before claiming:** run `cargo test -p openphalanx-core`, `cargo clippy --workspace --all-targets`, `(cd app && npm run check)`, and for backend changes the lifecycle example (about 4 min, needs the GPU).
 
 ## Architecture
@@ -137,6 +138,7 @@ python3 scripts/test_inputs.py                                  # the gateway's 
 scripts/eval_edits.py --oppx target/debug/oppx --engine agent   # 9 edit tasks in fresh clones (3 name no file), checked by compiling/testing; compare engines
 ~/.local/share/oppx/engine/tools/aider-chat/bin/python scripts/eval_nav.py --repo <scratch clone>     # 10 questions that name no file (via `oppx proxy`): answered, steps, stuck
 ~/.local/share/oppx/engine/tools/aider-chat/bin/python scripts/test_agent.py                          # agent loop unit tests, scripted model, no server
+~/.local/share/oppx/engine/tools/aider-chat/bin/python scripts/test_agent_tools.py                    # ... its tools, edit text, commands (and test_agent_documents.py: documents, pictures)
 python3 scripts/test_permissions.py                             # the agent's command allowlist (read-only commands, saved rules, what is never remembered)
 python3 scripts/test_reqtrace.py                                # the gateway's request trace (prefix chains, tree, labels, content switch)
 ~/.local/share/oppx/engine/tools/aider-chat/bin/python scripts/bench_agent.py --repo <scratch clone>   # agent turns headless, steps and tokens

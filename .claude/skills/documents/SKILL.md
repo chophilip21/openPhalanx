@@ -45,7 +45,8 @@ Found on the 3090 with Qwen3.5-9B: without these, a 9B model answered "I can't f
 
 * **A named file is opened up front, pictures and videos too.** That way the model sees the picture, or the refusal. A bare file name counts when only one file in the repository has it.
 * **Documents the request is about** (`_documents_for`): files named like its words ("travel policy" finds `docs/travel-policy.pdf`), or every file of a kind it mentions ("the PDF", "the screenshot") when there are at most 10.
-* **Files to make** (`_documents_to_make`): "summary.docx: use create on summary.docx itself; you write Markdown… No script is needed".
+* **Files to make** (`_documents_to_make`): "summary.docx: use create on summary.docx itself; you write Markdown… No script is needed". A file that already exists gets this only as a condition ("exists. Only if the request asks you to change it: … If it is there to be read, leave it as it is"): given a screenshot and a PDF holding the instructions for the next phase of a project ("the first half is the screenshot docs/phase2-part1.jpg"), the note had read "Files the request asks for: docs/phase2-part1.jpg: use create on it…".
+* **Seen end to end on split Qwen3.6-27B (2026-10-19):** a request naming `docs/phase2-part1.jpg` (900×540 screenshot of a README section) and `docs/phase2-part2.pdf` (text PDF, the rest of it): both opened up front, the picture sent as an `image_url` part, the PDF as its 7 lines of text.
 * **Router examples:** the ask/edit prompt (`routing.INTENT_PROMPT`) now says that asking for a file to be made is "edit" whatever goes in it. Before that, "Create summary.docx: a one-page summary…" was routed to "ask" and the summary came back in the chat. `probe_routing.py` has 7 more intent cases (documents and pictures, worded differently from the prompt's examples).
 
 ## Engine packages
@@ -69,7 +70,7 @@ Found on the 3090 with Qwen3.5-9B: without these, a 9B model answered "I can't f
   * LibreOffice converts the generated `.docx`, `.odt` and `.rtf` to PDF with headings, nested lists, numbered lists, tables, code, bold, italic, é and €;
   * it opens the `.xlsx` and computes its formulas;
   * the fpdf2 PDF renders the same content.
-* **Tests:** `scripts/test_agent.py` classes `Pdfs` and `Documents` cover:
+* **Tests:** `scripts/test_agent_documents.py` classes `Pdfs` and `Documents` cover:
   * the round trip of every format through `writers` and `documents`;
   * workbooks with sheets, numbers and formulas;
   * SVG drawn to all four picture formats;
