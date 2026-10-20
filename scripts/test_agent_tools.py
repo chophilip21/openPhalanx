@@ -166,7 +166,6 @@ class EditText(Repo):
         self.assertIsNone(A.misplaced_lookup('{"x": 1}'))
 
 
-@unittest.skipUnless(HAVE_RICH, "needs rich (run with the oppx engine's Python)")
 class SpacingSlips(unittest.TestCase):
     """A SEARCH that differs from the file only in the spaces at a line's ends."""
 
@@ -204,6 +203,7 @@ class SpacingSlips(unittest.TestCase):
             A.apply_edit(self.ws, "store.py", "store.py\n<<<<<<< SEARCH\n  x = 1\n=======\nx = 2\n>>>>>>> REPLACE\n")
 
 
+@unittest.skipUnless(HAVE_RICH, "needs rich (run with the oppx engine's Python)")
 class TypeAhead(unittest.TestCase):
     """What is typed while a turn runs: kept, queued on Enter, and shown on the spinner's line."""
 
