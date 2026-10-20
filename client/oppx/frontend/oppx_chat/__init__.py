@@ -29,7 +29,11 @@ Modules, lowest layer first (each imports only from the ones above it):
     permissions  what may run without asking: commands that only read, and
                the user's saved "always" answers (no UI code)
     agent      the agent engine: the model reads the repository on demand with
-               tools (no UI code; app.py connects it to the terminal)
+               tools (no UI code; app.py connects it to the terminal). Split by
+               layer: prompts (limits, prompt texts), actions (replies read as
+               actions, the schema, Hooks), workspace (the repository's tools,
+               applying edits), replies and tools (mixins of Agent: thinking and
+               replying; carrying out an action), agent (the loop)
     oppx_io    Aider's InputOutput restyled: prompt, keys, confirmations
     routing    the one-token ask/edit check
     cache      keep requests prefix-cache friendly (stable repo map and prompts)

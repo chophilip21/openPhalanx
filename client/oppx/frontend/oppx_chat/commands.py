@@ -18,7 +18,7 @@ from .oppx_io import show_shortcuts
 from .routing import wants_edit
 from .cache import ASK_NOTE
 from .agent import ANSWER_RESERVE as AGENT_RESERVE
-from . import agent as agent_module, documents
+from . import documents, workspace
 
 
 # ---------------------------------------------------------------------------
@@ -720,4 +720,4 @@ def translate(coder, text: str):
 
 def cannot_take(p: Path) -> str | None:
     """Why the loaded model can't take this file the user hands over, or None."""
-    return documents.blocked(p, agent_module.VISION, MODEL_NAME)
+    return documents.blocked(p, workspace.VISION, MODEL_NAME)

@@ -85,6 +85,8 @@ jobs:
           # Documents and pictures: the engine's extras (engine.rs EXTRAS) and Pillow (comes with Aider).
           pip install pillow pypdf==6.19.0 fpdf2==2.8.9 resvg_py==0.5.0
           python3 scripts/test_agent.py
+          python3 scripts/test_agent_tools.py
+          python3 scripts/test_agent_documents.py
       - name: Request trace tests (the gateway's trace module; no dependencies)
         run: python3 scripts/test_reqtrace.py
       - name: Input checks (what the loaded model takes; the gateway's inputs module; no dependencies)
