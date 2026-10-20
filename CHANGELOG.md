@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.8.2 (2026-10-20)
+
+### Fixes
+
+- Agent: fixes from building an app end to end, and agent.py split by responsibility (#38)
+
 ## v0.8.1 (2026-10-17)
 
 ### Fixes
