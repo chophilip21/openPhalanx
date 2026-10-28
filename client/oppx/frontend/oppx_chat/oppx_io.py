@@ -329,7 +329,8 @@ class OppxIO(InputOutput):
             except OSError:
                 history = InMemoryHistory()
             self._session = PromptSession(
-                history=history, key_bindings=_keys(), multiline=True, enable_history_search=False
+                history=history, key_bindings=_keys(), multiline=True, enable_history_search=False,
+                enable_bracketed_paste=True
             )
         self._session.app.editing_mode = EditingMode.VI if UI.vi else EditingMode.EMACS
         width = console.size.width
@@ -427,6 +428,16 @@ def _keys() -> KeyBindings:
     def _(event):
         UI.plan_mode = not UI.plan_mode
         _flash("⏸ plan mode on: the model discusses and plans, no edits" if UI.plan_mode else "plan mode off: edits allowed")
+
+    @kb.add("c-v")
+    def _(event):
+        try:
+            import pyperclip
+            text = pyperclip.paste()
+            if text:
+                event.current_buffer.insert_text(text)
+        except Exception:
+            pass
 
     return kb
 

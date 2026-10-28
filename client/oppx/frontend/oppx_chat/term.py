@@ -252,7 +252,12 @@ class TurnSpinner:
                     if UI.unannounced:
                         self.clear_line()
                         announce_queued()
-                    status, typed = ahead(f"({secs}s · esc to interrupt", UI.prefill, len(UI.queued),
+                    token_part = ""
+                    if UI.agent is not None:
+                        ct = UI.agent.completion_tokens
+                        if ct:
+                            token_part = f" · {ct:,} tokens"
+                    status, typed = ahead(f"({secs}s · esc to interrupt{token_part}", UI.prefill, len(UI.queued),
                                           console.size.width - cell_len(word) - 2)
                     # The text starts at a fixed column (CSI 3G), so a frame
                     # the terminal draws wider or narrower can't shift it.

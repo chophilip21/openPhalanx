@@ -299,7 +299,7 @@ def make_agent(coder) -> Agent:
             step(f"Not run: a deny rule forbids {escape(name)}", MUTED)
             return why
         # One yes is enough for a session, for any tool of any connector.
-        options = [("y", GREEN, f"yes, and don't ask again this session: {name}")]
+        options = [("y", GREEN, f"yes, and don't ask again this session: every {connector} tool")]
         if not perms.every_time(name):  # running JavaScript in the browser is never saved between sessions
             options += [("a", ACCENT, f"always in this project: {name}"),
                         ("c", ACCENT, f"always in this project: every {connector} tool")]

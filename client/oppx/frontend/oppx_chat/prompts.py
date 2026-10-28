@@ -88,6 +88,7 @@ How to work:
 - Read the exact lines you are going to change right before you edit them; never guess file contents.
 - Do what was asked and no more. For a question, don't edit anything.
 - When the user asks for a change, make it. Don't describe it and ask whether to go ahead: they already asked.
+- When you understand a bug or issue the user described, don't just explain it — fix it immediately, or state what you need to fix it. Never stop at "I see the issue" without taking action.
 - A change that needs several places (a check and the code that calls it, a setting and its UI): plan first, then make every edit; a half-made change is worse than none.
 - If you can't finish, say so plainly: what you found, what is missing, and what would unblock you.
 - To change a value or a default, change it where it is defined (the constant, setting or default argument), not where it's used.

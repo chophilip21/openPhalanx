@@ -1002,12 +1002,20 @@ fn choose_session(root: &std::path::Path, choice: &SessionChoice) -> Result<(age
                 .iter()
                 .enumerate()
                 .map(|(i, s)| {
+                    let size_str = if s.size >= 1024 * 1024 {
+                        format!("{:.1} MB", s.size as f64 / (1024.0 * 1024.0))
+                    } else if s.size >= 1024 {
+                        format!("{:.1} KB", s.size as f64 / 1024.0)
+                    } else {
+                        format!("{} B", s.size)
+                    };
                     format!(
-                        "{} {}  {}  {}",
+                        "{} {}  {}  {}  {}",
                         ui::accent(format!("{:>2}.", i + 1)),
                         ui::dim(ago(s.modified)),
                         s.first_message,
-                        ui::dim(format!("({} message{})", s.messages, if s.messages == 1 { "" } else { "s" }))
+                        ui::dim(format!("({} message{})", s.messages, if s.messages == 1 { "" } else { "s" })),
+                        ui::dim(format!("~{}", size_str))
                     )
                 })
                 .collect();

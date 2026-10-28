@@ -1537,9 +1537,9 @@ class Permissions:
         if answer in ONCE:
             return True, "Allowed this once"
         if answer in YES | ALWAYS | SESSION | {"c", "connector"}:
-            self.session_yes.add(name)
+            self.session_tools.add(f"{connector}.*")
             kept = "" if lasting or answer in YES | SESSION else " (this tool is never saved between sessions)"
-            return True, f"Allowed, and for the rest of this session without asking: {name}{kept}"
+            return True, f"Allowed, and for the rest of this session without asking: every {connector} tool{kept}"
         if answer in ("", "n", "no"):
             return False, "Declined"
         return f"The user declined this call and said: {said.strip()}", "Declined, with your note"
