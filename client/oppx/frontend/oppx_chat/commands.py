@@ -222,30 +222,23 @@ def show_recovery(name: str, c):
 
 
 def show_connectors(hub):
-    tokens = hub.tokens()
-    cost = f" [{MUTED}]· about {tokens:,} tokens of every request ({100 * tokens / CONTEXT:.1f}% of {CONTEXT // 1024}k)[/]" if tokens else ""
-    headline(f"[bold]Connectors[/]{cost}")
     if hub.error:
         step(escape(hub.error), YELLOW)
     if not hub.connectors:
-        step("None yet. A connector is an MCP server whose tools the model can call.")
+        step("No connectors connected.")
         step(f"[{MUTED}]{escape(MCP_USAGE)}[/]")
         return
-    width = max(len(n) for n in hub.connectors)
+    tokens = hub.tokens()
+    cost = f" [{MUTED}]· about {tokens:,} tokens per request[/]" if tokens else ""
+    headline(f"[bold]Connectors[/]{cost}")
     for name, c in hub.connectors.items():
-        d = c.definition
-        where = "yours" if d.scope == "user" else "this repo"
         if c.state == "connected":
             n = len(c.tools)
-            state = f"[{GREEN}]✓[/] {name:<{width}}  {f'{n} tool' + ('s' if n != 1 else ''):<9}"
+            step(f"• [{GREEN}]{escape(name)}[/] ({n} tool{'s' if n != 1 else ''}) [{GREEN}]connected[/]")
+        elif c.state == "failed":
+            step(f"• [{RED}]{escape(name)}[/] [{RED}]failed[/] [{MUTED}]{escape(c.error[:120])}[/]")
         else:
-            state = f"[{RED if c.state == 'failed' else YELLOW}]{'✗' if c.state == 'failed' else '!'}[/] {name:<{width}}  {'failed' if c.state == 'failed' else 'waiting':<9}"
-        step(f"{state}  [{MUTED}]{where:<9}[/]  {escape(d.summary()[:70])}")
-        if c.state != "connected":
-            why, steps = c.recovery()
-            out(f"       [{YELLOW}]{escape(why)}[/] [{MUTED}]· {escape(c.error[:160])}[/]")
-            for i, line in enumerate(steps, 1):
-                out(f"       [{ACCENT}]{i}.[/] {escape(line)}")
+            step(f"• [{YELLOW}]{escape(name)}[/] [{YELLOW}]waiting[/] [{MUTED}]{escape(c.error[:120])}[/]")
     step(f"[{MUTED}]{escape(MCP_USAGE)}[/]")
 
 

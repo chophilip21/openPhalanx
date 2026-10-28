@@ -655,8 +655,23 @@ async fn pair(
     let url = config::normalize_url(server)?;
     let alias = alias.unwrap_or_else(|| name_for(&url));
     config::validate_name(&alias)?;
+    let mut expired_repair = false;
     if cfg.servers.contains_key(&alias) && !force {
-        bail!("already paired as \"{alias}\"; use --force to replace it, or --as <name> to keep both");
+        // If the existing pairing is expired or revoked, allow re-pair silently.
+        let existing = &cfg.servers[&alias];
+        if let Ok(client) = tls::pinned_client(&existing.fingerprint) {
+            if let Ok(Err(api::Rejected::Expired | api::Rejected::Revoked)) =
+                api::whoami(&client, &existing.url, &existing.token).await
+            {
+                expired_repair = true;
+            } else {
+                bail!("already paired as \"{alias}\"; use --force to replace it, or --as <name> to keep both");
+            }
+        } else {
+            // Can't build client (e.g. bad fingerprint); fall through and let the
+            // new pairing replace it.
+            expired_repair = true;
+        }
     }
 
     let sp = ui::spinner(format!("Connecting to {url}"));
@@ -734,7 +749,11 @@ async fn pair(
         ],
     );
     if replaced {
-        ui::warning("the previous pairing was replaced; revoke the old device on the app's Client page.");
+        if expired_repair {
+            ui::line(ui::ok("previous pairing", "was expired or revoked; replaced automatically"));
+        } else {
+            ui::warning("the previous pairing was replaced; revoke the old device on the app's Client page.");
+        }
     }
     println!("  Next: {}  then  {} in a git repo", ui::accent("oppx status"), ui::accent("oppx"));
     Ok(())
@@ -780,7 +799,7 @@ async fn status(cfg: &Config, name: Option<&str>) -> Result<()> {
                 api::Rejected::Expired => "pairing expired (the server app sets how long pairings last)",
             }));
             ui::panel("OpenPhalanx", &rows);
-            bail!("pair again with `oppx pair {} <code> --as {name} --force`", s.url);
+            bail!("pair again with `oppx pair {} <code>`", s.url);
         }
     };
     rows.push(ui::ok("device", format!("{} {}", me.device_name, ui::dim(format!("({})", me.device_id)))));
@@ -983,12 +1002,20 @@ fn choose_session(root: &std::path::Path, choice: &SessionChoice) -> Result<(age
                 .iter()
                 .enumerate()
                 .map(|(i, s)| {
+                    let size_str = if s.size >= 1024 * 1024 {
+                        format!("{:.1} MB", s.size as f64 / (1024.0 * 1024.0))
+                    } else if s.size >= 1024 {
+                        format!("{:.1} KB", s.size as f64 / 1024.0)
+                    } else {
+                        format!("{} B", s.size)
+                    };
                     format!(
-                        "{} {}  {}  {}",
+                        "{} {}  {}  {}  {}",
                         ui::accent(format!("{:>2}.", i + 1)),
                         ui::dim(ago(s.modified)),
                         s.first_message,
-                        ui::dim(format!("({} message{})", s.messages, if s.messages == 1 { "" } else { "s" }))
+                        ui::dim(format!("({} message{})", s.messages, if s.messages == 1 { "" } else { "s" })),
+                        ui::dim(format!("~{}", size_str))
                     )
                 })
                 .collect();

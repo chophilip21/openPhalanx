@@ -182,6 +182,7 @@ pub struct Session {
     pub modified: std::time::SystemTime,
     pub first_message: String,
     pub messages: usize,
+    pub size: u64,
 }
 
 /// The per-repo folder holding its sessions.
@@ -266,6 +267,7 @@ pub fn list_sessions(repo_root: &Path) -> Result<Vec<Session>> {
             modified: entry_modified(&path),
             first_message: first.chars().take(80).collect(),
             messages: user.len(),
+            size: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
             path,
         });
     }

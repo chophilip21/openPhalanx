@@ -95,7 +95,11 @@ class Doing:
         (with the arguments) and the result."""
         hub = self.connectors
         tool = hub.tools()[name]
-        args = self._arguments(name, tool.schema) if tool.schema.get("properties") else {}
+        try:
+            args = self._arguments(name, tool.schema) if tool.schema.get("properties") else {}
+        except ToolError as e:
+            self._called[f"{name} bad_args"] = f"bad_args:{e}"
+            raise
         shown = json.dumps(args, ensure_ascii=False)
         title = f"{name}({shown[1:-1][:160]})"
         # The arguments go in the result, not into the action: merged into the
