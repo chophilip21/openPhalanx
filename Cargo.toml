@@ -3,6 +3,6 @@ resolver = "2"
 members = ["crates/openphalanx-core", "crates/openphalanx-server", "crates/pinned-tls", "app/src-tauri", "client/oppx"]
 
 [workspace.package]
-version = "0.8.2"
+version = "0.8.3"
 edition = "2021"
 license = "GPL-3.0-only"
