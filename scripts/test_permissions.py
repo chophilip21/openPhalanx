@@ -664,10 +664,11 @@ class Audit(Base):
             self.assertEqual(self.p.judge_tool(tool, read_only=False)[0], "ask", tool)
             result, shown = self.p.answered_tool(tool, "y")
             self.assertIs(result, True)
-            self.assertIn(f"rest of this session without asking: {tool}", shown)
+            self.assertIn("rest of this session without asking: every", shown)
             for _ in range(3):
                 self.assertEqual(self.p.judge_tool(tool, read_only=False)[0], "run", f"{tool}: not asked again")
-        self.assertEqual(self.p.judge_tool("linear.delete_issue", read_only=False)[0], "ask", "that tool, not its whole connector")
+        # y now covers the whole connector for the session
+        self.assertEqual(self.p.judge_tool("linear.delete_issue", read_only=False)[0], "run", "whole connector covered by y")
         self.assertFalse(self.file.exists(), "a yes saves nothing")
         self.assertEqual(P.Permissions(str(self.root), self.file).judge_tool("linear.save_issue", False)[0], "ask", "a new session asks")
         # The same for commands: one yes covers that kind of command until the chat ends...
@@ -702,7 +703,8 @@ class Audit(Base):
         self.assertIs(result, True)
         self.assertIn("rest of this session", shown)
         self.assertEqual(self.p.judge_tool("notes.add_note", read_only=False)[0], "run")
-        self.assertEqual(self.p.judge_tool("notes.delete_note", read_only=False)[0], "ask")
+        # s now covers the whole connector for the session
+        self.assertEqual(self.p.judge_tool("notes.delete_note", read_only=False)[0], "run")
         self.assertNotIn("notes", self.file.read_text())
         self.assertEqual(P.Permissions(str(self.root), self.file).judge_tool("notes.add_note", False)[0], "ask")
 

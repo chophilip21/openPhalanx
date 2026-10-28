@@ -1538,6 +1538,10 @@ class Permissions:
             return True, "Allowed this once"
         if answer in YES | ALWAYS | SESSION | {"c", "connector"}:
             self.session_tools.add(f"{connector}.*")
+            # every_time tools (like browser_evaluate) are blocked by the every_time
+            # guard in tool_allowed, so they need session_yes to bypass it
+            if not lasting:
+                self.session_yes.add(name)
             kept = "" if lasting or answer in YES | SESSION else " (this tool is never saved between sessions)"
             return True, f"Allowed, and for the rest of this session without asking: every {connector} tool{kept}"
         if answer in ("", "n", "no"):
