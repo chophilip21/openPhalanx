@@ -14,7 +14,7 @@ pinned-tls = { path = "../pinned-tls" }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
-dirs = "6"
+dirs = "7"
 futures-util = "0.3"
 hex = "0.4"
 rand = "0.9"
