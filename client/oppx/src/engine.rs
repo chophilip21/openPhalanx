@@ -23,6 +23,7 @@ const UV_INSTALLER: &str = "https://astral.sh/uv/install.sh";
 /// reads PDFs, fpdf2 writes them (with fontTools and defusedxml), resvg-py
 /// draws pictures from SVG (one wheel with no dependencies). Word, Excel,
 /// OpenDocument, RTF and EPUB need only Python's standard library.
+/// Do not mess with pyperclip version, because it needs to match openaider
 pub const EXTRAS: &[(&str, &str)] = &[("pypdf", "6.19.0"), ("fpdf2", "2.8.9"), ("resvg_py", "0.5.0"), ("pyperclip", "1.11.0")];
 
 /// The extras an engine at `aider` is missing (or has at another version).
