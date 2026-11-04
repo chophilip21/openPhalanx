@@ -2,6 +2,12 @@
 
 Generated from merged pull request titles by `scripts/bump_version.py`.
 
+## v0.8.4 (2026-11-04)
+
+### Fixes
+
+- activate cd (#40)
+
 ## v0.8.3 (2026-10-28)
 
 ### Fixes
