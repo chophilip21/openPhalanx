@@ -329,8 +329,7 @@ class OppxIO(InputOutput):
             except OSError:
                 history = InMemoryHistory()
             self._session = PromptSession(
-                history=history, key_bindings=_keys(), multiline=True, enable_history_search=False,
-                enable_bracketed_paste=True
+                history=history, key_bindings=_keys(), multiline=True, enable_history_search=False
             )
         self._session.app.editing_mode = EditingMode.VI if UI.vi else EditingMode.EMACS
         width = console.size.width
